@@ -45,9 +45,9 @@ Grok Account Manager
 
 ```bash
 cd grok-account-manager
-python3 -m venv .venv
+python3.13 -m venv .venv
 .venv/bin/python -m pip install -e .
-.venv/bin/grok-manager ui
+python3 run.py
 ```
 
 随后在“配置与环境”中设置临时邮箱、代理和 CPA。环境检查会验证内置运行时、Python、依赖和邮箱基础配置。
@@ -61,17 +61,25 @@ cd grok-account-manager
 python3 run.py
 ```
 
-也可以安装为本地命令：
+启动器会自动使用根目录下的 `.venv`，启动 `http://127.0.0.1:8787` 并打开默认浏览器。不自动打开浏览器或更换端口时可以直接传参数，不需要再写 `ui`：
 
 ```bash
-python3 -m pip install -e .
-grok-manager ui
+python3 run.py --no-browser
+python3 run.py --port 9000
 ```
 
-命令会启动 `http://127.0.0.1:8787` 并打开默认浏览器。若不希望自动打开：
+Linux/macOS 还可以直接运行：
 
 ```bash
-python3 -m grok_manager ui --no-browser
+./run.py
+```
+
+首次运行前仍需用 Python 3.13 创建 `.venv` 并安装依赖。如果环境不符合要求，启动器会输出对应的处理命令。原有 CLI 子命令也可以通过启动器使用：
+
+```bash
+python3 run.py config check
+python3 run.py list
+python3 run.py login --expired
 ```
 
 源码目录运行时，首次启动会创建：
