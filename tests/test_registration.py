@@ -82,7 +82,7 @@ class RegistrationImportTests(unittest.TestCase):
             )
             legacy_manager_config = root / "legacy-manager-config.json"
             legacy_manager_config.write_text(
-                json.dumps({"reference_project": str(legacy_root)}),
+                json.dumps({"reference_project": legacy_root.name}),
                 encoding="utf-8",
             )
 
@@ -125,6 +125,29 @@ class RegistrationImportTests(unittest.TestCase):
                 "http://127.0.0.1:7890",
                 manager.reference.load_registration_config()["proxy"],
             )
+
+    def test_missing_legacy_source_does_not_complete_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager_config = root / "legacy-manager-config.json"
+            manager_config.write_text(
+                json.dumps({"reference_project": "missing-register-project"}),
+                encoding="utf-8",
+            )
+            migration_file = root / "data" / ".migration.json"
+            reference = ReferenceProject(
+                root=root / "embedded",
+                config_file=root / "data" / "registration-config.json",
+                config_example_file=root / "example.json",
+                output_dir=root / "data" / "registration-output",
+                data_root=root / "data",
+                legacy_manager_config_file=manager_config,
+                migration_file=migration_file,
+            )
+
+            reference.migrate_legacy_data()
+
+            self.assertFalse(migration_file.exists())
 
     def test_registration_without_accounts_is_not_successful(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

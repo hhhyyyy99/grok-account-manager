@@ -87,7 +87,7 @@ class ReferenceProject:
         self.legacy_manager_config_file = (
             Path(legacy_manager_config_file).expanduser().resolve()
             if legacy_manager_config_file is not None
-            else (LEGACY_CONFIG_FILE.resolve() if legacy_source_layout else None)
+            else (LEGACY_CONFIG_FILE.resolve() if default_layout else None)
         )
         self.legacy_reference_root = (
             Path(legacy_reference_root).expanduser().resolve()
@@ -209,7 +209,12 @@ class ReferenceProject:
         if not isinstance(values, dict):
             raise ReferenceProjectError("旧管理端配置必须是 JSON 对象")
         configured = str(values.get("reference_project") or "").strip()
-        return Path(configured).expanduser().resolve() if configured else root
+        if not configured:
+            return root
+        configured_path = Path(configured).expanduser()
+        if not configured_path.is_absolute():
+            configured_path = path.parent / configured_path
+        return configured_path.resolve()
 
     def _registration_config_is_default(self) -> bool:
         if not self.config_file.is_file():
@@ -299,6 +304,9 @@ class ReferenceProject:
         }
         if legacy_root is not None and legacy_root != self.root:
             legacy_config = legacy_root / "config.json"
+            legacy_output = legacy_root / "output"
+            if not legacy_config.is_file() and not legacy_output.is_dir():
+                return
             if legacy_config.is_file() and self._registration_config_is_default():
                 try:
                     values = json.loads(legacy_config.read_text(encoding="utf-8-sig"))
@@ -310,7 +318,6 @@ class ReferenceProject:
                     self._rebase_legacy_config_paths(values, legacy_root)
                 )
                 result["config_copied"] = True
-            legacy_output = legacy_root / "output"
             if legacy_output.is_dir():
                 result["output_files_copied"] = self._copy_legacy_output(
                     legacy_output,

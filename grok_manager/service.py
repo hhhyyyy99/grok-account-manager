@@ -16,6 +16,7 @@ from .reference import (
     RegistrationRunner,
 )
 from .store import AccountStore
+from .paths import migrate_legacy_install_data
 
 
 class GrokManager:
@@ -28,6 +29,7 @@ class GrokManager:
         reference: Optional[ReferenceProject] = None,
         python_executable: str = "",
     ):
+        migrate_legacy_install_data()
         self.config_store = config_store or ConfigStore()
         self.config = self.config_store.load()
         self.store = store or AccountStore()
