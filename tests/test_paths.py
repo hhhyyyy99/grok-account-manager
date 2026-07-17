@@ -8,6 +8,58 @@ from grok_manager.paths import _default_data_dir, _migrate_legacy_install_data
 
 
 class DataDirectoryTests(unittest.TestCase):
+    def test_empty_user_database_rebases_installed_auth_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "site-packages" / "data"
+            old_auth = source / "auths" / "xai-old@example.com.json"
+            old_auth.parent.mkdir(parents=True)
+            old_auth.write_text("{}\n", encoding="utf-8")
+            source_database = sqlite3.connect(source / "accounts.sqlite3")
+            try:
+                source_database.execute(
+                    """
+                    CREATE TABLE accounts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        email TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                        auth_file TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                source_database.execute(
+                    """
+                    INSERT INTO accounts (email, auth_file, created_at, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    ("old@example.com", str(old_auth), "2026-01-01", "2026-01-01"),
+                )
+                source_database.commit()
+            finally:
+                source_database.close()
+            destination = root / "user-data"
+
+            _migrate_legacy_install_data(
+                source,
+                root / "site-packages" / "config.json",
+                destination,
+                destination / ".migration.json",
+            )
+
+            migrated_database = sqlite3.connect(destination / "accounts.sqlite3")
+            try:
+                auth_file = migrated_database.execute(
+                    "SELECT auth_file FROM accounts WHERE email = ?",
+                    ("old@example.com",),
+                ).fetchone()[0]
+            finally:
+                migrated_database.close()
+            self.assertEqual(
+                destination / "auths" / old_auth.name,
+                Path(auth_file),
+            )
+
     def test_installed_upgrade_migrates_database_config_and_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

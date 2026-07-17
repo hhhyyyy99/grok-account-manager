@@ -179,6 +179,41 @@ def _account_count(database: Path) -> int:
         return -1
 
 
+def _rebase_database_auth_files(
+    database: Path,
+    source_root: Path,
+    destination_root: Path,
+) -> int:
+    connection = sqlite3.connect(database)
+    try:
+        columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(accounts)")
+        }
+        if "id" not in columns or "auth_file" not in columns:
+            return 0
+        updates = []
+        for account_id, raw in connection.execute(
+            "SELECT id, auth_file FROM accounts WHERE auth_file != ''"
+        ):
+            path = Path(str(raw)).expanduser()
+            if not path.is_absolute():
+                continue
+            try:
+                relative = path.resolve().relative_to(source_root.resolve())
+            except ValueError:
+                continue
+            updates.append((str(destination_root / relative), int(account_id)))
+        if updates:
+            with connection:
+                connection.executemany(
+                    "UPDATE accounts SET auth_file = ? WHERE id = ?",
+                    updates,
+                )
+        return len(updates)
+    finally:
+        connection.close()
+
+
 def _migrate_account_database(source: Path, destination: Path) -> tuple[bool, int]:
     source_count = _account_count(source)
     destination_count = _account_count(destination)
@@ -311,6 +346,7 @@ def _migrate_account_database(source: Path, destination: Path) -> tuple[bool, in
         finally:
             destination_connection.close()
             source_connection.close()
+    _rebase_database_auth_files(destination, source.parent, destination.parent)
     try:
         destination.chmod(0o600)
     except OSError:
