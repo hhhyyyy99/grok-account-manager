@@ -47,14 +47,6 @@
           <div class="heading-actions">
             <button class="button" type="button" id="import-file-button">导入文件</button>
             <button class="button button-primary" type="button" id="import-history-button">导入历史产物</button>
-            <div class="export-actions">
-              <select id="export-format" class="export-format-select" aria-label="导出格式" title="导出格式">
-                <option value="cpa">CPA ZIP</option>
-                <option value="sub2api">Sub2API JSON</option>
-                <option value="grok2api">Grok2API JSON</option>
-              </select>
-              <button class="button" type="button" id="export-accounts">导出筛选结果</button>
-            </div>
             <input type="file" id="import-file-input" accept=".txt,text/plain" hidden>
           </div>
         </div>
@@ -90,19 +82,35 @@
               </label>
             </div>
             <div class="toolbar-actions">
-              <button class="button" type="button" id="refresh-accounts">刷新</button>
-              <button class="button" type="button" id="inspect-selected">巡检所选</button>
-              <button class="button" type="button" id="inspect-all">巡检全部</button>
-              <button class="button button-danger" type="button" id="cancel-inspection" disabled>停止巡检</button>
-              <button class="button button-primary" type="button" id="login-candidates">登录异常账号</button>
+              <button class="button" type="button" id="refresh-accounts">刷新列表</button>
             </div>
           </div>
 
-          <div class="selection-bar" id="selection-bar" hidden>
-            <span>已选择 <strong id="selected-count">0</strong> 个账号</span>
-            <div>
-              <button class="button" type="button" id="login-selected">登录所选</button>
-              <button class="button button-danger" type="button" id="delete-selected">删除记录</button>
+          <div class="selection-bar" id="selection-bar">
+            <div class="selection-overview">
+              <span class="selection-count">已选择 <strong id="selected-count">0</strong> 个账号</span>
+              <div class="selection-controls">
+                <button class="button" type="button" id="select-current-page">选择本页</button>
+                <button class="button" type="button" id="select-all-results">选择全部筛选结果</button>
+                <button class="button button-quiet" type="button" id="clear-selection" disabled>清空选择</button>
+              </div>
+            </div>
+            <div class="bulk-actions">
+              <button class="button" type="button" id="inspect-selected" disabled>巡检所选</button>
+              <button class="button button-primary" type="button" id="login-selected" disabled>重新登录</button>
+              <div class="export-actions">
+                <select id="export-format" class="export-format-select" aria-label="导出格式" title="导出格式" disabled>
+                  <option value="cpa">CPA ZIP</option>
+                  <option value="sub2api">Sub2API JSON</option>
+                  <option value="grok2api">Grok2API JSON</option>
+                </select>
+                <button class="button" type="button" id="export-accounts" disabled>导出所选</button>
+              </div>
+              <button class="button button-danger" type="button" id="delete-selected" disabled>删除所选</button>
+              <span class="action-divider" aria-hidden="true"></span>
+              <button class="button" type="button" id="inspect-all">巡检全部</button>
+              <button class="button" type="button" id="login-candidates">登录异常账号</button>
+              <button class="button button-danger" type="button" id="cancel-inspection" disabled>停止巡检</button>
             </div>
           </div>
 

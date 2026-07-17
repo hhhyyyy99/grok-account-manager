@@ -55,6 +55,42 @@ class ManagerTaskConfigTests(unittest.TestCase):
         self.assertIn('<option value="grok2api">Grok2API JSON</option>', html)
         self.assertIn('fetch("/api/accounts/export"', script)
 
+    def test_account_actions_share_a_persistent_selection_toolbar(self) -> None:
+        html = (ASSET_DIR / "index.html").read_text(encoding="utf-8")
+        script = (ASSET_DIR / "app.js").read_text(encoding="utf-8")
+        selection_bar = html[
+            html.index('<div class="selection-bar"'):
+            html.index('<div class="table-wrap"')
+        ]
+        heading_actions = html[
+            html.index('<div class="heading-actions">'):
+            html.index("</div>", html.index('<div class="heading-actions">'))
+        ]
+
+        self.assertNotIn("hidden", selection_bar.split(">", 1)[0])
+        self.assertIn('id="select-current-page"', selection_bar)
+        self.assertIn('id="select-all-results"', selection_bar)
+        self.assertIn('id="clear-selection"', selection_bar)
+        for control_id in ("inspect-selected", "login-selected", "export-accounts", "delete-selected"):
+            self.assertIn(f'id="{control_id}" disabled', selection_bar)
+        self.assertIn('id="import-file-button"', heading_actions)
+        self.assertIn('id="import-history-button"', heading_actions)
+        self.assertNotIn('id="export-accounts"', heading_actions)
+        self.assertIn('/api/accounts/selection?', script)
+
+    def test_registration_save_captures_form_before_async_work(self) -> None:
+        script = (ASSET_DIR / "app.js").read_text(encoding="utf-8")
+        start = script.index("async function saveRegistrationSection")
+        end = script.index("async function saveReferenceJson", start)
+        save_function = script[start:end]
+
+        capture = save_function.index("const form = event.currentTarget;")
+        async_boundary = save_function.index("await loadConfig()")
+        self.assertLess(capture, async_boundary)
+        self.assertIn("formValues(form)", save_function)
+        self.assertIn("form.dataset.configLabel", save_function)
+        self.assertNotIn("event.currentTarget.dataset", save_function)
+
     def test_task_config_controls_registration_and_relogin_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = make_manager(Path(directory))

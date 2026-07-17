@@ -103,16 +103,62 @@
     return Array.from(state.selected).map(Number);
   }
 
+  function clearSelection(render = true) {
+    state.selected.clear();
+    if (render) renderAccounts();
+    else updateSelectionBar();
+  }
+
   function updateSelectionBar() {
     const count = state.selected.size;
+    const pageSelected = state.accounts.reduce(
+      (total, account) => total + (state.selected.has(Number(account.id)) ? 1 : 0),
+      0,
+    );
+    const hasSelection = count > 0;
     byId("selected-count").textContent = String(count);
-    byId("selection-bar").hidden = count === 0;
     const selectAll = byId("select-all");
-    selectAll.checked = state.accounts.length > 0 && count === state.accounts.length;
-    selectAll.indeterminate = count > 0 && count < state.accounts.length;
-    const exportButton = byId("export-accounts");
-    exportButton.textContent = count ? `导出所选 (${count})` : "导出筛选结果";
-    exportButton.disabled = count === 0 && Number(state.pagination.total || 0) === 0;
+    selectAll.checked = state.accounts.length > 0 && pageSelected === state.accounts.length;
+    selectAll.indeterminate = pageSelected > 0 && pageSelected < state.accounts.length;
+    byId("select-current-page").disabled = (
+      state.accounts.length === 0 || pageSelected === state.accounts.length
+    );
+    byId("select-all-results").disabled = (
+      Number(state.pagination.total || 0) === 0
+      || count === Number(state.pagination.total || 0)
+    );
+    byId("clear-selection").disabled = !hasSelection;
+    byId("login-selected").disabled = !hasSelection;
+    byId("delete-selected").disabled = !hasSelection;
+    byId("export-format").disabled = !hasSelection;
+    byId("export-accounts").disabled = !hasSelection;
+    const inspection = state.tasks.find(
+      (task) => task.kind === "inspect" && ["queued", "running"].includes(task.state),
+    );
+    byId("inspect-selected").disabled = !hasSelection || Boolean(inspection);
+  }
+
+  function selectCurrentPage() {
+    state.accounts.forEach((account) => state.selected.add(Number(account.id)));
+    renderAccounts();
+  }
+
+  async function selectAllResults() {
+    const query = new URLSearchParams();
+    const search = byId("account-search").value.trim();
+    const status = byId("status-filter").value;
+    if (search) query.set("search", search);
+    if (status) query.set("status", status);
+    byId("select-all-results").disabled = true;
+    try {
+      const payload = await api(`/api/accounts/selection?${query.toString()}`);
+      state.selected = new Set((payload.ids || []).map(Number));
+      renderAccounts();
+      toast(`已选择全部 ${Number(payload.total || state.selected.size)} 个筛选结果`);
+    } catch (error) {
+      toast(error.message, true);
+      updateSelectionBar();
+    }
   }
 
   function renderMetrics(stats) {
@@ -194,8 +240,6 @@
       state.stats = payload.stats || {};
       state.tasks = payload.tasks || [];
       state.pagination = payload.pagination || state.pagination;
-      const visibleIds = new Set(state.accounts.map((account) => Number(account.id)));
-      state.selected = new Set(Array.from(state.selected).filter((id) => visibleIds.has(id)));
       renderMetrics(state.stats);
       renderAccounts();
       renderPagination();
@@ -228,7 +272,7 @@
     const running = state.tasks.filter((task) => !["succeeded", "failed", "cancelled"].includes(task.state));
     const inspection = running.find((task) => task.kind === "inspect");
     byId("running-task-count").textContent = String(running.length);
-    byId("inspect-selected").disabled = Boolean(inspection);
+    byId("inspect-selected").disabled = Boolean(inspection) || state.selected.size === 0;
     byId("inspect-all").disabled = Boolean(inspection);
     byId("cancel-inspection").disabled = !inspection || Boolean(inspection.cancelRequested);
     if (!state.tasks.length) {
@@ -393,11 +437,8 @@
     const button = byId("export-accounts");
     const format = byId("export-format").value;
     const ids = selectedIds();
+    if (!ids.length) return;
     const body = { format, ids };
-    if (!ids.length) {
-      body.search = byId("account-search").value.trim();
-      body.status = byId("status-filter").value;
-    }
     button.disabled = true;
     try {
       const response = await fetch("/api/accounts/export", {
@@ -514,9 +555,10 @@
   }
 
   async function saveManagerConfig(event) {
+    const form = event.currentTarget;
     event.preventDefault();
     if (!state.config) await loadConfig();
-    const values = { ...(state.config?.manager || {}), ...formValues(event.currentTarget) };
+    const values = { ...(state.config?.manager || {}), ...formValues(form) };
     try {
       const config = await api("/api/config/manager", { method: "POST", body: values });
       state.config = config;
@@ -528,13 +570,15 @@
   }
 
   async function saveRegistrationSection(event) {
+    const form = event.currentTarget;
+    const label = form.dataset.configLabel || "注册配置";
     event.preventDefault();
     if (!state.config) await loadConfig();
-    const values = { ...(state.config?.registration || {}), ...formValues(event.currentTarget) };
+    const values = { ...(state.config?.registration || {}), ...formValues(form) };
     try {
       const config = await api("/api/config/registration", { method: "POST", body: values });
       state.config = config;
-      toast(`${event.currentTarget.dataset.configLabel || "注册配置"}已保存`);
+      toast(`${label}已保存`);
       await loadConfig();
     } catch (error) {
       toast(error.message, true);
@@ -598,6 +642,9 @@
     byId("import-file-button").addEventListener("click", () => byId("import-file-input").click());
     byId("import-file-input").addEventListener("change", (event) => importFile(event.target.files[0]));
     byId("refresh-accounts").addEventListener("click", () => loadState({ loading: true }));
+    byId("select-current-page").addEventListener("click", selectCurrentPage);
+    byId("select-all-results").addEventListener("click", selectAllResults);
+    byId("clear-selection").addEventListener("click", () => clearSelection());
     byId("export-accounts").addEventListener("click", exportAccounts);
     byId("inspect-selected").addEventListener("click", () => {
       const ids = selectedIds();
@@ -616,16 +663,20 @@
 
     byId("select-all").addEventListener("change", (event) => {
       if (event.target.checked) state.accounts.forEach((account) => state.selected.add(Number(account.id)));
-      else state.selected.clear();
+      else state.accounts.forEach((account) => state.selected.delete(Number(account.id)));
       renderAccounts();
     });
 
     let searchTimer;
     byId("account-search").addEventListener("input", () => {
       window.clearTimeout(searchTimer);
+      clearSelection(false);
       searchTimer = window.setTimeout(() => loadState({ page: 1 }), 260);
     });
-    byId("status-filter").addEventListener("change", () => loadState({ page: 1 }));
+    byId("status-filter").addEventListener("change", () => {
+      clearSelection(false);
+      loadState({ page: 1 });
+    });
     byId("page-size").addEventListener("change", (event) => {
       state.pagination.pageSize = Number(event.target.value) || 50;
       loadState({ page: 1, loading: true });

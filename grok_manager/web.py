@@ -251,6 +251,18 @@ class GrokWebApplication:
             "tasks": [task.serialize(include_logs=False) for task in self.tasks.latest()],
         }
 
+    def selection_json(self, query: Dict[str, List[str]]) -> Dict[str, Any]:
+        search = (query.get("search") or [""])[0]
+        status = (query.get("status") or [""])[0]
+        total = self.manager.store.count_accounts(search=search, status=status)
+        if total > 10000:
+            raise ValueError("单次最多选择 10000 个账号，请先缩小筛选范围")
+        accounts = self.manager.store.list_accounts(search=search, status=status)
+        return {
+            "ids": [account.id for account in accounts],
+            "total": total,
+        }
+
     def config_json(self) -> Dict[str, Any]:
         reference_config: Dict[str, Any] = {}
         reference_error = ""
@@ -585,6 +597,12 @@ class GrokWebApplication:
                             return
                         self._json(application.state_json(parse_qs(parsed.query)))
                         return
+                    if parsed.path == "/api/accounts/selection":
+                        if not self._authorized():
+                            self._error(403, "请求令牌无效")
+                            return
+                        self._json(application.selection_json(parse_qs(parsed.query)))
+                        return
                     if parsed.path == "/api/config":
                         if not self._authorized():
                             self._error(403, "请求令牌无效")
@@ -609,6 +627,8 @@ class GrokWebApplication:
                             self._json(task.serialize())
                         return
                     self._error(404, "接口不存在")
+                except ValueError as exc:
+                    self._error(400, str(exc))
                 except Exception as exc:
                     self._error(500, str(exc))
 

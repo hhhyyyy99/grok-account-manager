@@ -98,6 +98,26 @@ class AccountImportQueryTests(unittest.TestCase):
             self.assertEqual(3, last_page["pagination"]["page"])
             self.assertEqual(1, len(last_page["accounts"]))
 
+    def test_web_selection_returns_every_id_in_the_current_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            manager.import_account_text(
+                "alice@example.com----password\n"
+                "bob@example.com----password\n"
+                "carol@other.test----password\n"
+                "dave@example.com----password"
+            )
+            application = GrokWebApplication(manager)
+
+            selection = application.selection_json({"search": ["example.com"]})
+            expected = manager.store.list_accounts(search="example.com")
+
+            self.assertEqual(3, selection["total"])
+            self.assertEqual(
+                [account.id for account in expected],
+                selection["ids"],
+            )
+
     def test_missing_cpa_filter_marks_only_accounts_without_cpa_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = make_manager(Path(directory))
