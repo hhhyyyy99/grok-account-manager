@@ -11,3 +11,8 @@ dist/
 # Local data contains passwords and tokens. Never commit it.
 data/
 config.json
+output/
+registration-config.json
+registration-output/
+registration-crash.log
+registration-token.json

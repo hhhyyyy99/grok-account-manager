@@ -64,7 +64,7 @@ def command_list(args: argparse.Namespace) -> int:
         print(json.dumps([_account_summary(account) for account in accounts], ensure_ascii=False, indent=2))
         return 0
     if not accounts:
-        print("暂无账号。可先运行 `python3 -m grok_manager import` 导入参考项目产物。")
+        print("暂无账号。可先批量注册，或运行 `python3 -m grok_manager import` 导入历史产物。")
         return 0
     print("ID    总状态      SSO         CPA         邮箱")
     print("----  ----------  ----------  ----------  ----------------------------------------")
@@ -160,7 +160,7 @@ def command_delete(args: argparse.Namespace) -> int:
         print("请通过 --ids 指定账号", file=sys.stderr)
         return 2
     deleted = manager.store.delete(ids)
-    print("已从管理库删除 %s 个账号；参考项目原始文件未改动" % deleted)
+    print("已从管理库删除 %s 个账号；注册产物文件未改动" % deleted)
     return 0
 
 
@@ -197,7 +197,7 @@ def build_parser() -> argparse.ArgumentParser:
     listing.add_argument("--json", action="store_true")
     listing.set_defaults(handler=command_list)
 
-    importer = subparsers.add_parser("import", help="导入参考项目账号产物")
+    importer = subparsers.add_parser("import", help="导入本应用的账号产物")
     importer.add_argument("--file", action="append", default=[], help="指定 accounts.txt，可重复")
     importer.set_defaults(handler=command_import)
 
@@ -213,7 +213,7 @@ def build_parser() -> argparse.ArgumentParser:
     login.add_argument("--expired", action="store_true", help="登录巡检判定为过期/无效/待登录的账号")
     login.set_defaults(handler=command_login)
 
-    register = subparsers.add_parser("register", help="调用参考项目批量注册")
+    register = subparsers.add_parser("register", help="调用内置运行时批量注册")
     register.add_argument("--count", type=int, default=1)
     register.add_argument("--threads", type=int, default=1)
     register.add_argument("--mint-workers", type=int, default=1)
@@ -221,7 +221,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     config = subparsers.add_parser("config", help="查看/检查配置")
     config_sub = config.add_subparsers(dest="config_command", required=True)
-    check = config_sub.add_parser("check", help="检查参考项目与运行环境")
+    check = config_sub.add_parser("check", help="检查内置注册运行环境")
     check.set_defaults(handler=command_config_check)
     show = config_sub.add_parser("show", help="显示管理端配置")
     show.set_defaults(handler=command_config_show)

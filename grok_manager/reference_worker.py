@@ -1,15 +1,13 @@
-"""Worker executed with grok-register-mint's Python environment.
+"""Worker executed with the registration runtime embedded in this project.
 
-The manager stays dependency-free. Browser automation and DrissionPage are
-loaded only in this subprocess, using the interpreter selected for the
-reference project.
+Browser automation and DrissionPage are loaded only in this subprocess so the
+local management server can still start and report missing automation packages.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -107,12 +105,10 @@ def run_login_batch(
 
 
 def batch_login(args: argparse.Namespace) -> int:
-    reference_path = Path(args.reference_path).expanduser().resolve()
-    sys.path.insert(0, str(reference_path))
     try:
         from grok_register.cpa_xai.mint import mint_and_export
     except Exception as exc:
-        emit("GM_FATAL ", {"error": "无法加载参考项目登录模块: %s" % exc})
+        emit("GM_FATAL ", {"error": "无法加载内置登录模块: %s" % exc})
         return 3
 
     try:
@@ -149,7 +145,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="grok-manager reference browser worker")
     subparsers = parser.add_subparsers(dest="command", required=True)
     login = subparsers.add_parser("batch-login")
-    login.add_argument("--reference-path", required=True)
     login.add_argument("--input", required=True)
     login.set_defaults(handler=batch_login)
     return parser

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence
 
 from .models import Account, AccountDraft, AccountStatus, InspectionResult, utc_now_iso
 from .paths import DATABASE_FILE, ensure_data_dirs
@@ -74,18 +75,22 @@ class AccountStore:
         except OSError:
             pass
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(str(self.path), timeout=30)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout = 30000")
         try:
-            conn.execute("PRAGMA journal_mode = WAL")
-        except sqlite3.OperationalError as exc:
-            if "locked" not in str(exc).lower():
-                conn.close()
-                raise
-        conn.execute("PRAGMA foreign_keys = ON")
-        return conn
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout = 30000")
+            try:
+                conn.execute("PRAGMA journal_mode = WAL")
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower():
+                    raise
+            conn.execute("PRAGMA foreign_keys = ON")
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def upsert(self, draft: AccountDraft) -> Account:
         email = draft.email.strip().lower()

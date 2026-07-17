@@ -231,9 +231,10 @@ class GrokWebApplication:
             reference_error = safe_visible(exc)
         return {
             "manager": asdict(self.manager.config),
-            "reference": reference_config,
-            "referenceError": reference_error,
-            "resolvedPython": self.manager.config.resolve_reference_python(),
+            "registration": reference_config,
+            "registrationError": reference_error,
+            "runtimePython": self.manager.python_executable,
+            "runtimeRoot": str(self.manager.reference.root),
         }
 
     @staticmethod
@@ -357,7 +358,7 @@ class GrokWebApplication:
 
     def start_diagnostics(self) -> TaskRecord:
         def worker(task: TaskRecord) -> Dict[str, Any]:
-            task.log("开始检查参考项目环境")
+            task.log("开始检查内置注册环境")
             checks = []
             for ok, message in self.manager.diagnostics():
                 checks.append({"ok": bool(ok), "message": safe_visible(message)})
@@ -395,8 +396,6 @@ class GrokWebApplication:
         values = asdict(self.manager.config)
         values.update({key: value for key, value in payload.items() if key in known})
         config = ManagerConfig(**values).normalized()
-        if not config.reference_project.strip():
-            raise ValueError("参考项目目录不能为空")
         self.manager.save_manager_config(config)
         return self.config_json()
 
@@ -560,7 +559,7 @@ class GrokWebApplication:
                         self._json({"task": application.start_diagnostics().serialize(False)}, 202)
                     elif parsed.path == "/api/config/manager":
                         self._json(application.save_manager_config(payload))
-                    elif parsed.path == "/api/config/reference":
+                    elif parsed.path in ("/api/config/registration", "/api/config/reference"):
                         self._json(application.save_reference_config(payload))
                     elif parsed.path == "/api/accounts/delete":
                         ids = application._ids(payload)

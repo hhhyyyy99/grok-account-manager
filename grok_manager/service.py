@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Sequence, Tuple
@@ -20,22 +21,29 @@ from .store import AccountStore
 class GrokManager:
     """Application facade used by both the local Web UI and CLI."""
 
-    def __init__(self, config_store: Optional[ConfigStore] = None, store: Optional[AccountStore] = None):
+    def __init__(
+        self,
+        config_store: Optional[ConfigStore] = None,
+        store: Optional[AccountStore] = None,
+        reference: Optional[ReferenceProject] = None,
+        python_executable: str = "",
+    ):
         self.config_store = config_store or ConfigStore()
         self.config = self.config_store.load()
         self.store = store or AccountStore()
+        self.reference = reference or ReferenceProject()
+        self.python_executable = python_executable or sys.executable
+        self.reference.ensure_registration_config()
         self._wire_adapters()
 
     def _wire_adapters(self) -> None:
-        self.reference = ReferenceProject(self.config.reference_path)
-        python_executable = self.config.resolve_reference_python()
-        self.registration = RegistrationRunner(self.reference, python_executable)
+        self.registration = RegistrationRunner(self.reference, self.python_executable)
         self.inspection = InspectionService(
             self.store,
             TokenInspector(timeout_seconds=self.config.probe_timeout_seconds),
             max_workers=self.config.inspection_workers,
         )
-        self.login = BatchLoginService(self.store, self.reference, python_executable)
+        self.login = BatchLoginService(self.store, self.reference, self.python_executable)
 
     def save_manager_config(self, config: ManagerConfig) -> None:
         self.config_store.save(config)
@@ -123,4 +131,4 @@ class GrokManager:
         )
 
     def diagnostics(self) -> List[Tuple[bool, str]]:
-        return self.reference.diagnostics(self.config.resolve_reference_python())
+        return self.reference.diagnostics(self.python_executable)

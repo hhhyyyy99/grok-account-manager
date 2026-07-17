@@ -361,7 +361,7 @@
     if (!ids.length) return;
     const confirmed = await confirmOperation(
       "删除管理记录",
-      `将从本地管理库删除 ${ids.length} 条记录。参考项目原始账号和凭据文件不会被修改。`,
+      `将从本地管理库删除 ${ids.length} 条记录。注册产物和凭据文件不会被修改。`,
       true,
     );
     if (!confirmed) return;
@@ -398,14 +398,14 @@
       const config = await api("/api/config");
       state.config = config;
       setFormValues(byId("manager-config-form"), config.manager || {});
-      setFormValues(byId("reference-config-form"), config.reference || {});
-      byId("reference-json").value = JSON.stringify(config.reference || {}, null, 2);
+      setFormValues(byId("reference-config-form"), config.registration || {});
+      byId("reference-json").value = JSON.stringify(config.registration || {}, null, 2);
       const manager = config.manager || {};
       const registrationForm = byId("registration-form");
       registrationForm.elements.count.value = manager.register_count ?? 1;
       registrationForm.elements.threads.value = manager.register_threads ?? 1;
       registrationForm.elements.mintWorkers.value = manager.mint_workers ?? 1;
-      if (config.referenceError) toast(config.referenceError, true);
+      if (config.registrationError) toast(config.registrationError, true);
     } catch (error) {
       toast(error.message, true);
     }
@@ -428,9 +428,9 @@
   async function saveReferenceCommon(event) {
     event.preventDefault();
     if (!state.config) await loadConfig();
-    const values = { ...(state.config?.reference || {}), ...formValues(event.currentTarget) };
+    const values = { ...(state.config?.registration || {}), ...formValues(event.currentTarget) };
     try {
-      const config = await api("/api/config/reference", { method: "POST", body: values });
+      const config = await api("/api/config/registration", { method: "POST", body: values });
       state.config = config;
       toast("注册配置已保存");
       await loadConfig();
@@ -450,7 +450,7 @@
       return;
     }
     try {
-      const config = await api("/api/config/reference", { method: "POST", body: values });
+      const config = await api("/api/config/registration", { method: "POST", body: values });
       state.config = config;
       toast("完整注册配置已保存");
       await loadConfig();

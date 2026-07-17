@@ -114,7 +114,7 @@
 
           <div class="empty-state" id="account-empty" hidden>
             <strong>还没有账号</strong>
-            <p>从参考项目导入历史产物，或先运行一次批量注册。</p>
+            <p>导入本应用生成的历史产物，或先运行一次批量注册。</p>
             <button class="button button-primary" type="button" id="empty-import-button">导入历史产物</button>
           </div>
 
@@ -131,7 +131,7 @@
           <div>
             <p class="context-label">Registration bridge</p>
             <h1 id="registration-title">批量注册</h1>
-            <p>调用 grok-register-mint 的真实浏览器流程，完成后自动导入账号和 CPA 凭据。</p>
+            <p>调用内置的真实浏览器流程，完成后自动导入账号和 CPA 凭据。</p>
           </div>
           <button class="button" type="button" data-open-tasks>查看任务日志</button>
         </div>
@@ -165,7 +165,7 @@
           <aside class="panel readiness-panel">
             <div class="panel-heading">
               <h2>运行前检查</h2>
-              <p>注册依赖参考项目的 Python 3.13、浏览器依赖、临时邮箱和代理配置。</p>
+              <p>注册依赖当前 Python 环境中的浏览器组件，以及临时邮箱和代理配置。</p>
             </div>
             <div id="registration-readiness" class="readiness-list">
               <p class="muted">尚未运行环境检查。</p>
@@ -180,7 +180,7 @@
           <div>
             <p class="context-label">Configuration</p>
             <h1 id="settings-title">配置与环境</h1>
-            <p>管理端配置保存在当前项目。注册配置直接读写参考项目的 config.json。</p>
+            <p>管理端与注册配置都保存在当前应用的 data 目录。</p>
           </div>
           <button class="button" type="button" id="reload-config">从磁盘重载</button>
         </div>
@@ -196,17 +196,9 @@
           <form class="panel form-panel" id="manager-config-form">
             <div class="panel-heading">
               <h2>管理端运行参数</h2>
-              <p>参考项目 Python 留空时，会自动寻找其 .venv 和本机 Python。</p>
+              <p>注册与登录运行时已内置，和管理端使用同一个 Python 环境。</p>
             </div>
             <div class="form-grid two-columns">
-              <label class="field field-wide">
-                <span>参考项目目录</span>
-                <input type="text" name="reference_project" required>
-              </label>
-              <label class="field field-wide">
-                <span>参考项目 Python</span>
-                <input type="text" name="reference_python" placeholder="留空自动查找">
-              </label>
               <label class="field"><span>巡检超时（秒）</span><input type="number" name="probe_timeout_seconds" min="3" max="120"></label>
               <label class="field"><span>巡检并发</span><input type="number" name="inspection_workers" min="1" max="32"></label>
               <label class="field"><span>登录并发</span><input type="number" name="login_workers" min="1" max="10"></label>
@@ -250,7 +242,7 @@
         <div class="settings-view" data-settings-view="json">
           <form class="panel json-panel" id="reference-json-form">
             <div class="panel-heading">
-              <h2>参考项目完整 JSON</h2>
+              <h2>注册完整 JSON</h2>
               <p>保存前会验证根节点是否为 JSON 对象。请勿把密钥复制到聊天或日志。</p>
             </div>
             <label class="field">

@@ -112,7 +112,7 @@ class BatchLoginService:
         self.store.set_status(
             [account.id for account in ready],
             AccountStatus.LOGGING_IN.value,
-            "正在通过参考项目登录并重新获取 token",
+            "正在通过内置登录运行时重新获取 token",
         )
         run_dir = JOBS_DIR / (
             "login-%s-%s" % (datetime.now().strftime("%Y%m%d-%H%M%S"), uuid.uuid4().hex[:6])
@@ -140,12 +140,10 @@ class BatchLoginService:
             self.python_executable,
             str(worker_script),
             "batch-login",
-            "--reference-path",
-            str(self.project.root),
             "--input",
             str(input_file),
         ]
-        env = dict(os.environ)
+        env = self.project.environment()
         env["PYTHONUNBUFFERED"] = "1"
         parsed_ids = set()
         try:
@@ -154,7 +152,7 @@ class BatchLoginService:
                     raise RuntimeError("已有批量登录任务正在运行")
                 self._process = subprocess.Popen(
                     command,
-                    cwd=str(self.project.root),
+                    cwd=str(self.project.work_dir),
                     env=env,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
@@ -209,14 +207,11 @@ class BatchLoginService:
 
     @staticmethod
     def _worker_account(account: Account) -> Dict[str, Any]:
-        auth_dir = str(MANAGED_AUTH_DIR)
-        if account.auth_file:
-            auth_dir = str(Path(account.auth_file).expanduser().parent)
         return {
             "id": account.id,
             "email": account.email,
             "password": account.password,
-            "auth_dir": auth_dir,
+            "auth_dir": str(MANAGED_AUTH_DIR),
         }
 
     @staticmethod

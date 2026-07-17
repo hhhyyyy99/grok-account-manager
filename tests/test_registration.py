@@ -3,11 +3,35 @@ import textwrap
 import unittest
 from pathlib import Path
 
+from grok_manager.config import ConfigStore, ManagerConfig
+from grok_manager.paths import PROJECT_ROOT
 from grok_manager.reference import RegistrationRequest
+from grok_manager.service import GrokManager
+from grok_manager.store import AccountStore
 from tests.support import make_manager
 
 
 class RegistrationImportTests(unittest.TestCase):
+    def test_default_registration_runtime_is_embedded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_store = ConfigStore(root / "manager-config.json")
+            config_store.save(ManagerConfig(auto_import_on_start=False))
+
+            manager = GrokManager(
+                config_store=config_store,
+                store=AccountStore(root / "accounts.sqlite3"),
+            )
+
+            self.assertEqual(
+                (PROJECT_ROOT, True, ""),
+                (
+                    manager.reference.root,
+                    manager.reference.config_file.is_file(),
+                    manager.reference.load_registration_config().get("proxy"),
+                ),
+            )
+
     def test_registration_without_accounts_is_not_successful(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = make_manager(Path(directory))

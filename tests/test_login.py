@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from grok_manager.models import AccountDraft
+from grok_manager.paths import MANAGED_AUTH_DIR
 from tests.support import make_manager
 
 
@@ -122,13 +123,14 @@ class BatchLoginCredentialTests(unittest.TestCase):
             stored = manager.store.get(account.id)
 
             self.assertEqual(
-                (True, "fresh-sso", "fresh-access", "fresh-refresh", True),
+                (True, "fresh-sso", "fresh-access", "fresh-refresh", True, MANAGED_AUTH_DIR),
                 (
                     result.ok,
                     stored.sso_token if stored else "",
                     stored.access_token if stored else "",
                     stored.refresh_token if stored else "",
                     bool(stored and stored.last_login_at),
+                    Path(stored.auth_file).parent if stored else Path(),
                 ),
             )
 

@@ -13,7 +13,15 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .models import AccountDraft
-from .paths import JOBS_DIR, ensure_data_dirs, write_private_text_atomic
+from .paths import (
+    DATA_DIR,
+    PROJECT_ROOT,
+    REGISTRATION_CONFIG_EXAMPLE,
+    REGISTRATION_CONFIG_FILE,
+    REGISTRATION_OUTPUT_DIR,
+    ensure_data_dirs,
+    write_private_text_atomic,
+)
 
 
 LogCallback = Callable[[str], None]
@@ -41,34 +49,77 @@ class ReferenceProjectError(RuntimeError):
 
 
 class ReferenceProject:
-    """Stable adapter around the grok-register-mint project on disk."""
+    """Paths and environment for the registration runtime embedded in this package."""
 
-    def __init__(self, root: Path):
+    def __init__(
+        self,
+        root: Path = PROJECT_ROOT,
+        config_file: Path = REGISTRATION_CONFIG_FILE,
+        config_example_file: Path = REGISTRATION_CONFIG_EXAMPLE,
+        output_dir: Path = REGISTRATION_OUTPUT_DIR,
+        data_root: Path = DATA_DIR,
+    ):
         self.root = Path(root).expanduser().resolve()
+        self._config_file = Path(config_file).expanduser().resolve()
+        self._config_example_file = Path(config_example_file).expanduser().resolve()
+        self._output_dir = Path(output_dir).expanduser().resolve()
+        self.data_root = Path(data_root).expanduser().resolve()
 
     @property
     def entrypoint(self) -> Path:
-        return self.root / "register_cli.py"
+        return self.root / "grok_register" / "cli.py"
 
     @property
     def config_file(self) -> Path:
-        return self.root / "config.json"
+        return self._config_file
 
     @property
     def config_example_file(self) -> Path:
-        return self.root / "config.example.json"
+        return self._config_example_file
 
     @property
     def output_dir(self) -> Path:
-        return self.root / "output"
+        return self._output_dir
+
+    @property
+    def work_dir(self) -> Path:
+        self.data_root.mkdir(parents=True, exist_ok=True)
+        return self.data_root
+
+    @property
+    def turnstile_dir(self) -> Path:
+        return self.root / "grok_register" / "turnstilePatch"
+
+    def environment(self, base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+        env = dict(base or os.environ)
+        env.update(
+            {
+                "GROK_REGISTER_PROJECT_ROOT": str(self.data_root),
+                "GROK_REGISTER_CONFIG_FILE": str(self.config_file),
+                "GROK_REGISTER_CONFIG_EXAMPLE": str(self.config_example_file),
+                "GROK_REGISTER_OUTPUT_DIR": str(self.output_dir),
+                "GROK_REGISTER_TURNSTILE_DIR": str(self.turnstile_dir),
+                "GROK_REGISTER_CRASH_LOG": str(self.data_root / "registration-crash.log"),
+                "GROK_REGISTER_TOKEN_FILE": str(self.data_root / "registration-token.json"),
+            }
+        )
+        existing_path = env.get("PYTHONPATH", "").strip()
+        env["PYTHONPATH"] = str(self.root) + (
+            os.pathsep + existing_path if existing_path else ""
+        )
+        return env
 
     def validate(self) -> None:
         missing = []
-        for path in (self.entrypoint, self.config_example_file, self.root / "grok_register"):
+        for path in (
+            self.entrypoint,
+            self.config_example_file,
+            self.turnstile_dir / "manifest.json",
+        ):
             if not path.exists():
                 missing.append(str(path))
         if missing:
-            raise ReferenceProjectError("参考项目不完整，缺少: %s" % ", ".join(missing))
+            raise ReferenceProjectError("内置注册运行时不完整，缺少: %s" % ", ".join(missing))
 
     def load_registration_config(self) -> Dict[str, Any]:
         self.validate()
@@ -83,9 +134,9 @@ class ReferenceProject:
             try:
                 local = json.loads(self.config_file.read_text(encoding="utf-8-sig"))
             except (OSError, json.JSONDecodeError) as exc:
-                raise ReferenceProjectError("参考项目 config.json 读取失败: %s" % exc) from exc
+                raise ReferenceProjectError("注册配置读取失败: %s" % exc) from exc
             if not isinstance(local, dict):
-                raise ReferenceProjectError("参考项目 config.json 必须是 JSON 对象")
+                raise ReferenceProjectError("注册配置必须是 JSON 对象")
             base.update(local)
         return base
 
@@ -98,22 +149,23 @@ class ReferenceProject:
             json.dumps(values, ensure_ascii=False, indent=2) + "\n",
         )
 
+    def ensure_registration_config(self) -> Path:
+        if self.config_file.is_file():
+            return self.config_file
+        return self.save_registration_config(self.load_registration_config())
+
     def discover_account_files(self) -> List[Path]:
         candidates: Dict[str, Path] = {}
-        patterns = (
-            "output/out_*/accounts*.txt",
-            "output/accounts*.txt",
-            "accounts*.txt",
-        )
+        patterns = ("**/accounts*.txt",)
         for pattern in patterns:
-            for path in self.root.glob(pattern):
+            for path in self.output_dir.glob(pattern):
                 if path.is_file():
                     candidates[str(path.resolve())] = path.resolve()
         return sorted(candidates.values(), key=lambda item: (item.stat().st_mtime, str(item)))
 
     def discover_auth_files(self, extra_dirs: Sequence[Path] = ()) -> List[Path]:
         candidates: Dict[str, Path] = {}
-        for path in self.root.glob("output/**/xai-*.json"):
+        for path in self.output_dir.glob("**/xai-*.json"):
             if path.is_file():
                 candidates[str(path.resolve())] = path.resolve()
         try:
@@ -123,7 +175,7 @@ class ReferenceProject:
         if configured:
             auth_dir = Path(configured).expanduser()
             if not auth_dir.is_absolute():
-                auth_dir = self.root / auth_dir
+                auth_dir = self.data_root / auth_dir
             for path in auth_dir.glob("xai-*.json"):
                 if path.is_file():
                     candidates[str(path.resolve())] = path.resolve()
@@ -265,7 +317,7 @@ class ReferenceProject:
         checks: List[Tuple[bool, str]] = []
         try:
             self.validate()
-            checks.append((True, "参考项目结构完整"))
+            checks.append((True, "内置注册运行时完整"))
         except ReferenceProjectError as exc:
             checks.append((False, str(exc)))
             return checks
@@ -276,7 +328,8 @@ class ReferenceProject:
                     "-c",
                     "import sys; print('%s.%s.%s' % sys.version_info[:3])",
                 ],
-                cwd=str(self.root),
+                cwd=str(self.work_dir),
+                env=self.environment(),
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -288,21 +341,26 @@ class ReferenceProject:
             compatible = bool(
                 version.returncode == 0
                 and matched
-                and (int(matched.group(1)), int(matched.group(2))) == (3, 13)
+                and (int(matched.group(1)), int(matched.group(2))) >= (3, 9)
             )
             checks.append(
                 (
                     compatible,
-                    "注册 Python: %s（参考项目要求 3.13）" % (version_text or "未知"),
+                    "内置运行 Python: %s（要求 3.9+）" % (version_text or "未知"),
                 )
             )
         except (OSError, subprocess.SubprocessError) as exc:
-            checks.append((False, "注册 Python 无法执行: %s" % exc))
+            checks.append((False, "内置运行 Python 无法执行: %s" % exc))
             return checks
         try:
             imports = subprocess.run(
-                [python_executable, "-c", "import DrissionPage, curl_cffi; print('依赖完整')"],
-                cwd=str(self.root),
+                [
+                    python_executable,
+                    "-c",
+                    "import grok_register.cli, DrissionPage, curl_cffi, requests; print('依赖完整')",
+                ],
+                cwd=str(self.work_dir),
+                env=self.environment(),
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -310,7 +368,7 @@ class ReferenceProject:
                 check=False,
             )
             message = imports.stdout.strip().splitlines()[-1] if imports.stdout.strip() else "依赖检查无输出"
-            checks.append((imports.returncode == 0, "注册环境: %s" % message))
+            checks.append((imports.returncode == 0, "内置注册依赖: %s" % message))
         except (OSError, subprocess.SubprocessError) as exc:
             checks.append((False, "注册依赖检查失败: %s" % exc))
         try:
@@ -360,17 +418,18 @@ class RegistrationRunner:
             threads=max(1, min(int(request.threads), 10)),
             mint_workers=max(0, min(int(request.mint_workers), 10)),
         )
-        run_name = "register-%s-%s" % (
+        run_name = "manager-%s-%s" % (
             datetime.now().strftime("%Y%m%d-%H%M%S"),
             uuid.uuid4().hex[:6],
         )
-        run_dir = JOBS_DIR / run_name
+        run_dir = self.project.output_dir / run_name
         run_dir.mkdir(parents=True, exist_ok=False)
         accounts_file = run_dir / "accounts.txt"
         command = [
             self.python_executable,
             "-u",
-            str(self.project.entrypoint),
+            "-m",
+            "grok_register.cli",
             "--count",
             str(request.count),
             "--threads",
@@ -380,7 +439,7 @@ class RegistrationRunner:
             "--accounts-file",
             str(accounts_file),
         ]
-        env = dict(os.environ)
+        env = self.project.environment()
         env["PYTHONUNBUFFERED"] = "1"
         batch_dir = ""
         with self._lock:
@@ -389,7 +448,7 @@ class RegistrationRunner:
             try:
                 self._process = subprocess.Popen(
                     command,
-                    cwd=str(self.project.root),
+                    cwd=str(self.project.work_dir),
                     env=env,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,

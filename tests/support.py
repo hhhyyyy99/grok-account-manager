@@ -1,26 +1,42 @@
+import sys
 from pathlib import Path
 
 from grok_manager.config import ConfigStore, ManagerConfig
+from grok_manager.reference import ReferenceProject
 from grok_manager.service import GrokManager
 from grok_manager.store import AccountStore
 
 
 def make_manager(root: Path) -> GrokManager:
     reference_root = root / "reference"
-    (reference_root / "grok_register").mkdir(parents=True)
-    (reference_root / "register_cli.py").write_text("", encoding="utf-8")
-    (reference_root / "config.example.json").write_text("{}\n", encoding="utf-8")
+    package = reference_root / "grok_register"
+    (package / "turnstilePatch").mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "cli.py").write_text("", encoding="utf-8")
+    (package / "turnstilePatch" / "manifest.json").write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+    registration_config_example = reference_root / "registration-config.example.json"
+    registration_config_example.write_text("{}\n", encoding="utf-8")
 
     config_store = ConfigStore(root / "manager-config.json")
     config_store.save(
         ManagerConfig(
-            reference_project=str(reference_root),
-            reference_python="",
             live_probe=False,
             auto_import_on_start=False,
         )
     )
+    reference = ReferenceProject(
+        root=reference_root,
+        config_file=root / "registration-config.json",
+        config_example_file=registration_config_example,
+        output_dir=root / "registration-output",
+        data_root=root,
+    )
     return GrokManager(
         config_store=config_store,
         store=AccountStore(root / "accounts.sqlite3"),
+        reference=reference,
+        python_executable=sys.executable,
     )

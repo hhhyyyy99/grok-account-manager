@@ -1,22 +1,22 @@
 # Grok Account Manager
 
-本地 Grok 账号管理应用，围绕现有 [`grok-register-mint`](../grok-register-mint) 注册工具补齐账号归档、批量巡检和 token 失效后的批量登录。
+自包含的本地 Grok 账号管理应用，提供账号注册、配置、归档、批量巡检和 token 失效后的批量登录，不需要另行下载其他项目。
 
 > 仅用于你有权管理的账号。自动化注册与登录可能受目标站点条款、验证码和风控策略限制，请遵守服务条款与当地法律。
 
 ## 已实现能力
 
 - 本地 Web 管理端：账号列表、搜索、状态筛选、批量操作和实时任务日志
-- 接入 `grok-register-mint/register_cli.py`，支持注册数量、注册并发、CPA mint 并发
+- 内置注册与 OAuth mint 运行时，支持注册数量、注册并发、CPA mint 并发
 - 注册完成后自动导入 `email----password----sso` 和对应 `xai-*.json`
-- 在管理端编辑参考项目常用注册配置，也可完整编辑其 `config.json`
+- 在管理端编辑常用注册配置，也可完整编辑注册 JSON
 - 同时巡检注册 SSO cookie 与 CPA access token：
   - 本地解析两类 JWT 及 CPA `expired` 到期时间
   - SSO 通过只读的 `accounts.x.ai/account` 跳转结果确认会话
   - CPA 在线请求 `cli-chat-proxy.grok.com/v1/models`
   - 区分正常、过期、凭据无效、限流、待登录和网络异常
 - 对过期、无效或缺少 SSO 的账号批量登录
-  - 复用参考项目的真实 Chrome/DrissionPage 登录与 OAuth mint 流程
+  - 复用内置的真实 Chrome/DrissionPage 登录与 OAuth mint 流程
   - 同一次浏览器登录刷新 SSO 与 CPA OAuth 凭据
   - 登录结果逐账号回写管理库和 `xai-*.json`，随后自动复核
 - 同一套服务同时提供 CLI，方便无界面操作和故障排查
@@ -26,40 +26,35 @@
 ```text
 Grok Account Manager
 ├── 本地 SQLite：账号索引、状态、巡检/登录时间
-├── 注册桥接 ───────────→ grok-register-mint/register_cli.py
-├── 配置桥接 ───────────→ grok-register-mint/config.json
+├── 内置注册运行时 ─────→ grok_register.cli
+├── 本地注册配置 ───────→ data/registration-config.json
 ├── 巡检服务 ───────────→ accounts.x.ai/account + CPA /models
 └── 批量登录 worker ────→ grok_register.cpa_xai.mint
 ```
 
-管理端不会复制或修改参考项目的注册逻辑。浏览器自动化在独立子进程中运行，使用“配置与环境”里指定的参考项目 Python。管理端自身保持零第三方依赖。本地 HTTP 服务仅绑定回环地址并校验 `Host`，账号、配置、任务详情与全部写操作都要求页面内的随机请求令牌。
+注册运行时代码和 Turnstile 扩展随本项目一起安装。浏览器自动化仍在独立子进程中运行，避免阻塞管理端。本地 HTTP 服务仅绑定回环地址并校验 `Host`，账号、配置、任务详情与全部写操作都要求页面内的随机请求令牌。
 
 ## 环境要求
 
-管理端：
-
 - Python 3.9+
 - 现代浏览器
-
-注册与批量登录：
-
-- `/Users/puhuan/Desktop/project/mySpace/grok-register-mint`，或在界面中选择其他路径
-- 参考项目要求的 Python 3.13、`DrissionPage`、`curl_cffi`
+- 通过本项目安装的 `DrissionPage`、`curl_cffi`、`requests`
 - Chrome/Chromium 与可访问 xAI/Grok、临时邮箱 API 的网络
 
-推荐给参考项目创建独立环境：
+推荐为本项目创建虚拟环境并一次性安装全部依赖：
 
 ```bash
-cd /Users/puhuan/Desktop/project/mySpace/grok-register-mint
-python3.13 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
+cd /Users/puhuan/Desktop/project/mySpace/gork-manager
+python3 -m venv .venv
+.venv/bin/python -m pip install -e .
+.venv/bin/grok-manager ui
 ```
 
-随后按参考项目 README 配好临时邮箱、代理和 CPA。管理端的“配置与环境 → 环境检查”会检查项目结构、Python、依赖和邮箱基础配置。
+随后在“配置与环境”中设置临时邮箱、代理和 CPA。环境检查会验证内置运行时、Python、依赖和邮箱基础配置。
 
 ## 启动
 
-无需安装即可运行：
+只查看管理端时可以直接运行；执行注册或批量登录前仍需安装本项目依赖：
 
 ```bash
 cd /Users/puhuan/Desktop/project/mySpace/gork-manager
@@ -83,30 +78,32 @@ python3 -m grok_manager ui --no-browser
 
 ```text
 data/
-├── accounts.sqlite3    # 账号管理库
-├── auths/              # 没有原 CPA 目录时的新凭据
-└── jobs/               # 任务目录；登录输入中的密码会在任务结束后删除
+├── manager-config.json       # 管理端配置
+├── registration-config.json  # 注册、邮箱、代理和 CPA 配置
+├── accounts.sqlite3          # 账号管理库
+├── registration-output/      # 注册账号与 CPA 产物
+├── auths/                    # 批量登录生成的新凭据
+└── jobs/                     # 临时任务；登录输入会在任务结束后删除
 ```
 
-`data/` 与 `config.json` 已被 `.gitignore` 排除。目录权限会尽量设置为 `0700`，数据库和含敏感信息的配置会尽量设置为 `0600`。
+`data/` 已被 `.gitignore` 排除。目录权限会尽量设置为 `0700`，数据库和含敏感信息的配置会尽量设置为 `0600`。
 
 ## 推荐工作流
 
-1. 打开“配置与环境”，确认参考项目目录和 Python。
-2. 在“注册常用配置”填写临时邮箱、域名、代理和 CPA 配置。
-3. 运行“环境检查”，所有项目通过后再注册。
-4. 在“批量注册”设置数量和并发，启动任务。
-5. 注册结束后账号会自动进入“账号与巡检”。历史产物可点“导入产物”。
-6. 点“巡检全部”；已过期或在线返回 401/403 的账号会进入异常状态。
-7. 点“登录异常账号”，确认后会启动真实浏览器批量重新获取 token。
+1. 在“注册常用配置”填写临时邮箱、域名、代理和 CPA 配置。
+2. 运行“环境检查”，所有项目通过后再注册。
+3. 在“批量注册”设置数量和并发，启动任务。
+4. 注册结束后账号会自动进入“账号与巡检”。历史产物可点“导入产物”。
+5. 点“巡检全部”；已过期或在线返回 401/403 的账号会进入异常状态。
+6. 点“登录异常账号”，确认后会启动真实浏览器批量重新获取 token。
 
 ## CLI
 
 ```bash
-# 检查参考环境
+# 检查内置注册环境
 python3 -m grok_manager config check
 
-# 导入参考项目全部历史产物
+# 导入本应用全部历史产物
 python3 -m grok_manager import
 
 # 查看账号（不会输出密码或 token）
@@ -120,7 +117,7 @@ python3 -m grok_manager inspect --all --local
 # 登录所有巡检判定为过期/无效/待登录的账号
 python3 -m grok_manager login --expired
 
-# 调用参考项目注册并自动导入
+# 调用内置运行时注册并自动导入
 python3 -m grok_manager register --count 10 --threads 2 --mint-workers 2
 ```
 
@@ -146,7 +143,7 @@ python3 -m unittest discover -v
 
 ## 数据边界
 
-- “删除”只删除管理库索引，不修改参考项目原始账号和 CPA 文件。
+- “删除”只删除管理库索引，不修改注册账号和 CPA 产物文件。
 - 导入同一邮箱时，非空的新密码、SSO、access token 会更新旧记录；空字段不会擦除已有凭据。
 - 批量登录后的 SSO 优先于更旧的 `accounts.txt`，启动自动导入不会把新凭据覆盖回旧值。
 - CLI 和界面列表不会显示密码、SSO、access token 或 refresh token。
@@ -156,4 +153,8 @@ python3 -m unittest discover -v
 
 ## 当前机器首次运行提示
 
-如果环境检查显示 `No module named 'DrissionPage'`，说明管理端可运行，但参考项目的注册 Python 尚未安装依赖。请给参考项目创建 Python 3.13 虚拟环境并在管理端选择其 `.venv/bin/python`。
+如果环境检查显示 `No module named 'DrissionPage'`，说明源码模式下尚未安装本项目依赖。运行 `python3 -m pip install -e .`，然后用同一个 Python 启动管理端。
+
+## 上游许可
+
+内置注册运行时基于 MIT 许可的 `grok-register-mint`，上游版权与许可原文保存在 `grok_register/LICENSE.upstream`。运行时源码和扩展已包含在本仓库及构建产物中，使用时不访问或导入上游项目目录。

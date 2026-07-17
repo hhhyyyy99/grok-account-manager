@@ -8,14 +8,22 @@ from typing import Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("GROK_MANAGER_DATA_DIR", PROJECT_ROOT / "data")).expanduser()
-CONFIG_FILE = Path(os.environ.get("GROK_MANAGER_CONFIG", PROJECT_ROOT / "config.json")).expanduser()
+CONFIG_FILE = Path(
+    os.environ.get("GROK_MANAGER_CONFIG", DATA_DIR / "manager-config.json")
+).expanduser()
+LEGACY_CONFIG_FILE = PROJECT_ROOT / "config.json"
 DATABASE_FILE = DATA_DIR / "accounts.sqlite3"
 JOBS_DIR = DATA_DIR / "jobs"
 MANAGED_AUTH_DIR = DATA_DIR / "auths"
+REGISTRATION_CONFIG_FILE = DATA_DIR / "registration-config.json"
+REGISTRATION_OUTPUT_DIR = DATA_DIR / "registration-output"
+REGISTRATION_CONFIG_EXAMPLE = (
+    Path(__file__).resolve().parent / "registration_config.example.json"
+)
 
 
 def ensure_data_dirs() -> None:
-    for path in (DATA_DIR, JOBS_DIR, MANAGED_AUTH_DIR):
+    for path in (DATA_DIR, JOBS_DIR, MANAGED_AUTH_DIR, REGISTRATION_OUTPUT_DIR):
         path.mkdir(parents=True, exist_ok=True)
         try:
             path.chmod(0o700)

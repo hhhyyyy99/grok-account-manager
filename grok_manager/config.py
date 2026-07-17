@@ -1,28 +1,19 @@
 from __future__ import annotations
 
 import json
-import shutil
-import sys
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
 from .paths import (
     CONFIG_FILE,
-    PROJECT_ROOT,
+    LEGACY_CONFIG_FILE,
     ensure_data_dirs,
     write_private_text_atomic,
 )
 
 
-def _default_reference_path() -> str:
-    sibling = PROJECT_ROOT.parent / "grok-register-mint"
-    return str(sibling)
-
-
 @dataclass
 class ManagerConfig:
-    reference_project: str = _default_reference_path()
-    reference_python: str = ""
     live_probe: bool = True
     probe_timeout_seconds: int = 20
     inspection_workers: int = 6
@@ -32,26 +23,6 @@ class ManagerConfig:
     register_threads: int = 1
     mint_workers: int = 1
     auto_import_on_start: bool = True
-
-    @property
-    def reference_path(self) -> Path:
-        return Path(self.reference_project).expanduser().resolve()
-
-    def resolve_reference_python(self) -> str:
-        if self.reference_python.strip():
-            return str(Path(self.reference_python).expanduser())
-        candidates = [
-            self.reference_path / ".venv" / "bin" / "python",
-            self.reference_path / ".venv" / "Scripts" / "python.exe",
-        ]
-        for candidate in candidates:
-            if candidate.is_file():
-                return str(candidate)
-        for executable in ("python3.13", "python3.12", "python3"):
-            resolved = shutil.which(executable)
-            if resolved:
-                return resolved
-        return sys.executable
 
     def normalized(self) -> "ManagerConfig":
         self.probe_timeout_seconds = max(3, min(int(self.probe_timeout_seconds), 120))
@@ -70,10 +41,13 @@ class ConfigStore:
 
     def load(self) -> ManagerConfig:
         ensure_data_dirs()
-        if not self.path.is_file():
+        source = self.path
+        if not source.is_file() and self.path == CONFIG_FILE and LEGACY_CONFIG_FILE.is_file():
+            source = LEGACY_CONFIG_FILE
+        if not source.is_file():
             return ManagerConfig().normalized()
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8-sig"))
+            raw = json.loads(source.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError("管理端配置读取失败: %s" % exc) from exc
         if not isinstance(raw, dict):

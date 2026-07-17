@@ -1,6 +1,4 @@
 {
-  "reference_project": "../grok-register-mint",
-  "reference_python": "../grok-register-mint/.venv/bin/python",
   "live_probe": true,
   "probe_timeout_seconds": 20,
   "inspection_workers": 6,
