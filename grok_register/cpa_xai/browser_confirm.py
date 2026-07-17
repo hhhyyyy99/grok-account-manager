@@ -545,8 +545,16 @@ def _fill(
         return False
 
     try:
-        el.clear()
+        current = getattr(el, "value", None)
+        if current is not None and str(current) == value:
+            log(f"{field_name} already filled")
+            return True
+        el.clear(by_js=True)
         el.input(value)
+        actual = getattr(el, "value", None)
+        if actual is not None and str(actual) != value:
+            log(f"fill {field_name} did not replace existing value")
+            return False
     except Exception as e:
         log(f"fill {field_name} failed: {type(e).__name__}")
         return False

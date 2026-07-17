@@ -1,5 +1,13 @@
 (function () {
   "use strict";
+  function orderAccountsById(accounts) {
+    return Array.from(accounts || []).sort((left, right) => Number(right.id) - Number(left.id));
+  }
+
+  if (typeof module !== "undefined" && module.exports) {
+    module.exports = { orderAccountsById };
+    return;
+  }
 
   const token = document.querySelector('meta[name="grok-manager-token"]').content;
   const state = {
@@ -236,7 +244,7 @@
     query.set("page_size", String(state.pagination.pageSize));
     try {
       const payload = await api(`/api/state?${query.toString()}`);
-      state.accounts = payload.accounts || [];
+      state.accounts = orderAccountsById(payload.accounts || []);
       state.stats = payload.stats || {};
       state.tasks = payload.tasks || [];
       state.pagination = payload.pagination || state.pagination;

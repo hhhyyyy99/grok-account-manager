@@ -1,3 +1,6 @@
+import json
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +15,37 @@ class ManagerTaskConfigTests(unittest.TestCase):
         html = (ASSET_DIR / "index.html").read_text(encoding="utf-8")
         self.assertIn('<option value="checking">巡检中</option>', html)
         self.assertIn('<option value="missing_cpa">缺少 CPA 凭据</option>', html)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for asset tests")
+    def test_account_order_ignores_status_changes(self) -> None:
+        accounts = [
+            {"id": 3, "email": "c", "status": "unknown"},
+            {"id": 2, "email": "d", "status": "unknown"},
+            {"id": 1, "email": "e", "status": "unknown"},
+            {"id": 4, "email": "b", "status": "checking"},
+            {"id": 5, "email": "a", "status": "checking"},
+        ]
+        source = """
+const { orderAccountsById } = require(process.argv[1]);
+const accounts = JSON.parse(process.argv[2]);
+process.stdout.write(JSON.stringify(orderAccountsById(accounts).map((item) => item.email)));
+"""
+
+        completed = subprocess.run(
+            [
+                "node",
+                "-e",
+                source,
+                str(ASSET_DIR / "app.js"),
+                json.dumps(accounts),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(["a", "b", "c", "d", "e"], json.loads(completed.stdout))
+
 
     def test_registration_config_is_split_by_integration(self) -> None:
         html = (ASSET_DIR / "index.html").read_text(encoding="utf-8")

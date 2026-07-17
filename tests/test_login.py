@@ -121,16 +121,24 @@ class BatchLoginCredentialTests(unittest.TestCase):
         actions = []
 
         class FakeElement:
-            def clear(self):
-                actions.append(("clear", ""))
+            def __init__(self):
+                self.value = ""
+
+            def clear(self, by_js=False):
+                actions.append(("clear", by_js))
+                if by_js:
+                    self.value = ""
 
             def input(self, value):
                 actions.append(("input", value))
+                self.value += value
+
+        element = FakeElement()
 
         class FakePage:
             def ele(self, selector, timeout=0):
                 self.request = (selector, timeout)
-                return FakeElement()
+                return element
 
         page = FakePage()
         logs = []
@@ -141,8 +149,40 @@ class BatchLoginCredentialTests(unittest.TestCase):
 
         self.assertTrue(filled)
         self.assertEqual(("css:input[type='password']", 0.8), page.request)
-        self.assertEqual([("clear", ""), ("input", "secret-value")], actions)
+        self.assertEqual([("clear", True), ("input", "secret-value")], actions)
         self.assertNotIn("secret-value", " ".join(logs))
+
+    def test_fill_replaces_password_when_physical_clear_does_not_work(self) -> None:
+        class FakeElement:
+            def __init__(self):
+                self.value = ""
+
+            def clear(self, by_js=False):
+                if by_js:
+                    self.value = ""
+
+            def input(self, value):
+                self.value += value
+
+        element = FakeElement()
+
+        class FakePage:
+            def ele(self, _selector, timeout=0):
+                return element
+
+        page = FakePage()
+        for _ in range(2):
+            self.assertTrue(
+                browser_confirm._fill(
+                    page,
+                    "css:input[type='password']",
+                    "123456",
+                    lambda _message: None,
+                    "password",
+                )
+            )
+
+        self.assertEqual("123456", element.value)
 
     def test_password_is_filled_before_waiting_for_turnstile(self) -> None:
         events = []
@@ -174,6 +214,39 @@ class BatchLoginCredentialTests(unittest.TestCase):
             events,
         )
         self.assertIn("input[name='password']", selectors["password"])
+
+    def test_password_step_preserves_existing_readonly_email(self) -> None:
+        class FakeElement:
+            def __init__(self, value="", readonly=False):
+                self.value = value
+                self.readonly = readonly
+
+            def clear(self, by_js=False):
+                if by_js:
+                    self.value = ""
+
+            def input(self, value):
+                if not self.readonly:
+                    self.value += value
+
+        email = "target@example.com"
+        email_element = FakeElement(email, readonly=True)
+        password_element = FakeElement()
+
+        class FakePage:
+            def ele(self, selector, timeout=0):
+                if "type='email'" in selector:
+                    return email_element
+                return password_element
+
+        with patch.object(browser_confirm, "_wait_turnstile", return_value=True):
+            ready = browser_confirm._prepare_password_login(
+                FakePage(), email, "123456", lambda _message: None
+            )
+
+        self.assertTrue(ready)
+        self.assertEqual(email, email_element.value)
+        self.assertEqual("123456", password_element.value)
 
     def test_login_rejects_invalid_credentials_message(self) -> None:
         with self.assertRaisesRegex(browser_confirm.BrowserConfirmError, "邮箱或密码错误"):
