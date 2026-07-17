@@ -44,7 +44,7 @@ Grok Account Manager
 推荐为本项目创建虚拟环境并一次性安装全部依赖：
 
 ```bash
-cd /Users/puhuan/Desktop/project/mySpace/gork-manager
+cd grok-account-manager
 python3 -m venv .venv
 .venv/bin/python -m pip install -e .
 .venv/bin/grok-manager ui
@@ -57,7 +57,7 @@ python3 -m venv .venv
 只查看管理端时可以直接运行；执行注册或批量登录前仍需安装本项目依赖：
 
 ```bash
-cd /Users/puhuan/Desktop/project/mySpace/gork-manager
+cd grok-account-manager
 python3 run.py
 ```
 
