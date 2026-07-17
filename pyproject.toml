@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "grok-account-manager"
+version = "0.1.0"
+description = "Local manager for Grok registration, account inspection, and batch login"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "gork-manager contributors" }]
+dependencies = []
+
+[project.scripts]
+grok-manager = "grok_manager.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["grok_manager*"]
+
+[tool.setuptools.package-data]
+grok_manager = ["web_assets/*.html", "web_assets/*.css", "web_assets/*.js"]

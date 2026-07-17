@@ -1,0 +1,13 @@
+{
+  "reference_project": "../grok-register-mint",
+  "reference_python": "../grok-register-mint/.venv/bin/python",
+  "live_probe": true,
+  "probe_timeout_seconds": 20,
+  "inspection_workers": 6,
+  "login_workers": 2,
+  "login_timeout_seconds": 300,
+  "register_count": 1,
+  "register_threads": 1,
+  "mint_workers": 1,
+  "auto_import_on_start": true
+}
