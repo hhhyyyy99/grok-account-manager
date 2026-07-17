@@ -72,7 +72,16 @@ JOBS_DIR = DATA_DIR / "jobs"
 MANAGED_AUTH_DIR = DATA_DIR / "auths"
 REGISTRATION_CONFIG_FILE = DATA_DIR / "registration-config.json"
 REGISTRATION_OUTPUT_DIR = DATA_DIR / "registration-output"
-LEGACY_MIGRATION_FILE = DATA_DIR / ".legacy-registration-migration-v1.json"
+REGISTRATION_PATH_KEYS = frozenset(
+    {
+        "cpa_auth_dir",
+        "cpa_hotload_dir",
+        "grok2api_local_token_file",
+        "sub2api_combined_file",
+        "sub2api_export_dir",
+    }
+)
+LEGACY_MIGRATION_FILE = DATA_DIR / ".legacy-registration-migration-v2.json"
 LEGACY_INSTALL_MIGRATION_FILE = DATA_DIR / ".legacy-install-migration-v1.json"
 REGISTRATION_CONFIG_EXAMPLE = (
     PACKAGE_DIR / "registration_config.example.json"
@@ -157,7 +166,10 @@ def _account_count(database: Path) -> int:
     if not database.is_file():
         return 0
     try:
-        connection = sqlite3.connect("file:%s?mode=ro" % database, uri=True)
+        connection = sqlite3.connect(
+            database.resolve().as_uri() + "?mode=ro",
+            uri=True,
+        )
         try:
             row = connection.execute("SELECT COUNT(*) FROM accounts").fetchone()
             return int(row[0]) if row else 0
@@ -167,24 +179,177 @@ def _account_count(database: Path) -> int:
         return -1
 
 
-def _backup_account_database(source: Path, destination: Path) -> bool:
+def _migrate_account_database(source: Path, destination: Path) -> tuple[bool, int]:
     source_count = _account_count(source)
     destination_count = _account_count(destination)
-    if source_count <= 0 or destination_count > 0:
-        return False
+    if source_count < 0:
+        raise ValueError("旧账号数据库无法读取: %s" % source)
+    if source_count == 0:
+        return True, 0
     destination.parent.mkdir(parents=True, exist_ok=True)
-    source_connection = sqlite3.connect("file:%s?mode=ro" % source, uri=True)
-    destination_connection = sqlite3.connect(destination)
-    try:
-        source_connection.backup(destination_connection)
-    finally:
-        destination_connection.close()
-        source_connection.close()
+    if destination_count <= 0:
+        source_connection = sqlite3.connect(
+            source.resolve().as_uri() + "?mode=ro",
+            uri=True,
+        )
+        destination_connection = sqlite3.connect(destination)
+        try:
+            source_connection.backup(destination_connection)
+        finally:
+            destination_connection.close()
+            source_connection.close()
+        migrated_count = source_count
+    else:
+        source_connection = sqlite3.connect(
+            source.resolve().as_uri() + "?mode=ro",
+            uri=True,
+        )
+        destination_connection = sqlite3.connect(destination)
+        source_connection.row_factory = sqlite3.Row
+        destination_connection.row_factory = sqlite3.Row
+        try:
+            source_columns = {
+                str(row[1])
+                for row in source_connection.execute("PRAGMA table_info(accounts)")
+            }
+            destination_columns = {
+                str(row[1])
+                for row in destination_connection.execute("PRAGMA table_info(accounts)")
+            }
+            expected_columns = (
+                "email",
+                "password",
+                "sso_token",
+                "access_token",
+                "refresh_token",
+                "token_expires_at",
+                "sso_expires_at",
+                "auth_file",
+                "source",
+                "source_modified_at",
+                "status",
+                "status_detail",
+                "sso_status",
+                "sso_detail",
+                "cpa_status",
+                "cpa_detail",
+                "last_checked_at",
+                "last_login_at",
+                "created_at",
+                "updated_at",
+            )
+            columns = [
+                name
+                for name in expected_columns
+                if name in source_columns and name in destination_columns
+            ]
+            if "email" not in columns:
+                raise ValueError("账号数据库缺少 email 列")
+            fill_empty_columns = {
+                "password",
+                "sso_token",
+                "access_token",
+                "refresh_token",
+                "token_expires_at",
+                "sso_expires_at",
+                "auth_file",
+                "source",
+                "source_modified_at",
+                "last_checked_at",
+                "last_login_at",
+            }
+            source_rows = source_connection.execute(
+                "SELECT %s FROM accounts" % ", ".join(columns)
+            ).fetchall()
+
+            def migrated_value(row: sqlite3.Row, name: str):
+                value = row[name]
+                if name != "auth_file" or not str(value or "").strip():
+                    return value
+                auth_path = Path(str(value)).expanduser()
+                if not auth_path.is_absolute():
+                    return value
+                try:
+                    relative = auth_path.resolve().relative_to(source.parent.resolve())
+                except ValueError:
+                    return value
+                return str(destination.parent / relative)
+
+            migrated_count = 0
+            with destination_connection:
+                for row in source_rows:
+                    email = str(row["email"] or "").strip().lower()
+                    if not email:
+                        continue
+                    existing = destination_connection.execute(
+                        "SELECT * FROM accounts WHERE email = ? COLLATE NOCASE",
+                        (email,),
+                    ).fetchone()
+                    if existing is None:
+                        placeholders = ", ".join("?" for _ in columns)
+                        destination_connection.execute(
+                            "INSERT INTO accounts (%s) VALUES (%s)"
+                            % (", ".join(columns), placeholders),
+                            [migrated_value(row, name) for name in columns],
+                        )
+                        migrated_count += 1
+                        continue
+                    updates = {
+                        name: migrated_value(row, name)
+                        for name in columns
+                        if name in fill_empty_columns
+                        and not str(existing[name] or "").strip()
+                        and str(row[name] or "").strip()
+                    }
+                    if updates:
+                        destination_connection.execute(
+                            "UPDATE accounts SET %s WHERE email = ? COLLATE NOCASE"
+                            % ", ".join("%s = ?" % name for name in updates),
+                            list(updates.values()) + [email],
+                        )
+                        migrated_count += 1
+        finally:
+            destination_connection.close()
+            source_connection.close()
     try:
         destination.chmod(0o600)
     except OSError:
         pass
-    return True
+    return True, migrated_count
+
+
+def _rebase_registration_config(
+    config_file: Path,
+    source_root: Path,
+    destination_root: Path,
+) -> None:
+    if not config_file.is_file():
+        return
+    try:
+        values = json.loads(config_file.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("迁移后的注册配置无法读取: %s" % exc) from exc
+    if not isinstance(values, dict):
+        raise ValueError("迁移后的注册配置必须是 JSON 对象")
+    changed = False
+    for key in REGISTRATION_PATH_KEYS:
+        raw = str(values.get(key) or "").strip()
+        if not raw:
+            continue
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            continue
+        try:
+            relative = path.resolve().relative_to(source_root.resolve())
+        except ValueError:
+            continue
+        values[key] = str(destination_root / relative)
+        changed = True
+    if changed:
+        write_private_text_atomic(
+            config_file,
+            json.dumps(values, ensure_ascii=False, indent=2) + "\n",
+        )
 
 
 def _migrate_legacy_install_data(
@@ -206,10 +371,14 @@ def _migrate_legacy_install_data(
         if source_data_dir.is_dir()
         else 0
     )
-    database_copied = _backup_account_database(
-        source_data_dir / "accounts.sqlite3",
-        destination_data_dir / "accounts.sqlite3",
-    )
+    source_database = source_data_dir / "accounts.sqlite3"
+    if source_database.is_file():
+        database_migrated, accounts_migrated = _migrate_account_database(
+            source_database,
+            destination_data_dir / "accounts.sqlite3",
+        )
+    else:
+        database_migrated, accounts_migrated = True, 0
     manager_config = destination_data_dir / "manager-config.json"
     config_copied = False
     if source_config_file.is_file() and not manager_config.exists():
@@ -219,6 +388,11 @@ def _migrate_legacy_install_data(
         except OSError:
             pass
         config_copied = True
+    _rebase_registration_config(
+        destination_data_dir / "registration-config.json",
+        source_data_dir,
+        destination_data_dir,
+    )
     write_private_text_atomic(
         marker_file,
         json.dumps(
@@ -229,7 +403,8 @@ def _migrate_legacy_install_data(
                 .replace("+00:00", "Z"),
                 "source": str(source_data_dir),
                 "files_copied": files_copied,
-                "database_copied": database_copied,
+                "database_migrated": database_migrated,
+                "accounts_migrated": accounts_migrated,
                 "manager_config_copied": config_copied,
             },
             ensure_ascii=False,

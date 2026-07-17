@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from grok_manager.config import ConfigStore, ManagerConfig
+from grok_manager.models import AccountDraft
 from grok_manager.paths import PROJECT_ROOT
 from grok_manager.reference import (
     ReferenceProject,
@@ -80,6 +81,15 @@ class RegistrationImportTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            (legacy_auth / "xai-database@example.com.json").write_text(
+                json.dumps(
+                    {
+                        "email": "database@example.com",
+                        "access_token": "database-access",
+                    }
+                ),
+                encoding="utf-8",
+            )
             legacy_manager_config = root / "legacy-manager-config.json"
             legacy_manager_config.write_text(
                 json.dumps({"reference_project": legacy_root.name}),
@@ -98,14 +108,24 @@ class RegistrationImportTests(unittest.TestCase):
                 legacy_manager_config_file=legacy_manager_config,
                 migration_file=migration_file,
             )
+            store = AccountStore(data_root / "accounts.sqlite3")
+            stored_before_migration = store.upsert(
+                AccountDraft(
+                    email="database@example.com",
+                    password="password",
+                    access_token="database-access",
+                    auth_file=str(legacy_auth / "xai-database@example.com.json"),
+                )
+            )
             manager = GrokManager(
                 config_store=ConfigStore(data_root / "manager-config.json"),
-                store=AccountStore(data_root / "accounts.sqlite3"),
+                store=store,
                 reference=reference,
             )
 
             migrated_config = manager.reference.load_registration_config()
             records = manager.reference.import_records()
+            stored_after_migration = manager.store.get(stored_before_migration.id)
             self.assertEqual("http://127.0.0.1:7890", migrated_config["proxy"])
             self.assertNotIn(str(legacy_root), migrated_config["cpa_auth_dir"])
             self.assertEqual(
@@ -115,6 +135,20 @@ class RegistrationImportTests(unittest.TestCase):
                     [record.email for record in records],
                     records[0].access_token,
                 ),
+            )
+            expected_auth_file = (
+                data_root
+                / "registration-output"
+                / "legacy-import"
+                / "out_old"
+                / "cpa_auths"
+                / "xai-database@example.com.json"
+            )
+            self.assertEqual(
+                expected_auth_file.resolve(),
+                Path(stored_after_migration.auth_file)
+                if stored_after_migration
+                else Path(),
             )
 
             (legacy_root / "config.json").write_text(

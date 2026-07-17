@@ -127,10 +127,22 @@ class AccountStore:
                         ) THEN excluded.sso_token
                         ELSE accounts.sso_token
                     END,
-                    access_token = CASE WHEN excluded.access_token != '' THEN excluded.access_token ELSE accounts.access_token END,
-                    refresh_token = CASE WHEN excluded.refresh_token != '' THEN excluded.refresh_token ELSE accounts.refresh_token END,
-                    token_expires_at = CASE WHEN excluded.token_expires_at != '' THEN excluded.token_expires_at ELSE accounts.token_expires_at END,
-                    auth_file = CASE WHEN excluded.auth_file != '' THEN excluded.auth_file ELSE accounts.auth_file END,
+                    access_token = CASE
+                        WHEN excluded.access_token != '' AND (
+                            accounts.last_login_at = '' OR excluded.auth_file = accounts.auth_file
+                        ) THEN excluded.access_token ELSE accounts.access_token END,
+                    refresh_token = CASE
+                        WHEN excluded.refresh_token != '' AND (
+                            accounts.last_login_at = '' OR excluded.auth_file = accounts.auth_file
+                        ) THEN excluded.refresh_token ELSE accounts.refresh_token END,
+                    token_expires_at = CASE
+                        WHEN excluded.token_expires_at != '' AND (
+                            accounts.last_login_at = '' OR excluded.auth_file = accounts.auth_file
+                        ) THEN excluded.token_expires_at ELSE accounts.token_expires_at END,
+                    auth_file = CASE
+                        WHEN excluded.auth_file != '' AND (
+                            accounts.last_login_at = '' OR excluded.auth_file = accounts.auth_file
+                        ) THEN excluded.auth_file ELSE accounts.auth_file END,
                     source = CASE WHEN excluded.source != '' THEN excluded.source ELSE accounts.source END,
                     source_modified_at = CASE
                         WHEN excluded.source_modified_at > accounts.source_modified_at
@@ -142,7 +154,9 @@ class AccountStore:
                             accounts.last_login_at = '' OR
                             excluded.source_modified_at >= accounts.last_login_at
                         ) THEN 'unknown'
-                        WHEN excluded.access_token != '' AND excluded.access_token != accounts.access_token THEN 'unknown'
+                        WHEN excluded.access_token != '' AND excluded.access_token != accounts.access_token AND (
+                            accounts.last_login_at = '' OR excluded.auth_file = accounts.auth_file
+                        ) THEN 'unknown'
                         ELSE accounts.status
                     END,
                     status_detail = CASE
@@ -150,7 +164,9 @@ class AccountStore:
                             accounts.last_login_at = '' OR
                             excluded.source_modified_at >= accounts.last_login_at
                         ) THEN ''
-                        WHEN excluded.access_token != '' AND excluded.access_token != accounts.access_token THEN ''
+                        WHEN excluded.access_token != '' AND excluded.access_token != accounts.access_token AND (
+                            accounts.last_login_at = '' OR excluded.auth_file = accounts.auth_file
+                        ) THEN ''
                         ELSE accounts.status_detail
                     END,
                     sso_status = CASE
@@ -168,11 +184,15 @@ class AccountStore:
                         ELSE accounts.sso_detail
                     END,
                     cpa_status = CASE
-                        WHEN excluded.access_token != '' AND excluded.access_token != accounts.access_token THEN 'unknown'
+                        WHEN excluded.access_token != '' AND excluded.access_token != accounts.access_token AND (
+                            accounts.last_login_at = '' OR excluded.auth_file = accounts.auth_file
+                        ) THEN 'unknown'
                         ELSE accounts.cpa_status
                     END,
                     cpa_detail = CASE
-                        WHEN excluded.access_token != '' AND excluded.access_token != accounts.access_token THEN ''
+                        WHEN excluded.access_token != '' AND excluded.access_token != accounts.access_token AND (
+                            accounts.last_login_at = '' OR excluded.auth_file = accounts.auth_file
+                        ) THEN ''
                         ELSE accounts.cpa_detail
                     END,
                     updated_at = excluded.updated_at

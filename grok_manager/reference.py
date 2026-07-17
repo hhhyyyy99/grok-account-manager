@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import threading
 import uuid
@@ -19,10 +20,12 @@ from .paths import (
     DEFAULT_LEGACY_REFERENCE_ROOT,
     LEGACY_CONFIG_FILE,
     LEGACY_MIGRATION_FILE,
+    MANAGED_AUTH_DIR,
     PROJECT_ROOT,
     REGISTRATION_CONFIG_EXAMPLE,
     REGISTRATION_CONFIG_FILE,
     REGISTRATION_OUTPUT_DIR,
+    REGISTRATION_PATH_KEYS,
     ensure_data_dirs,
     write_private_text_atomic,
 )
@@ -69,6 +72,7 @@ class ReferenceProject:
         config_example_file: Path = REGISTRATION_CONFIG_EXAMPLE,
         output_dir: Path = REGISTRATION_OUTPUT_DIR,
         data_root: Path = DATA_DIR,
+        managed_auth_dir: Path = MANAGED_AUTH_DIR,
         legacy_manager_config_file: Optional[Path] = None,
         legacy_reference_root: Optional[Path] = None,
         migration_file: Optional[Path] = None,
@@ -78,6 +82,7 @@ class ReferenceProject:
         self._config_example_file = Path(config_example_file).expanduser().resolve()
         self._output_dir = Path(output_dir).expanduser().resolve()
         self.data_root = Path(data_root).expanduser().resolve()
+        self.managed_auth_dir = Path(managed_auth_dir).expanduser().resolve()
         default_layout = (
             self.root == PROJECT_ROOT.resolve() and self.data_root == DATA_DIR.resolve()
         )
@@ -104,7 +109,7 @@ class ReferenceProject:
             else (
                 LEGACY_MIGRATION_FILE.resolve()
                 if default_layout
-                else self.data_root / ".legacy-registration-migration-v1.json"
+                else self.data_root / ".legacy-registration-migration-v2.json"
             )
         )
 
@@ -231,15 +236,8 @@ class ReferenceProject:
         values: Dict[str, Any],
         legacy_root: Path,
     ) -> Dict[str, Any]:
-        path_keys = {
-            "cpa_auth_dir",
-            "cpa_hotload_dir",
-            "grok2api_local_token_file",
-            "sub2api_combined_file",
-            "sub2api_export_dir",
-        }
         migrated = dict(values)
-        for key in path_keys:
+        for key in REGISTRATION_PATH_KEYS:
             raw = str(migrated.get(key) or "").strip()
             if not raw:
                 continue
@@ -301,8 +299,12 @@ class ReferenceProject:
             "source": str(legacy_root) if legacy_root is not None else "",
             "config_copied": False,
             "output_files_copied": 0,
+            "database_auth_paths_rebased": 0,
         }
         if legacy_root is not None and legacy_root != self.root:
+            result["database_auth_paths_rebased"] = self._rebase_database_auth_paths(
+                legacy_root
+            )
             legacy_config = legacy_root / "config.json"
             legacy_output = legacy_root / "output"
             if not legacy_config.is_file() and not legacy_output.is_dir():
@@ -327,6 +329,45 @@ class ReferenceProject:
             self.migration_file,
             json.dumps(result, ensure_ascii=False, indent=2) + "\n",
         )
+
+    def _rebase_database_auth_paths(self, legacy_root: Path) -> int:
+        database = self.data_root / "accounts.sqlite3"
+        if not database.is_file():
+            return 0
+        connection = sqlite3.connect(database)
+        try:
+            columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(accounts)")
+            }
+            if "id" not in columns or "auth_file" not in columns:
+                return 0
+            updates = []
+            for account_id, raw in connection.execute(
+                "SELECT id, auth_file FROM accounts WHERE auth_file != ''"
+            ):
+                path = Path(str(raw)).expanduser()
+                if not path.is_absolute():
+                    continue
+                try:
+                    relative = path.resolve().relative_to(legacy_root / "output")
+                except ValueError:
+                    continue
+                updates.append(
+                    (
+                        str((self.output_dir / "legacy-import" / relative).resolve()),
+                        int(account_id),
+                    )
+                )
+            if updates:
+                with connection:
+                    connection.executemany(
+                        "UPDATE accounts SET auth_file = ? WHERE id = ?",
+                        updates,
+                    )
+            return len(updates)
+        finally:
+            connection.close()
 
     def discover_account_files(self) -> List[Path]:
         candidates: Dict[str, Path] = {}
@@ -353,6 +394,9 @@ class ReferenceProject:
             for path in auth_dir.glob("xai-*.json"):
                 if path.is_file():
                     candidates[str(path.resolve())] = path.resolve()
+        for path in self.managed_auth_dir.glob("xai-*.json"):
+            if path.is_file():
+                candidates[str(path.resolve())] = path.resolve()
         for extra_dir in extra_dirs:
             directory = Path(extra_dir)
             if directory.is_file():

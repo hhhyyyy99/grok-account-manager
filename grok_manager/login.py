@@ -15,7 +15,6 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 from .models import Account, AccountStatus, LoginResult
 from .paths import (
     JOBS_DIR,
-    MANAGED_AUTH_DIR,
     ensure_data_dirs,
     write_private_text_atomic,
 )
@@ -129,7 +128,7 @@ class BatchLoginService:
                 "probe": bool(settings.probe_after_login),
                 "reuse_browser": True,
                 "recycle_every": 10,
-                "default_auth_dir": str(MANAGED_AUTH_DIR),
+                "default_auth_dir": str(self.project.managed_auth_dir),
             },
             "accounts": [self._worker_account(account) for account in ready],
         }
@@ -205,13 +204,12 @@ class BatchLoginService:
         results.sort(key=lambda item: item.account_id)
         return results
 
-    @staticmethod
-    def _worker_account(account: Account) -> Dict[str, Any]:
+    def _worker_account(self, account: Account) -> Dict[str, Any]:
         return {
             "id": account.id,
             "email": account.email,
             "password": account.password,
-            "auth_dir": str(MANAGED_AUTH_DIR),
+            "auth_dir": str(self.project.managed_auth_dir),
         }
 
     @staticmethod

@@ -1,3 +1,5 @@
+import json
+import os
 import sys
 import tempfile
 import textwrap
@@ -136,6 +138,77 @@ class BatchLoginCredentialTests(unittest.TestCase):
                 (result.ok, stored.access_token if stored else ""),
             )
 
+    def test_auto_import_keeps_managed_login_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = make_manager(root)
+            output = manager.reference.output_dir / "out_old"
+            output.mkdir(parents=True)
+            accounts_file = output / "accounts.txt"
+            accounts_file.write_text(
+                "persisted@example.com----password----old-sso\n",
+                encoding="utf-8",
+            )
+            old_auth = output / "xai-persisted@example.com.json"
+            old_auth.write_text(
+                json.dumps(
+                    {
+                        "email": "persisted@example.com",
+                        "access_token": "old-access",
+                        "refresh_token": "old-refresh",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.utime(accounts_file, (1000, 1000))
+            os.utime(old_auth, (1000, 1000))
+            account = manager.import_reference_accounts()[0]
+
+            managed_auth = manager.reference.managed_auth_dir / old_auth.name
+            managed_auth.parent.mkdir(parents=True, exist_ok=True)
+            managed_auth.write_text(
+                json.dumps(
+                    {
+                        "email": "persisted@example.com",
+                        "access_token": "fresh-access",
+                        "refresh_token": "fresh-refresh",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.utime(managed_auth, (2000, 2000))
+            manager.store.apply_login_credentials(
+                account.id,
+                "fresh-access",
+                "fresh-refresh",
+                "2099-01-01T00:00:00Z",
+                str(managed_auth),
+                sso_token="fresh-sso",
+            )
+
+            indexed_path, _payload = manager.reference.build_auth_index()[
+                "persisted@example.com"
+            ]
+            manager.import_reference_accounts()
+            stored = manager.store.get(account.id)
+
+            self.assertEqual(
+                (
+                    managed_auth,
+                    "fresh-sso",
+                    "fresh-access",
+                    "fresh-refresh",
+                    managed_auth,
+                ),
+                (
+                    indexed_path,
+                    stored.sso_token if stored else "",
+                    stored.access_token if stored else "",
+                    stored.refresh_token if stored else "",
+                    Path(stored.auth_file) if stored else Path(),
+                ),
+            )
+
     def test_login_updates_sso_and_cpa_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -156,7 +229,14 @@ class BatchLoginCredentialTests(unittest.TestCase):
             stored = manager.store.get(account.id)
 
             self.assertEqual(
-                (True, "fresh-sso", "fresh-access", "fresh-refresh", True, MANAGED_AUTH_DIR),
+                (
+                    True,
+                    "fresh-sso",
+                    "fresh-access",
+                    "fresh-refresh",
+                    True,
+                    MANAGED_AUTH_DIR.resolve(),
+                ),
                 (
                     result.ok,
                     stored.sso_token if stored else "",
