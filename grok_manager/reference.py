@@ -202,11 +202,11 @@ class ReferenceProject:
             return self.config_file
         return self.save_registration_config(self.load_registration_config())
 
-    def _legacy_root_from_manager_config(self) -> Optional[Path]:
+    def _legacy_root_from_manager_config(self) -> Tuple[Optional[Path], bool]:
         root = self.legacy_reference_root
         path = self.legacy_manager_config_file
         if path is None or not path.is_file():
-            return root
+            return root, False
         try:
             values = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -215,11 +215,11 @@ class ReferenceProject:
             raise ReferenceProjectError("旧管理端配置必须是 JSON 对象")
         configured = str(values.get("reference_project") or "").strip()
         if not configured:
-            return root
+            return root, False
         configured_path = Path(configured).expanduser()
         if not configured_path.is_absolute():
             configured_path = path.parent / configured_path
-        return configured_path.resolve()
+        return configured_path.resolve(), True
 
     def _registration_config_is_default(self) -> bool:
         if not self.config_file.is_file():
@@ -290,7 +290,7 @@ class ReferenceProject:
         if self.migration_file.is_file():
             return
         ensure_data_dirs()
-        legacy_root = self._legacy_root_from_manager_config()
+        legacy_root, explicit_source = self._legacy_root_from_manager_config()
         result: Dict[str, Any] = {
             "completed_at": datetime.now(tz=timezone.utc)
             .replace(microsecond=0)
@@ -308,7 +308,8 @@ class ReferenceProject:
             legacy_config = legacy_root / "config.json"
             legacy_output = legacy_root / "output"
             if not legacy_config.is_file() and not legacy_output.is_dir():
-                return
+                if explicit_source:
+                    return
             if legacy_config.is_file() and self._registration_config_is_default():
                 try:
                     values = json.loads(legacy_config.read_text(encoding="utf-8-sig"))
