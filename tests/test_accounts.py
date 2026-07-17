@@ -1,8 +1,10 @@
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
-from grok_manager.models import AccountDraft, InspectionResult
+from grok_manager.models import AccountDraft, AccountStatus, InspectionResult
+from grok_manager.store import AccountStore
 from grok_manager.web import GrokWebApplication
 from tests.support import make_manager
 
@@ -155,6 +157,34 @@ class AccountImportQueryTests(unittest.TestCase):
                     state["accounts"][0]["cpaStatus"],
                     state["accounts"][0]["cpaStatusLabel"],
                     state["accounts"][0]["missingCpa"],
+                ),
+            )
+
+    def test_store_removes_legacy_logging_in_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "accounts.sqlite3"
+            store = AccountStore(database)
+            account = store.upsert(
+                AccountDraft(email="legacy@example.com", password="password")
+            )
+            connection = sqlite3.connect(str(database))
+            try:
+                connection.execute(
+                    "UPDATE accounts SET status = ?, status_detail = ? WHERE id = ?",
+                    ("logging_in", "旧的登录任务状态", account.id),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            migrated = AccountStore(database).get(account.id)
+
+            self.assertIsNotNone(migrated)
+            self.assertEqual(
+                (AccountStatus.UNKNOWN.value, ""),
+                (
+                    migrated.status if migrated else "",
+                    migrated.status_detail if migrated else "",
                 ),
             )
 

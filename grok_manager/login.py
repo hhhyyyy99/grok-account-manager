@@ -108,11 +108,6 @@ class BatchLoginService:
 
         self.project.validate()
         ensure_data_dirs()
-        self.store.set_status(
-            [account.id for account in ready],
-            AccountStatus.LOGGING_IN.value,
-            "正在通过内置登录运行时重新获取 token",
-        )
         run_dir = JOBS_DIR / (
             "login-%s-%s" % (datetime.now().strftime("%Y%m%d-%H%M%S"), uuid.uuid4().hex[:6])
         )

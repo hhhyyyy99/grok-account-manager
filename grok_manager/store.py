@@ -69,6 +69,10 @@ class AccountStore:
             for name, definition in MIGRATION_COLUMNS.items():
                 if name not in existing:
                     conn.execute("ALTER TABLE accounts ADD COLUMN %s %s" % (name, definition))
+            conn.execute(
+                "UPDATE accounts SET status = 'unknown', status_detail = '' "
+                "WHERE status = 'logging_in'"
+            )
             conn.execute("PRAGMA user_version = 3")
         try:
             self.path.chmod(0o600)

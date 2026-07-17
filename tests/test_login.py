@@ -10,7 +10,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 import DrissionPage
-from grok_manager.models import AccountDraft
+from grok_manager.login import LoginSettings
+from grok_manager.models import AccountDraft, AccountStatus
 from grok_manager.paths import MANAGED_AUTH_DIR
 from grok_register.cpa_xai import browser_confirm, oauth_device
 from grok_register.paths import TURNSTILE_DIR
@@ -249,6 +250,40 @@ class BatchLoginCredentialTests(unittest.TestCase):
                 (False, "old-access"),
                 (result.ok, stored.access_token if stored else ""),
             )
+
+    def test_login_keeps_account_status_until_result_arrives(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            account = manager.store.upsert(
+                AccountDraft(email="expired@example.com", password="password")
+            )
+            manager.store.set_status(
+                [account.id], AccountStatus.EXPIRED.value, "原有凭据已过期"
+            )
+            observed_statuses = []
+
+            class ObservingOutput:
+                def __iter__(self):
+                    stored = manager.store.get(account.id)
+                    observed_statuses.append(stored.status if stored else "")
+                    return iter(())
+
+                def close(self):
+                    return None
+
+            class FakeProcess:
+                stdout = ObservingOutput()
+
+                @staticmethod
+                def wait():
+                    return 0
+
+            with patch(
+                "grok_manager.login.subprocess.Popen", return_value=FakeProcess()
+            ):
+                manager.login.login_accounts([account.id], LoginSettings())
+
+            self.assertEqual([AccountStatus.EXPIRED.value], observed_statuses)
 
     def test_auto_import_keeps_managed_login_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

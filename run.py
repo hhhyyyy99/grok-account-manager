@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Iterable, List, Optional
@@ -41,15 +42,40 @@ def normalize_cli_args(argv: Iterable[str]) -> List[str]:
     return args
 
 
-def activate_project_venv(argv: Iterable[str]) -> None:
+def find_uv() -> Optional[str]:
+    return shutil.which("uv")
+
+
+def activate_project_environment(argv: Iterable[str]) -> None:
+    args = list(argv)
     executable = find_venv_python()
-    if executable is None or is_current_python(executable):
+    if executable is not None and is_current_python(executable):
         return
     script = str(ROOT / "run.py")
-    try:
-        os.execv(str(executable), [str(executable), script, *list(argv)])
-    except OSError as exc:
-        raise RuntimeError("无法使用项目虚拟环境启动: %s" % exc) from exc
+    if executable is not None:
+        try:
+            os.execv(str(executable), [str(executable), script, *args])
+        except OSError as exc:
+            raise RuntimeError("无法使用项目虚拟环境启动: %s" % exc) from exc
+        return
+    uv = find_uv()
+    if uv:
+        try:
+            os.execv(
+                uv,
+                [
+                    uv,
+                    "run",
+                    "--locked",
+                    "--project",
+                    str(ROOT),
+                    "python",
+                    script,
+                    *args,
+                ],
+            )
+        except OSError as exc:
+            raise RuntimeError("无法通过 uv 启动项目环境: %s" % exc) from exc
 
 
 def runtime_error() -> str:
@@ -57,9 +83,10 @@ def runtime_error() -> str:
     if version[:2] != (3, 13):
         return (
             "当前 Python 为 %s.%s.%s，本项目需要 Python 3.13.x。\n"
-            "请先执行:\n"
-            "  python3.13 -m venv .venv\n"
-            "  .venv/bin/python -m pip install -e ."
+            "请安装 uv 后在项目根目录执行:\n"
+            "  uv python install 3.13\n"
+            "  uv sync --locked\n"
+            "  uv run --locked python run.py"
             % version[:3]
         )
     missing = [
@@ -70,15 +97,17 @@ def runtime_error() -> str:
     if missing:
         return (
             "当前 Python 环境缺少依赖: %s\n"
-            "请执行: %s -m pip install -e ."
-            % (", ".join(missing), sys.executable)
+            "请在项目根目录执行:\n"
+            "  uv sync --locked\n"
+            "  uv run --locked python run.py"
+            % ", ".join(missing)
         )
     return ""
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
-    activate_project_venv(args)
+    activate_project_environment(args)
     error = runtime_error()
     if error:
         print(error, file=sys.stderr)

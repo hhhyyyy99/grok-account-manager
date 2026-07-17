@@ -36,50 +36,49 @@ Grok Account Manager
 
 ## 环境要求
 
-- Python 3.13.x
-- 现代浏览器
-- 通过本项目安装的 `DrissionPage`、`curl_cffi`、`requests`
-- Chrome/Chromium 与可访问 xAI/Grok、临时邮箱 API 的网络
+- [uv](https://docs.astral.sh/uv/getting-started/installation/)
+- Chrome/Chromium
+- 可访问 xAI/Grok、临时邮箱 API 的网络
 
-推荐为本项目创建虚拟环境并一次性安装全部依赖：
+项目通过 `.python-version` 固定 Python 3.13，并通过 `uv.lock` 锁定全部 Python 依赖。首次运行执行：
 
 ```bash
 cd grok-account-manager
-python3.13 -m venv .venv
-.venv/bin/python -m pip install -e .
-python3 run.py
+uv python install 3.13
+uv sync --locked
+uv run --locked python run.py
 ```
 
-随后在“配置与环境”中设置临时邮箱、代理和 CPA。环境检查会验证内置运行时、Python、依赖和邮箱基础配置。
+`uv sync` 会自动创建根目录下的 `.venv` 并安装项目、`DrissionPage`、`curl_cffi`、`requests` 等全部依赖，不需要手工执行 `venv` 或 `pip install`。随后在“配置与环境”中设置临时邮箱、代理和 CPA；环境检查会验证内置运行时、Python、依赖和邮箱基础配置。
 
 ## 启动
 
-只查看管理端时可以直接运行；执行注册或批量登录前仍需安装本项目依赖：
+日常启动直接通过 `uv` 运行根目录启动器：
 
 ```bash
 cd grok-account-manager
-python3 run.py
+uv run --locked python run.py
 ```
 
-启动器会自动使用根目录下的 `.venv`，启动 `http://127.0.0.1:8787` 并打开默认浏览器。不自动打开浏览器或更换端口时可以直接传参数，不需要再写 `ui`：
+启动后会打开 `http://127.0.0.1:8787`。不自动打开浏览器或更换端口时直接传参数，不需要再写 `ui`：
 
 ```bash
-python3 run.py --no-browser
-python3 run.py --port 9000
+uv run --locked python run.py --no-browser
+uv run --locked python run.py --port 9000
 ```
 
-Linux/macOS 还可以直接运行：
+Linux/macOS 也可以这样运行：
 
 ```bash
-./run.py
+uv run --locked ./run.py
 ```
 
-首次运行前仍需用 Python 3.13 创建 `.venv` 并安装依赖。如果环境不符合要求，启动器会输出对应的处理命令。原有 CLI 子命令也可以通过启动器使用：
+如果 `.venv` 尚不存在，直接执行 `python3 run.py` 或 `./run.py` 时，启动器也会自动转交给已安装的 `uv` 创建环境。CLI 子命令继续通过同一个启动器使用：
 
 ```bash
-python3 run.py config check
-python3 run.py list
-python3 run.py login --expired
+uv run --locked python run.py config check
+uv run --locked python run.py list
+uv run --locked python run.py login --expired
 ```
 
 源码目录运行时，首次启动会创建：
@@ -113,24 +112,24 @@ data/
 
 ```bash
 # 检查内置注册环境
-python3 -m grok_manager config check
+uv run --locked python run.py config check
 
 # 导入本应用全部历史产物
-python3 -m grok_manager import
+uv run --locked python run.py import
 
 # 查看账号（不会输出密码或 token）
-python3 -m grok_manager list
-python3 -m grok_manager list --json
+uv run --locked python run.py list
+uv run --locked python run.py list --json
 
 # 巡检全部；--local 只检查本地到期时间
-python3 -m grok_manager inspect --all
-python3 -m grok_manager inspect --all --local
+uv run --locked python run.py inspect --all
+uv run --locked python run.py inspect --all --local
 
 # 登录所有巡检判定为过期/无效/待登录的账号
-python3 -m grok_manager login --expired
+uv run --locked python run.py login --expired
 
 # 调用内置运行时注册并自动导入
-python3 -m grok_manager register --count 10 --threads 2 --mint-workers 2
+uv run --locked python run.py register --count 10 --threads 2 --mint-workers 2
 ```
 
 ## 测试
@@ -138,7 +137,7 @@ python3 -m grok_manager register --count 10 --threads 2 --mint-workers 2
 测试通过公开服务接口运行，并用临时目录隔离数据库、任务输入和凭据文件：
 
 ```bash
-python3 -m unittest discover -v
+uv run --locked python -m unittest discover -v
 ```
 
 ## 状态含义
@@ -165,7 +164,7 @@ python3 -m unittest discover -v
 
 ## 当前机器首次运行提示
 
-如果环境检查显示 `No module named 'DrissionPage'`，说明源码模式下尚未安装本项目依赖。运行 `python3 -m pip install -e .`，然后用同一个 Python 启动管理端。
+如果环境检查显示 `No module named 'DrissionPage'`，说明项目环境尚未同步。运行 `uv sync --locked`，然后用 `uv run --locked python run.py` 启动管理端。
 
 ## 上游许可
 

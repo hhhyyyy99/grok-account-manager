@@ -19,7 +19,6 @@ class AccountStatus(str, Enum):
     LIMITED = "limited"
     ERROR = "error"
     CHECKING = "checking"
-    LOGGING_IN = "logging_in"
     MISSING_CPA = "missing_cpa"
 
 
@@ -32,7 +31,6 @@ STATUS_LABELS = {
     AccountStatus.LIMITED.value: "受限但有效",
     AccountStatus.ERROR.value: "巡检异常",
     AccountStatus.CHECKING.value: "巡检中",
-    AccountStatus.LOGGING_IN.value: "登录中",
     AccountStatus.MISSING_CPA.value: "缺少 CPA 凭据",
 }
 

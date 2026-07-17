@@ -46,16 +46,38 @@ class RunLauncherTests(unittest.TestCase):
             self.assertEqual(executable.absolute(), selected)
             self.assertNotEqual(base_python.resolve(), selected)
 
-    def test_activate_project_venv_reexecutes_with_original_arguments(self) -> None:
+    def test_project_environment_reexecutes_venv_with_original_arguments(self) -> None:
         executable = Path("/tmp/project-venv/bin/python")
         with patch.object(run, "find_venv_python", return_value=executable):
             with patch.object(run, "is_current_python", return_value=False):
                 with patch.object(run.os, "execv") as execv:
-                    run.activate_project_venv(["--no-browser"])
+                    run.activate_project_environment(["--no-browser"])
 
         execv.assert_called_once_with(
             str(executable),
             [str(executable), str(run.ROOT / "run.py"), "--no-browser"],
+        )
+
+    def test_project_environment_uses_uv_when_venv_is_missing(self) -> None:
+        uv = "/usr/bin/uv"
+        with patch.object(run, "find_venv_python", return_value=None):
+            with patch.object(run, "find_uv", return_value=uv):
+                with patch.object(run.os, "execv") as execv:
+                    run.activate_project_environment(["--port", "9000"])
+
+        execv.assert_called_once_with(
+            uv,
+            [
+                uv,
+                "run",
+                "--locked",
+                "--project",
+                str(run.ROOT),
+                "python",
+                str(run.ROOT / "run.py"),
+                "--port",
+                "9000",
+            ],
         )
 
     def test_runtime_error_rejects_unsupported_python(self) -> None:
@@ -64,6 +86,7 @@ class RunLauncherTests(unittest.TestCase):
             message = run.runtime_error()
 
         self.assertIn("需要 Python 3.13.x", message)
+        self.assertIn("uv sync --locked", message)
 
 
 if __name__ == "__main__":

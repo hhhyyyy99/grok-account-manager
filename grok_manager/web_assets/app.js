@@ -36,7 +36,7 @@
   function safeStatus(value) {
     const allowed = new Set([
       "unknown", "active", "expired", "invalid", "needs_login", "limited",
-      "error", "checking", "logging_in", "missing_cpa", "queued", "running", "succeeded",
+      "error", "checking", "missing_cpa", "queued", "running", "succeeded",
       "failed", "cancelled",
     ]);
     return allowed.has(String(value)) ? String(value) : "unknown";

@@ -655,7 +655,6 @@ input[type="checkbox"] {
 }
 
 .status-checking,
-.status-logging_in,
 .task-running,
 .task-queued {
   border-color: #9eb6d5;
@@ -1191,7 +1190,6 @@ input[type="checkbox"] {
   }
 
   .status-checking,
-  .status-logging_in,
   .task-running,
   .task-queued {
     border-color: #486689;
