@@ -5,9 +5,20 @@ import unittest
 from pathlib import Path
 
 from grok_manager.paths import _default_data_dir, _migrate_legacy_install_data
+from grok_manager.paths import DATA_DIR, REGISTRATION_CONFIG_EXAMPLE
+from grok_register import paths as registration_paths
 
 
 class DataDirectoryTests(unittest.TestCase):
+    def test_embedded_cli_defaults_to_manager_data_directory(self) -> None:
+        self.assertEqual(
+            (DATA_DIR.resolve(), REGISTRATION_CONFIG_EXAMPLE.resolve()),
+            (
+                registration_paths.PROJECT_ROOT,
+                registration_paths.CONFIG_EXAMPLE,
+            ),
+        )
+
     def test_empty_user_database_rebases_installed_auth_paths(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -1,8 +1,4 @@
-"""Project path anchors for the grok_register package.
-
-PROJECT_ROOT = repository root (config.json, turnstilePatch/, output/)
-PACKAGE_DIR  = this package directory (grok_register/)
-"""
+"""Writable data and packaged asset paths for the embedded registration runtime."""
 from __future__ import annotations
 
 import os
@@ -16,7 +12,16 @@ def _environment_path(name: str, default: Path) -> Path:
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = _environment_path("GROK_REGISTER_PROJECT_ROOT", PACKAGE_DIR.parent)
+try:
+    from grok_manager.paths import (
+        DATA_DIR as MANAGER_DATA_DIR,
+        REGISTRATION_CONFIG_EXAMPLE as MANAGER_CONFIG_EXAMPLE,
+    )
+except ImportError:
+    MANAGER_DATA_DIR = PACKAGE_DIR.parent / "data"
+    MANAGER_CONFIG_EXAMPLE = PACKAGE_DIR.parent / "config.example.json"
+
+PROJECT_ROOT = _environment_path("GROK_REGISTER_PROJECT_ROOT", MANAGER_DATA_DIR)
 
 CONFIG_FILE = _environment_path(
     "GROK_REGISTER_CONFIG_FILE",
@@ -24,7 +29,7 @@ CONFIG_FILE = _environment_path(
 )
 CONFIG_EXAMPLE = _environment_path(
     "GROK_REGISTER_CONFIG_EXAMPLE",
-    PACKAGE_DIR.parent / "config.example.json",
+    MANAGER_CONFIG_EXAMPLE,
 )
 OUTPUT_DIR = _environment_path(
     "GROK_REGISTER_OUTPUT_DIR",
