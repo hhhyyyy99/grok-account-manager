@@ -15,7 +15,8 @@ from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
 from .config import ManagerConfig
-from .models import Account, AccountStatus
+from .exports import AccountExport, AccountExporter
+from .models import Account, AccountStatus, status_label
 from .reference import RegistrationRequest
 from .service import GrokManager
 
@@ -188,6 +189,11 @@ class GrokWebApplication:
 
     @staticmethod
     def account_json(account: Account) -> Dict[str, Any]:
+        cpa_status = (
+            AccountStatus.MISSING_CPA.value
+            if account.missing_cpa_credentials
+            else account.cpa_status
+        )
         return {
             "id": account.id,
             "email": safe_visible(account.email),
@@ -206,9 +212,10 @@ class GrokWebApplication:
             "ssoStatusLabel": account.sso_status_label,
             "ssoDetail": safe_visible(account.sso_detail),
             "ssoExpiresAt": safe_visible(account.sso_expires_at),
-            "cpaStatus": account.cpa_status,
-            "cpaStatusLabel": account.cpa_status_label,
+            "cpaStatus": cpa_status,
+            "cpaStatusLabel": status_label(cpa_status),
             "cpaDetail": safe_visible(account.cpa_detail),
+            "missingCpa": account.missing_cpa_credentials,
             "source": safe_visible(account.source),
         }
 
@@ -272,6 +279,29 @@ class GrokWebApplication:
         if len(ids) > 10000:
             raise ValueError("单次任务账号数量过多")
         return ids
+
+    def export_accounts(self, payload: Dict[str, Any]) -> AccountExport:
+        export_format = str(payload.get("format") or "").strip().lower()
+        ids = self._ids(payload)
+        if ids:
+            accounts = self.manager.store.get_many(ids)
+        else:
+            search = str(payload.get("search") or "")
+            status = str(payload.get("status") or "")
+            accounts = self.manager.store.list_accounts(
+                search=search,
+                status=status,
+                limit=10001,
+            )
+            if len(accounts) > 10000:
+                raise ValueError("单次最多导出 10000 个账号，请先缩小筛选范围")
+        if not accounts:
+            raise ValueError("没有符合条件的账号可导出")
+        try:
+            registration_config = self.manager.reference.load_registration_config()
+        except Exception:
+            registration_config = {}
+        return AccountExporter(registration_config).export(accounts, export_format)
 
     def start_import(self, payload: Dict[str, Any]) -> TaskRecord:
         content = payload.get("content")
@@ -447,7 +477,13 @@ class GrokWebApplication:
             def log_message(self, format: str, *args: Any) -> None:
                 return None
 
-            def _headers(self, content_type: str, content_length: int, status: int = 200) -> None:
+            def _headers(
+                self,
+                content_type: str,
+                content_length: int,
+                status: int = 200,
+                extra_headers: Optional[Dict[str, str]] = None,
+            ) -> None:
                 self.send_response(status)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(content_length))
@@ -461,10 +497,18 @@ class GrokWebApplication:
                     "img-src 'self' data:; connect-src 'self'; object-src 'none'; "
                     "base-uri 'none'; frame-ancestors 'none'",
                 )
+                for name, value in (extra_headers or {}).items():
+                    self.send_header(name, value)
                 self.end_headers()
 
-            def _bytes(self, body: bytes, content_type: str, status: int = 200) -> None:
-                self._headers(content_type, len(body), status)
+            def _bytes(
+                self,
+                body: bytes,
+                content_type: str,
+                status: int = 200,
+                extra_headers: Optional[Dict[str, str]] = None,
+            ) -> None:
+                self._headers(content_type, len(body), status, extra_headers)
                 self.wfile.write(body)
 
             def _json(self, value: Any, status: int = 200) -> None:
@@ -594,6 +638,19 @@ class GrokWebApplication:
                     elif parsed.path == "/api/accounts/delete":
                         ids = application._ids(payload)
                         self._json({"deleted": application.manager.store.delete(ids)})
+                    elif parsed.path == "/api/accounts/export":
+                        exported = application.export_accounts(payload)
+                        self._bytes(
+                            exported.body,
+                            exported.content_type,
+                            extra_headers={
+                                "Content-Disposition": (
+                                    'attachment; filename="%s"' % exported.filename
+                                ),
+                                "X-Exported-Count": str(exported.exported_count),
+                                "X-Skipped-Count": str(exported.skipped_count),
+                            },
+                        )
                     elif parsed.path.startswith("/api/tasks/") and parsed.path.endswith("/cancel"):
                         task_id = parsed.path.split("/")[-2]
                         self._json({"task": application.cancel_task(task_id).serialize(False)})

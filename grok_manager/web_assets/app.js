@@ -16,6 +16,13 @@
 
   const byId = (id) => document.getElementById(id);
   const all = (selector, root = document) => Array.from(root.querySelectorAll(selector));
+  const registrationConfigForms = [
+    "registration-base-config-form",
+    "email-config-form",
+    "cpa-config-form",
+    "sub2api-config-form",
+    "grok2api-config-form",
+  ];
 
   function escapeHtml(value) {
     return String(value ?? "")
@@ -29,7 +36,7 @@
   function safeStatus(value) {
     const allowed = new Set([
       "unknown", "active", "expired", "invalid", "needs_login", "limited",
-      "error", "checking", "logging_in", "queued", "running", "succeeded",
+      "error", "checking", "logging_in", "missing_cpa", "queued", "running", "succeeded",
       "failed", "cancelled",
     ]);
     return allowed.has(String(value)) ? String(value) : "unknown";
@@ -103,6 +110,9 @@
     const selectAll = byId("select-all");
     selectAll.checked = state.accounts.length > 0 && count === state.accounts.length;
     selectAll.indeterminate = count > 0 && count < state.accounts.length;
+    const exportButton = byId("export-accounts");
+    exportButton.textContent = count ? `导出所选 (${count})` : "导出筛选结果";
+    exportButton.disabled = count === 0 && Number(state.pagination.total || 0) === 0;
   }
 
   function renderMetrics(stats) {
@@ -379,6 +389,60 @@
     await startTask("/api/import", { filename: file.name, content }, "文件导入已开始");
   }
 
+  async function exportAccounts() {
+    const button = byId("export-accounts");
+    const format = byId("export-format").value;
+    const ids = selectedIds();
+    const body = { format, ids };
+    if (!ids.length) {
+      body.search = byId("account-search").value.trim();
+      body.status = byId("status-filter").value;
+    }
+    button.disabled = true;
+    try {
+      const response = await fetch("/api/accounts/export", {
+        method: "POST",
+        headers: {
+          Accept: "application/json, application/zip",
+          "Content-Type": "application/json",
+          "X-Grok-Manager-Token": token,
+        },
+        body: JSON.stringify(body),
+      });
+      if (!response.ok) {
+        let message = `导出失败 HTTP ${response.status}`;
+        try {
+          const payload = await response.json();
+          if (payload.error) message = payload.error;
+        } catch (_) {
+          // Keep the HTTP fallback when the response is not JSON.
+        }
+        throw new Error(message);
+      }
+      const disposition = response.headers.get("Content-Disposition") || "";
+      const filenameMatch = disposition.match(/filename="?([^";]+)"?/i);
+      const extension = format === "cpa" ? "zip" : "json";
+      const filename = filenameMatch?.[1] || `grok-${format}-export.${extension}`;
+      const objectUrl = URL.createObjectURL(await response.blob());
+      const link = document.createElement("a");
+      link.href = objectUrl;
+      link.download = filename;
+      link.hidden = true;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
+
+      const exported = Number(response.headers.get("X-Exported-Count") || 0);
+      const skipped = Number(response.headers.get("X-Skipped-Count") || 0);
+      toast(skipped ? `已导出 ${exported} 个账号，跳过 ${skipped} 个缺少凭据的账号` : `已导出 ${exported} 个账号`);
+    } catch (error) {
+      toast(error.message, true);
+    } finally {
+      updateSelectionBar();
+    }
+  }
+
   async function inspect(ids, allAccounts = false) {
     await startTask("/api/inspect", { ids, all: allAccounts }, "巡检任务已开始");
   }
@@ -435,7 +499,9 @@
       const config = await api("/api/config");
       state.config = config;
       setFormValues(byId("manager-config-form"), config.manager || {});
-      setFormValues(byId("reference-config-form"), config.registration || {});
+      registrationConfigForms.forEach((formId) => {
+        setFormValues(byId(formId), config.registration || {});
+      });
       byId("reference-json").value = JSON.stringify(config.registration || {}, null, 2);
       const manager = config.manager || {};
       byId("registration-count-summary").textContent = String(manager.register_count ?? 1);
@@ -461,14 +527,14 @@
     }
   }
 
-  async function saveReferenceCommon(event) {
+  async function saveRegistrationSection(event) {
     event.preventDefault();
     if (!state.config) await loadConfig();
     const values = { ...(state.config?.registration || {}), ...formValues(event.currentTarget) };
     try {
       const config = await api("/api/config/registration", { method: "POST", body: values });
       state.config = config;
-      toast("注册配置已保存");
+      toast(`${event.currentTarget.dataset.configLabel || "注册配置"}已保存`);
       await loadConfig();
     } catch (error) {
       toast(error.message, true);
@@ -532,6 +598,7 @@
     byId("import-file-button").addEventListener("click", () => byId("import-file-input").click());
     byId("import-file-input").addEventListener("change", (event) => importFile(event.target.files[0]));
     byId("refresh-accounts").addEventListener("click", () => loadState({ loading: true }));
+    byId("export-accounts").addEventListener("click", exportAccounts);
     byId("inspect-selected").addEventListener("click", () => {
       const ids = selectedIds();
       if (!ids.length) toast("请先选择账号", true);
@@ -580,7 +647,9 @@
     byId("registration-diagnostics").addEventListener("click", runDiagnostics);
     byId("run-diagnostics").addEventListener("click", runDiagnostics);
     byId("manager-config-form").addEventListener("submit", saveManagerConfig);
-    byId("reference-config-form").addEventListener("submit", saveReferenceCommon);
+    registrationConfigForms.forEach((formId) => {
+      byId(formId).addEventListener("submit", saveRegistrationSection);
+    });
     byId("reference-json-form").addEventListener("submit", saveReferenceJson);
     byId("reload-config").addEventListener("click", loadConfig);
   }

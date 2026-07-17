@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from grok_manager.models import InspectionResult
+from grok_manager.models import AccountDraft, InspectionResult
 from grok_manager.web import GrokWebApplication
 from tests.support import make_manager
 
@@ -97,6 +97,46 @@ class AccountImportQueryTests(unittest.TestCase):
             self.assertEqual(2, len(second_page["accounts"]))
             self.assertEqual(3, last_page["pagination"]["page"])
             self.assertEqual(1, len(last_page["accounts"]))
+
+    def test_missing_cpa_filter_marks_only_accounts_without_cpa_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            missing = manager.store.upsert(
+                AccountDraft(
+                    email="missing@example.com",
+                    sso_token="valid-sso",
+                )
+            )
+            manager.store.upsert(
+                AccountDraft(
+                    email="token@example.com",
+                    access_token="valid-access",
+                )
+            )
+            manager.store.upsert(
+                AccountDraft(
+                    email="file@example.com",
+                    auth_file="/tmp/xai-file@example.com.json",
+                )
+            )
+            application = GrokWebApplication(manager)
+
+            filtered = manager.store.list_accounts(status="missing_cpa")
+            state = application.state_json(
+                {"status": ["missing_cpa"], "page": ["1"], "page_size": ["50"]}
+            )
+
+            self.assertEqual([missing.id], [account.id for account in filtered])
+            self.assertEqual(1, manager.store.count_accounts(status="missing_cpa"))
+            self.assertEqual(1, state["pagination"]["total"])
+            self.assertEqual(
+                ("missing_cpa", "缺少 CPA 凭据", True),
+                (
+                    state["accounts"][0]["cpaStatus"],
+                    state["accounts"][0]["cpaStatusLabel"],
+                    state["accounts"][0]["missingCpa"],
+                ),
+            )
 
 
 if __name__ == "__main__":

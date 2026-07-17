@@ -20,6 +20,7 @@ class AccountStatus(str, Enum):
     ERROR = "error"
     CHECKING = "checking"
     LOGGING_IN = "logging_in"
+    MISSING_CPA = "missing_cpa"
 
 
 STATUS_LABELS = {
@@ -32,6 +33,7 @@ STATUS_LABELS = {
     AccountStatus.ERROR.value: "巡检异常",
     AccountStatus.CHECKING.value: "巡检中",
     AccountStatus.LOGGING_IN.value: "登录中",
+    AccountStatus.MISSING_CPA.value: "缺少 CPA 凭据",
 }
 
 
@@ -95,6 +97,10 @@ class Account:
     @property
     def has_login_credentials(self) -> bool:
         return bool(self.email and self.password)
+
+    @property
+    def missing_cpa_credentials(self) -> bool:
+        return not self.access_token and not self.auth_file
 
 
 @dataclass(frozen=True)

@@ -274,9 +274,12 @@ class AccountStore:
             )
             clauses.append("email COLLATE NOCASE LIKE ? ESCAPE '\\'")
             params.append("%%%s%%" % escaped_search)
-        if status.strip():
+        clean_status = status.strip()
+        if clean_status == AccountStatus.MISSING_CPA.value:
+            clauses.append("access_token = '' AND auth_file = ''")
+        elif clean_status:
             clauses.append("status = ?")
-            params.append(status.strip())
+            params.append(clean_status)
         return (" WHERE " + " AND ".join(clauses) if clauses else "", params)
 
     def ids_for_statuses(self, statuses: Sequence[str]) -> List[int]:

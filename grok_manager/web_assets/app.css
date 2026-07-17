@@ -232,6 +232,20 @@ textarea:focus-visible {
   gap: 8px;
 }
 
+.export-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.export-format-select {
+  width: 142px;
+}
+
+.export-actions .button {
+  min-width: 118px;
+}
+
 .button,
 .icon-button {
   min-height: 36px;
@@ -606,6 +620,7 @@ input[type="checkbox"] {
 }
 
 .status-needs_login,
+.status-missing_cpa,
 .status-error {
   border-color: #d9bc83;
   background: var(--warning-bg);
@@ -1142,6 +1157,7 @@ input[type="checkbox"] {
   }
 
   .status-needs_login,
+  .status-missing_cpa,
   .status-error {
     border-color: #765d34;
     color: #ecc077;
@@ -1272,6 +1288,17 @@ input[type="checkbox"] {
   .form-actions {
     align-items: stretch;
     flex-direction: column;
+    width: 100%;
+  }
+
+  .export-actions {
+    align-items: stretch;
+    flex-direction: column;
+    width: 100%;
+  }
+
+  .export-format-select,
+  .export-actions .button {
     width: 100%;
   }
 

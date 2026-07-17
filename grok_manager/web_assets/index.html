@@ -47,6 +47,14 @@
           <div class="heading-actions">
             <button class="button" type="button" id="import-file-button">导入文件</button>
             <button class="button button-primary" type="button" id="import-history-button">导入历史产物</button>
+            <div class="export-actions">
+              <select id="export-format" class="export-format-select" aria-label="导出格式" title="导出格式">
+                <option value="cpa">CPA ZIP</option>
+                <option value="sub2api">Sub2API JSON</option>
+                <option value="grok2api">Grok2API JSON</option>
+              </select>
+              <button class="button" type="button" id="export-accounts">导出筛选结果</button>
+            </div>
             <input type="file" id="import-file-input" accept=".txt,text/plain" hidden>
           </div>
         </div>
@@ -70,6 +78,7 @@
                 <select id="status-filter">
                   <option value="">全部状态</option>
                   <option value="unknown">未巡检</option>
+                  <option value="missing_cpa">缺少 CPA 凭据</option>
                   <option value="checking">巡检中</option>
                   <option value="active">正常</option>
                   <option value="expired">已过期</option>
@@ -210,7 +219,11 @@
 
         <div class="settings-tabs" role="tablist" aria-label="配置分类">
           <button class="settings-tab is-active" type="button" data-settings-target="manager" role="tab">任务参数</button>
-          <button class="settings-tab" type="button" data-settings-target="reference" role="tab">注册环境</button>
+          <button class="settings-tab" type="button" data-settings-target="registration" role="tab">注册基础</button>
+          <button class="settings-tab" type="button" data-settings-target="email" role="tab">临时邮箱</button>
+          <button class="settings-tab" type="button" data-settings-target="cpa" role="tab">CPA</button>
+          <button class="settings-tab" type="button" data-settings-target="sub2api" role="tab">Sub2API</button>
+          <button class="settings-tab" type="button" data-settings-target="grok2api" role="tab">Grok2API</button>
           <button class="settings-tab" type="button" data-settings-target="json" role="tab">完整 JSON</button>
           <button class="settings-tab" type="button" data-settings-target="environment" role="tab">环境检查</button>
         </div>
@@ -251,30 +264,156 @@
           </form>
         </div>
 
-        <div class="settings-view" data-settings-view="reference">
-          <form class="panel form-panel" id="reference-config-form">
+        <div class="settings-view" data-settings-view="registration">
+          <form class="panel form-panel" id="registration-base-config-form" data-config-label="注册基础配置">
             <div class="panel-heading">
-              <h2>注册常用配置</h2>
-              <p>只更新下列字段，其他高级配置保持不变。密钥不会出现在账号列表或任务日志中。</p>
+              <h2>注册基础</h2>
+              <p>设置注册过程使用的网络、浏览器标识和任务启动间隔。</p>
             </div>
             <div class="form-grid two-columns">
-              <label class="field"><span>邮箱服务</span><input name="email_provider" type="text"></label>
-              <label class="field"><span>收信域名</span><input name="defaultDomains" type="text"></label>
-              <label class="field field-wide"><span>Cloudflare API</span><input name="cloudflare_api_base" type="url"></label>
-              <label class="field"><span>Cloudflare 密钥</span><input name="cloudflare_api_key" type="password" autocomplete="off"></label>
-              <label class="field"><span>认证模式</span><input name="cloudflare_auth_mode" type="text"></label>
-              <label class="field"><span>邮箱前缀</span><input name="email_prefix" type="text"></label>
               <label class="field"><span>注册代理</span><input name="proxy" type="text"></label>
-              <label class="field field-wide"><span>CPA Base URL</span><input name="cpa_base_url" type="url"></label>
-              <label class="field"><span>CPA 代理</span><input name="cpa_proxy" type="text"></label>
-              <label class="field"><span>Mint 超时（秒）</span><input name="cpa_mint_timeout_sec" type="number" min="60"></label>
+              <label class="field"><span>线程启动间隔（秒）</span><input name="thread_start_interval" type="number" min="0" step="0.1"></label>
+              <label class="field field-wide"><span>浏览器 User-Agent</span><input name="user_agent" type="text"></label>
             </div>
             <div class="check-row">
-              <label><input type="checkbox" name="cpa_export_enabled"> 注册后生成 CPA token</label>
-              <label><input type="checkbox" name="cpa_headless"> Mint 浏览器无头</label>
-              <label><input type="checkbox" name="cpa_probe_after_write"> 生成后在线探测</label>
+              <label><input type="checkbox" name="enable_nsfw"> 注册后启用 NSFW</label>
             </div>
-            <div class="form-actions"><button class="button button-primary" type="submit">保存注册配置</button></div>
+            <div class="form-actions"><button class="button button-primary" type="submit">保存注册基础</button></div>
+          </form>
+        </div>
+
+        <div class="settings-view" data-settings-view="email">
+          <form class="panel form-panel" id="email-config-form" data-config-label="临时邮箱配置">
+            <div class="panel-heading">
+              <h2>临时邮箱</h2>
+              <p>选择注册邮箱来源，并分别维护各邮箱服务所需的凭据和接口参数。</p>
+            </div>
+            <section class="config-group" aria-labelledby="email-common-title">
+              <h3 id="email-common-title">通用设置</h3>
+              <div class="form-grid three-columns">
+                <label class="field"><span>邮箱服务</span><select name="email_provider"><option value="cloudflare">Cloudflare</option><option value="duckmail">DuckMail</option><option value="yyds">YYDS</option></select></label>
+                <label class="field"><span>邮箱前缀</span><input name="email_prefix" type="text"></label>
+                <label class="field"><span>收信域名（逗号分隔）</span><input name="defaultDomains" type="text"></label>
+                <label class="field"><span>邮箱创建重试次数</span><input name="max_mail_retry" type="number" min="1" max="20"></label>
+                <label class="field"><span>验证码等待（秒）</span><input name="code_poll_timeout" type="number" min="15" max="300"></label>
+                <label class="field"><span>验证码轮询间隔（秒）</span><input name="code_poll_interval" type="number" min="1" max="30"></label>
+              </div>
+            </section>
+            <section class="config-group" aria-labelledby="cloudflare-email-title">
+              <h3 id="cloudflare-email-title">Cloudflare</h3>
+              <div class="form-grid two-columns">
+                <label class="field field-wide"><span>API 地址</span><input name="cloudflare_api_base" type="url"></label>
+                <label class="field"><span>API 密钥</span><input name="cloudflare_api_key" type="password" autocomplete="off"></label>
+                <label class="field"><span>认证模式</span><select name="cloudflare_auth_mode"><option value="none">none</option><option value="query-key">query-key</option><option value="bearer">bearer</option><option value="x-api-key">x-api-key</option><option value="x-admin-auth">x-admin-auth</option></select></label>
+                <label class="field"><span>域名路径</span><input name="cloudflare_path_domains" type="text"></label>
+                <label class="field"><span>创建邮箱路径</span><input name="cloudflare_path_accounts" type="text"></label>
+                <label class="field"><span>Token 路径</span><input name="cloudflare_path_token" type="text"></label>
+                <label class="field"><span>邮件路径</span><input name="cloudflare_path_messages" type="text"></label>
+              </div>
+            </section>
+            <section class="config-group" aria-labelledby="other-email-title">
+              <h3 id="other-email-title">DuckMail 与 YYDS</h3>
+              <div class="form-grid two-columns">
+                <label class="field"><span>DuckMail API Key</span><input name="duckmail_api_key" type="password" autocomplete="off"></label>
+                <label class="field"><span>YYDS API Key</span><input name="yyds_api_key" type="password" autocomplete="off"></label>
+                <label class="field field-wide"><span>YYDS JWT</span><input name="yyds_jwt" type="password" autocomplete="off"></label>
+                <label class="field"><span>YYDS 优先域名（逗号分隔）</span><input name="yyds_preferred_domains" type="text"></label>
+                <label class="field"><span>YYDS 排除域名（逗号分隔）</span><input name="yyds_blocked_domains" type="text"></label>
+                <label class="field"><span>YYDS 域名选择</span><select name="yyds_domain_selection"><option value="random">随机</option><option value="first">按顺序</option></select></label>
+              </div>
+            </section>
+            <div class="form-actions"><button class="button button-primary" type="submit">保存临时邮箱配置</button></div>
+          </form>
+        </div>
+
+        <div class="settings-view" data-settings-view="cpa">
+          <form class="panel form-panel" id="cpa-config-form" data-config-label="CPA 配置">
+            <div class="panel-heading">
+              <h2>CPA</h2>
+              <p>管理 CPA token 的生成、落盘、热加载和生成后的验证行为。</p>
+            </div>
+            <section class="config-group" aria-labelledby="cpa-output-title">
+              <h3 id="cpa-output-title">生成与输出</h3>
+              <div class="form-grid two-columns">
+                <label class="field field-wide"><span>CPA Base URL</span><input name="cpa_base_url" type="url"></label>
+                <label class="field"><span>CPA 代理</span><input name="cpa_proxy" type="text"></label>
+                <label class="field"><span>Mint 超时（秒）</span><input name="cpa_mint_timeout_sec" type="number" min="60"></label>
+                <label class="field"><span>认证文件目录</span><input name="cpa_auth_dir" type="text"></label>
+                <label class="field"><span>热加载目录</span><input name="cpa_hotload_dir" type="text"></label>
+                <label class="field"><span>浏览器回收间隔</span><input name="cpa_mint_browser_recycle_every" type="number" min="1"></label>
+              </div>
+              <div class="check-row">
+                <label><input type="checkbox" name="cpa_export_enabled"> 注册后生成 CPA token</label>
+                <label><input type="checkbox" name="cpa_copy_to_hotload"> 复制到热加载目录</label>
+                <label><input type="checkbox" name="cpa_headless"> Mint 浏览器无头</label>
+                <label><input type="checkbox" name="cpa_force_standalone"> 使用独立浏览器</label>
+                <label><input type="checkbox" name="cpa_mint_required"> CPA 失败时判定注册失败</label>
+                <label><input type="checkbox" name="cpa_probe_after_write"> 生成后在线探测</label>
+                <label><input type="checkbox" name="cpa_probe_chat"> 探测聊天接口</label>
+                <label><input type="checkbox" name="cpa_mint_cookie_inject"> 注入已有 Cookie</label>
+                <label><input type="checkbox" name="cpa_mint_browser_reuse"> 复用 Mint 浏览器</label>
+              </div>
+            </section>
+            <section class="config-group" aria-labelledby="cpa-cloud-title">
+              <h3 id="cpa-cloud-title">云端同步</h3>
+              <div class="form-grid two-columns">
+                <label class="field field-wide"><span>云端 API 地址</span><input name="cpa_cloud_api_base" type="url"></label>
+                <label class="field field-wide"><span>管理密钥</span><input name="cpa_cloud_management_key" type="password" autocomplete="off"></label>
+                <label class="field"><span>上传超时（秒）</span><input name="cpa_cloud_upload_timeout" type="number" min="1"></label>
+                <label class="field"><span>上传重试次数</span><input name="cpa_cloud_upload_retries" type="number" min="0"></label>
+              </div>
+              <div class="check-row">
+                <label><input type="checkbox" name="cpa_cloud_upload_enabled"> 生成后同步到云端</label>
+              </div>
+            </section>
+            <div class="form-actions"><button class="button button-primary" type="submit">保存 CPA 配置</button></div>
+          </form>
+        </div>
+
+        <div class="settings-view" data-settings-view="sub2api">
+          <form class="panel form-panel" id="sub2api-config-form" data-config-label="Sub2API 配置">
+            <div class="panel-heading">
+              <h2>Sub2API</h2>
+              <p>将生成的 CPA 凭据转换为 Sub2API 账号文件，并维护合并导出文件。</p>
+            </div>
+            <div class="form-grid two-columns">
+              <label class="field"><span>单账号导出目录</span><input name="sub2api_export_dir" type="text"></label>
+              <label class="field"><span>合并账号文件</span><input name="sub2api_combined_file" type="text"></label>
+            </div>
+            <div class="check-row">
+              <label><input type="checkbox" name="sub2api_export_enabled"> CPA 生成后自动导出</label>
+            </div>
+            <div class="form-actions"><button class="button button-primary" type="submit">保存 Sub2API 配置</button></div>
+          </form>
+        </div>
+
+        <div class="settings-view" data-settings-view="grok2api">
+          <form class="panel form-panel" id="grok2api-config-form" data-config-label="Grok2API 配置">
+            <div class="panel-heading">
+              <h2>Grok2API</h2>
+              <p>配置 SSO token 写入本地池或远端 Grok2API 服务的方式。</p>
+            </div>
+            <section class="config-group" aria-labelledby="grok2api-pool-title">
+              <h3 id="grok2api-pool-title">Token 池</h3>
+              <div class="form-grid two-columns">
+                <label class="field"><span>池名称</span><select name="grok2api_pool_name"><option value="ssoBasic">ssoBasic</option><option value="ssoSuper">ssoSuper</option></select></label>
+                <label class="field"><span>本地 Token 文件</span><input name="grok2api_local_token_file" type="text"></label>
+              </div>
+              <div class="check-row">
+                <label><input type="checkbox" name="grok2api_auto_add_local"> 注册后写入本地池</label>
+              </div>
+            </section>
+            <section class="config-group" aria-labelledby="grok2api-remote-title">
+              <h3 id="grok2api-remote-title">远端服务</h3>
+              <div class="form-grid two-columns">
+                <label class="field field-wide"><span>远端服务地址</span><input name="grok2api_remote_base" type="url"></label>
+                <label class="field field-wide"><span>远端 App Key</span><input name="grok2api_remote_app_key" type="password" autocomplete="off"></label>
+              </div>
+              <div class="check-row">
+                <label><input type="checkbox" name="grok2api_auto_add_remote"> 注册后写入远端池</label>
+              </div>
+            </section>
+            <div class="form-actions"><button class="button button-primary" type="submit">保存 Grok2API 配置</button></div>
           </form>
         </div>
 

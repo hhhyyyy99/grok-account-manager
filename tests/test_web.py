@@ -11,6 +11,49 @@ class ManagerTaskConfigTests(unittest.TestCase):
     def test_status_filter_includes_checking(self) -> None:
         html = (ASSET_DIR / "index.html").read_text(encoding="utf-8")
         self.assertIn('<option value="checking">巡检中</option>', html)
+        self.assertIn('<option value="missing_cpa">缺少 CPA 凭据</option>', html)
+
+    def test_registration_config_is_split_by_integration(self) -> None:
+        html = (ASSET_DIR / "index.html").read_text(encoding="utf-8")
+        script = (ASSET_DIR / "app.js").read_text(encoding="utf-8")
+        sections = {
+            "registration": "registration-base-config-form",
+            "email": "email-config-form",
+            "cpa": "cpa-config-form",
+            "sub2api": "sub2api-config-form",
+            "grok2api": "grok2api-config-form",
+        }
+
+        self.assertNotIn(">注册环境</button>", html)
+        for target, form_id in sections.items():
+            self.assertIn(f'data-settings-target="{target}"', html)
+            self.assertIn(f'data-settings-view="{target}"', html)
+            self.assertIn(f'id="{form_id}"', html)
+            self.assertIn(f'"{form_id}"', script)
+
+        def form_markup(form_id: str) -> str:
+            start = html.index(f'id="{form_id}"')
+            return html[start:html.index("</form>", start)]
+
+        email_form = form_markup("email-config-form")
+        cpa_form = form_markup("cpa-config-form")
+        sub2api_form = form_markup("sub2api-config-form")
+        grok2api_form = form_markup("grok2api-config-form")
+        self.assertIn('name="email_provider"', email_form)
+        self.assertNotIn('name="cpa_base_url"', email_form)
+        self.assertIn('name="cpa_base_url"', cpa_form)
+        self.assertIn('name="sub2api_export_enabled"', sub2api_form)
+        self.assertIn('name="grok2api_auto_add_local"', grok2api_form)
+
+    def test_account_page_exposes_three_export_formats(self) -> None:
+        html = (ASSET_DIR / "index.html").read_text(encoding="utf-8")
+        script = (ASSET_DIR / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="export-accounts"', html)
+        self.assertIn('<option value="cpa">CPA ZIP</option>', html)
+        self.assertIn('<option value="sub2api">Sub2API JSON</option>', html)
+        self.assertIn('<option value="grok2api">Grok2API JSON</option>', html)
+        self.assertIn('fetch("/api/accounts/export"', script)
 
     def test_task_config_controls_registration_and_relogin_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
