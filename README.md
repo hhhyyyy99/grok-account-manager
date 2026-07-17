@@ -36,7 +36,7 @@ Grok Account Manager
 
 ## 环境要求
 
-- Python 3.9+
+- Python 3.13.x
 - 现代浏览器
 - 通过本项目安装的 `DrissionPage`、`curl_cffi`、`requests`
 - Chrome/Chromium 与可访问 xAI/Grok、临时邮箱 API 的网络
@@ -74,7 +74,7 @@ grok-manager ui
 python3 -m grok_manager ui --no-browser
 ```
 
-首次启动会创建：
+源码目录运行时，首次启动会创建：
 
 ```text
 data/
@@ -87,6 +87,10 @@ data/
 ```
 
 `data/` 已被 `.gitignore` 排除。目录权限会尽量设置为 `0700`，数据库和含敏感信息的配置会尽量设置为 `0600`。
+
+通过 wheel 安装时，可变数据不会写进 `site-packages`：macOS 默认使用 `~/Library/Application Support/grok-account-manager`，Linux 使用 `$XDG_DATA_HOME/grok-account-manager`（未设置时为 `~/.local/share/grok-account-manager`），Windows 使用本地 AppData。可用 `GROK_MANAGER_DATA_DIR` 覆盖。
+
+从旧版升级时，应用会在首次启动时一次性复制旧注册项目中的 `config.json` 和 `output/`。迁移完成后只使用本应用数据目录，后续启动不再读取旧项目；旧目录不存在也不影响运行。
 
 ## 推荐工作流
 

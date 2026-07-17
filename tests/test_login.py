@@ -1,10 +1,16 @@
+import sys
 import tempfile
 import textwrap
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import DrissionPage
 from grok_manager.models import AccountDraft
 from grok_manager.paths import MANAGED_AUTH_DIR
+from grok_register.cpa_xai import browser_confirm
+from grok_register.paths import TURNSTILE_DIR
 from tests.support import make_manager
 
 
@@ -79,6 +85,33 @@ def install_fake_login_modules(reference_root: Path, auth_email: str) -> None:
 
 
 class BatchLoginCredentialTests(unittest.TestCase):
+    def test_login_fallback_uses_packaged_turnstile_extension(self) -> None:
+        extensions = []
+
+        class FakeOptions:
+            def set_timeouts(self, **_values):
+                return None
+
+            def set_argument(self, _value):
+                return None
+
+            def add_extension(self, value):
+                extensions.append(value)
+
+            def headless(self, _value):
+                return None
+
+            def auto_port(self):
+                return None
+
+        fake_app = types.ModuleType("grok_register.app")
+        fake_app.create_browser_options = lambda **_values: None
+        with patch.dict(sys.modules, {"grok_register.app": fake_app}):
+            with patch.object(DrissionPage, "ChromiumOptions", FakeOptions):
+                browser_confirm._build_mint_browser_options()
+
+        self.assertEqual([str(TURNSTILE_DIR)], extensions)
+
     def test_login_rejects_auth_file_for_another_email(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

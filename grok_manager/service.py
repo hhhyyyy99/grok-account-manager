@@ -33,6 +33,7 @@ class GrokManager:
         self.store = store or AccountStore()
         self.reference = reference or ReferenceProject()
         self.python_executable = python_executable or sys.executable
+        self.reference.migrate_legacy_data()
         self.reference.ensure_registration_config()
         self._wire_adapters()
 

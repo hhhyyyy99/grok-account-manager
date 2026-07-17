@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import threading
@@ -15,6 +16,9 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from .models import AccountDraft
 from .paths import (
     DATA_DIR,
+    DEFAULT_LEGACY_REFERENCE_ROOT,
+    LEGACY_CONFIG_FILE,
+    LEGACY_MIGRATION_FILE,
     PROJECT_ROOT,
     REGISTRATION_CONFIG_EXAMPLE,
     REGISTRATION_CONFIG_FILE,
@@ -25,6 +29,13 @@ from .paths import (
 
 
 LogCallback = Callable[[str], None]
+
+
+def _is_supported_python(version_text: str) -> bool:
+    matched = re.match(r"^(\d+)\.(\d+)\.(\d+)", str(version_text or "").strip())
+    return bool(
+        matched and (int(matched.group(1)), int(matched.group(2))) == (3, 13)
+    )
 
 
 @dataclass(frozen=True)
@@ -58,12 +69,44 @@ class ReferenceProject:
         config_example_file: Path = REGISTRATION_CONFIG_EXAMPLE,
         output_dir: Path = REGISTRATION_OUTPUT_DIR,
         data_root: Path = DATA_DIR,
+        legacy_manager_config_file: Optional[Path] = None,
+        legacy_reference_root: Optional[Path] = None,
+        migration_file: Optional[Path] = None,
     ):
         self.root = Path(root).expanduser().resolve()
         self._config_file = Path(config_file).expanduser().resolve()
         self._config_example_file = Path(config_example_file).expanduser().resolve()
         self._output_dir = Path(output_dir).expanduser().resolve()
         self.data_root = Path(data_root).expanduser().resolve()
+        default_layout = (
+            self.root == PROJECT_ROOT.resolve() and self.data_root == DATA_DIR.resolve()
+        )
+        legacy_source_layout = (
+            default_layout and DEFAULT_LEGACY_REFERENCE_ROOT is not None
+        )
+        self.legacy_manager_config_file = (
+            Path(legacy_manager_config_file).expanduser().resolve()
+            if legacy_manager_config_file is not None
+            else (LEGACY_CONFIG_FILE.resolve() if legacy_source_layout else None)
+        )
+        self.legacy_reference_root = (
+            Path(legacy_reference_root).expanduser().resolve()
+            if legacy_reference_root is not None
+            else (
+                DEFAULT_LEGACY_REFERENCE_ROOT.resolve()
+                if legacy_source_layout and DEFAULT_LEGACY_REFERENCE_ROOT is not None
+                else None
+            )
+        )
+        self.migration_file = (
+            Path(migration_file).expanduser().resolve()
+            if migration_file is not None
+            else (
+                LEGACY_MIGRATION_FILE.resolve()
+                if default_layout
+                else self.data_root / ".legacy-registration-migration-v1.json"
+            )
+        )
 
     @property
     def entrypoint(self) -> Path:
@@ -153,6 +196,130 @@ class ReferenceProject:
         if self.config_file.is_file():
             return self.config_file
         return self.save_registration_config(self.load_registration_config())
+
+    def _legacy_root_from_manager_config(self) -> Optional[Path]:
+        root = self.legacy_reference_root
+        path = self.legacy_manager_config_file
+        if path is None or not path.is_file():
+            return root
+        try:
+            values = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ReferenceProjectError("旧管理端配置读取失败: %s" % exc) from exc
+        if not isinstance(values, dict):
+            raise ReferenceProjectError("旧管理端配置必须是 JSON 对象")
+        configured = str(values.get("reference_project") or "").strip()
+        return Path(configured).expanduser().resolve() if configured else root
+
+    def _registration_config_is_default(self) -> bool:
+        if not self.config_file.is_file():
+            return True
+        try:
+            current = json.loads(self.config_file.read_text(encoding="utf-8-sig"))
+            example = json.loads(self.config_example_file.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        return current == example
+
+    def _rebase_legacy_config_paths(
+        self,
+        values: Dict[str, Any],
+        legacy_root: Path,
+    ) -> Dict[str, Any]:
+        path_keys = {
+            "cpa_auth_dir",
+            "cpa_hotload_dir",
+            "grok2api_local_token_file",
+            "sub2api_combined_file",
+            "sub2api_export_dir",
+        }
+        migrated = dict(values)
+        for key in path_keys:
+            raw = str(migrated.get(key) or "").strip()
+            if not raw:
+                continue
+            source = Path(raw).expanduser()
+            if not source.is_absolute():
+                continue
+            try:
+                relative = source.resolve().relative_to(legacy_root)
+            except ValueError:
+                continue
+            if relative.parts and relative.parts[0] == "output":
+                target = (self.output_dir / "legacy-import").joinpath(
+                    *relative.parts[1:]
+                )
+            else:
+                target = self.data_root / "legacy-files" / relative
+            migrated[key] = str(target)
+        return migrated
+
+    @staticmethod
+    def _copy_legacy_output(source: Path, destination: Path) -> int:
+        copied = 0
+        for current_root, directories, files in os.walk(source, followlinks=False):
+            current = Path(current_root)
+            directories[:] = [
+                name for name in directories if not (current / name).is_symlink()
+            ]
+            relative = current.relative_to(source)
+            target_dir = destination / relative
+            target_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                target_dir.chmod(0o700)
+            except OSError:
+                pass
+            for name in files:
+                item = current / name
+                if item.is_symlink() or not item.is_file():
+                    continue
+                target = target_dir / name
+                shutil.copy2(item, target)
+                try:
+                    target.chmod(0o600)
+                except OSError:
+                    pass
+                copied += 1
+        return copied
+
+    def migrate_legacy_data(self) -> None:
+        """Copy legacy sibling data once, leaving no ongoing runtime dependency."""
+        if self.migration_file.is_file():
+            return
+        ensure_data_dirs()
+        legacy_root = self._legacy_root_from_manager_config()
+        result: Dict[str, Any] = {
+            "completed_at": datetime.now(tz=timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "source": str(legacy_root) if legacy_root is not None else "",
+            "config_copied": False,
+            "output_files_copied": 0,
+        }
+        if legacy_root is not None and legacy_root != self.root:
+            legacy_config = legacy_root / "config.json"
+            if legacy_config.is_file() and self._registration_config_is_default():
+                try:
+                    values = json.loads(legacy_config.read_text(encoding="utf-8-sig"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise ReferenceProjectError("旧注册配置读取失败: %s" % exc) from exc
+                if not isinstance(values, dict):
+                    raise ReferenceProjectError("旧注册配置必须是 JSON 对象")
+                self.save_registration_config(
+                    self._rebase_legacy_config_paths(values, legacy_root)
+                )
+                result["config_copied"] = True
+            legacy_output = legacy_root / "output"
+            if legacy_output.is_dir():
+                result["output_files_copied"] = self._copy_legacy_output(
+                    legacy_output,
+                    self.output_dir / "legacy-import",
+                )
+        write_private_text_atomic(
+            self.migration_file,
+            json.dumps(result, ensure_ascii=False, indent=2) + "\n",
+        )
 
     def discover_account_files(self) -> List[Path]:
         candidates: Dict[str, Path] = {}
@@ -337,16 +504,11 @@ class ReferenceProject:
                 check=False,
             )
             version_text = version.stdout.strip()
-            matched = re.match(r"^(\d+)\.(\d+)\.(\d+)", version_text)
-            compatible = bool(
-                version.returncode == 0
-                and matched
-                and (int(matched.group(1)), int(matched.group(2))) >= (3, 9)
-            )
+            compatible = version.returncode == 0 and _is_supported_python(version_text)
             checks.append(
                 (
                     compatible,
-                    "内置运行 Python: %s（要求 3.9+）" % (version_text or "未知"),
+                    "内置运行 Python: %s（要求 3.13.x）" % (version_text or "未知"),
                 )
             )
         except (OSError, subprocess.SubprocessError) as exc:

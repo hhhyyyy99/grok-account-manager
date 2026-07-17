@@ -7,7 +7,7 @@ name = "grok-account-manager"
 version = "0.1.0"
 description = "Local manager for Grok registration, account inspection, and batch login"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.13,<3.14"
 license = { text = "MIT" }
 authors = [{ name = "gork-manager contributors" }]
 dependencies = [

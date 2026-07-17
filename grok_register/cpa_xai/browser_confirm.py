@@ -27,10 +27,10 @@ import re
 import sys
 import threading
 import time
-from pathlib import Path
 from typing import Any, Callable
 
 from grok_register.browser_cleanup import cleanup_browser_profile, quit_browser
+from grok_register.paths import TURNSTILE_DIR
 from urllib.parse import urlparse
 
 LogFn = Callable[[str], None]
@@ -58,7 +58,6 @@ def _build_mint_browser_options(
     from DrissionPage import ChromiumOptions
 
     opts = None
-    _pkg_root = Path(__file__).resolve().parents[2]  # project root
     try:
         from grok_register.app import create_browser_options  # type: ignore
 
@@ -91,7 +90,7 @@ def _build_mint_browser_options(
                 opts.set_argument(flag)
             except Exception:
                 pass
-        ext = str(_pkg_root / "turnstilePatch")
+        ext = str(TURNSTILE_DIR)
         if os.path.isdir(ext):
             try:
                 opts.add_extension(ext)
