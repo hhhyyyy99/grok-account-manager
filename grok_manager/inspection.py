@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional
+from urllib.parse import urlparse
 
 from .models import Account, AccountStatus, InspectionResult, utc_now_iso
 from .store import AccountStore
@@ -100,10 +101,17 @@ class TokenInspector:
         timeout_seconds: int = 20,
         expiry_skew_seconds: int = 30,
         proxy: str = "",
+        cpa_hotload_dir: str = "",
     ):
         self.timeout_seconds = max(3, int(timeout_seconds))
         self.expiry_skew = timedelta(seconds=max(0, int(expiry_skew_seconds)))
         self.proxy = str(proxy or "").strip()
+        configured_hotload = str(cpa_hotload_dir or "").strip()
+        self.cpa_hotload_dir = (
+            Path(configured_hotload).expanduser().resolve()
+            if configured_hotload
+            else None
+        )
 
     def _opener(self) -> urllib.request.OpenerDirector:
         if self.proxy:
@@ -265,6 +273,10 @@ class TokenInspector:
                     base_url = configured.rstrip("/")
             except (OSError, json.JSONDecodeError, AttributeError):
                 pass
+        hostname = str(urlparse(base_url).hostname or "").lower()
+        if hostname in ("127.0.0.1", "localhost", "::1"):
+            return self._inspect_local_cpa_hotload(account, expires_at)
+
         url = base_url.rstrip("/") + "/models"
         headers = dict(DEFAULT_HEADERS)
         headers["Authorization"] = "Bearer %s" % account.access_token.strip()
@@ -307,6 +319,54 @@ class TokenInspector:
                 0,
             )
 
+    def _inspect_local_cpa_hotload(
+        self,
+        account: Account,
+        expires_at: str,
+    ) -> CredentialCheck:
+        if self.cpa_hotload_dir is None:
+            return CredentialCheck(
+                AccountStatus.UNKNOWN.value,
+                "CPA 指向本地服务，但未配置 cpa_hotload_dir",
+                expires_at,
+            )
+
+        filename = Path(account.auth_file).name
+        if not filename:
+            return CredentialCheck(
+                AccountStatus.INVALID.value,
+                "账号没有可用于 CPA hotload 的 auth 文件",
+                expires_at,
+            )
+        hotload_file = self.cpa_hotload_dir / filename
+        if not hotload_file.is_file():
+            return CredentialCheck(
+                AccountStatus.INVALID.value,
+                "CPA hotload 文件尚未同步",
+                expires_at,
+            )
+        try:
+            payload = json.loads(hotload_file.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return CredentialCheck(
+                AccountStatus.ERROR.value,
+                "CPA hotload 文件读取失败: %s" % exc,
+                expires_at,
+            )
+        hotload_token = str(
+            payload.get("access_token") if isinstance(payload, dict) else ""
+        ).strip()
+        if not hotload_token or hotload_token != account.access_token.strip():
+            return CredentialCheck(
+                AccountStatus.EXPIRED.value,
+                "CPA hotload 仍是旧 token，需要重新同步",
+                expires_at,
+            )
+        detail = "CPA hotload 凭据已同步"
+        if expires_at:
+            detail += "，到期时间 %s" % expires_at
+        return CredentialCheck(AccountStatus.ACTIVE.value, detail, expires_at)
+
     @staticmethod
     def _combine(
         account: Account,
@@ -345,19 +405,27 @@ class InspectionService:
         account_ids: Iterable[int],
         live: bool = True,
         progress: Optional[ProgressCallback] = None,
+        cancelled: Optional[Callable[[], bool]] = None,
     ) -> List[InspectionResult]:
         accounts = self.store.get_many(list(account_ids))
         if not accounts:
             return []
-        self.store.set_status(
-            [account.id for account in accounts],
-            AccountStatus.CHECKING.value,
-            "正在巡检 SSO 与 CPA token",
-        )
+        is_cancelled = cancelled or (lambda: False)
         results: List[InspectionResult] = []
+
+        def inspect_one(account: Account) -> Optional[InspectionResult]:
+            if is_cancelled():
+                return None
+            self.store.set_status(
+                [account.id],
+                AccountStatus.CHECKING.value,
+                "正在巡检 SSO 与 CPA token",
+            )
+            return self.inspector.inspect(account, live)
+
         with ThreadPoolExecutor(max_workers=min(self.max_workers, len(accounts))) as executor:
             futures: Dict[Future, Account] = {
-                executor.submit(self.inspector.inspect, account, live): account
+                executor.submit(inspect_one, account): account
                 for account in accounts
             }
             completed = 0
@@ -365,6 +433,8 @@ class InspectionService:
                 account = futures[future]
                 try:
                     result = future.result()
+                    if result is None:
+                        continue
                 except Exception as exc:
                     result = InspectionResult(
                         account_id=account.id,

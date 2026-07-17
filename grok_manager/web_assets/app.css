@@ -435,6 +435,79 @@ input[type="checkbox"] {
   overflow-x: auto;
 }
 
+.account-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 58px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--border);
+}
+
+.account-pagination[hidden] {
+  display: none;
+}
+
+.pagination-summary,
+.pagination-page,
+.page-size-control {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.pagination-actions,
+.pagination-buttons,
+.page-size-control {
+  display: flex;
+  align-items: center;
+}
+
+.pagination-actions {
+  gap: 16px;
+}
+
+.pagination-buttons,
+.page-size-control {
+  gap: 7px;
+}
+
+.page-size-control select {
+  width: 72px;
+  min-height: 34px;
+  padding: 5px 8px;
+}
+
+.pagination-button {
+  display: inline-grid;
+  width: 34px;
+  height: 34px;
+  flex: 0 0 34px;
+  place-items: center;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-control);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 18px;
+  line-height: 1;
+}
+
+.pagination-button:hover:not(:disabled) {
+  border-color: var(--accent-strong);
+  color: var(--accent-strong);
+}
+
+.pagination-button:disabled {
+  cursor: default;
+  opacity: 0.38;
+}
+
+.pagination-page {
+  min-width: 88px;
+  text-align: center;
+}
+
 .account-table {
   width: 100%;
   min-width: 980px;
@@ -616,6 +689,51 @@ input[type="checkbox"] {
 .form-grid {
   display: grid;
   gap: 16px;
+}
+
+.run-config-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  padding: 16px 0;
+}
+
+.run-config-summary > div {
+  padding: 0 18px;
+}
+
+.run-config-summary > div + div {
+  border-left: 1px solid var(--border);
+}
+
+.run-config-summary span,
+.run-config-summary strong {
+  display: block;
+}
+
+.run-config-summary span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.run-config-summary strong {
+  margin-top: 4px;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 24px;
+  letter-spacing: 0;
+}
+
+.config-group + .config-group {
+  margin-top: 24px;
+  padding-top: 22px;
+  border-top: 1px solid var(--border);
+}
+
+.config-group h3 {
+  margin: 0 0 14px;
+  font-size: 14px;
+  letter-spacing: 0;
 }
 
 .three-columns {
@@ -1125,6 +1243,19 @@ input[type="checkbox"] {
     width: 100%;
   }
 
+  .run-config-summary {
+    grid-template-columns: 1fr;
+  }
+
+  .run-config-summary > div {
+    padding: 10px 0;
+  }
+
+  .run-config-summary > div + div {
+    border-left: 0;
+    border-top: 1px solid var(--border);
+  }
+
   .three-columns,
   .two-columns {
     grid-template-columns: 1fr;
@@ -1157,6 +1288,21 @@ input[type="checkbox"] {
 
   .select-field {
     width: 100%;
+  }
+
+  .account-pagination,
+  .pagination-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .pagination-buttons {
+    justify-content: space-between;
+    width: 100%;
+  }
+
+  .page-size-control {
+    justify-content: space-between;
   }
 
   .metrics {

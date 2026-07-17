@@ -158,16 +158,21 @@ def poll_device_token(
     while time.time() < deadline:
         if cancel and cancel():
             raise OAuthDeviceError("cancelled")
-        status, body = _post_form(
-            TOKEN_URL,
-            {
-                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                "device_code": device_code,
-                "client_id": client_id,
-            },
-            timeout=timeout,
-            proxy=proxy,
-        )
+        try:
+            status, body = _post_form(
+                TOKEN_URL,
+                {
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                    "device_code": device_code,
+                    "client_id": client_id,
+                },
+                timeout=timeout,
+                proxy=proxy,
+            )
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            log(f"oauth poll network error: {type(e).__name__} (sleep {sleep_for}s)")
+            time.sleep(sleep_for)
+            continue
         if status == 200 and isinstance(body, dict) and body.get("access_token"):
             access = str(body["access_token"]).strip()
             refresh = str(body.get("refresh_token") or "").strip()

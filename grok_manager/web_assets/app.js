@@ -6,6 +6,7 @@
     accounts: [],
     stats: {},
     tasks: [],
+    pagination: { page: 1, pageSize: 50, total: 0, totalPages: 1 },
     selected: new Set(),
     selectedTaskId: "",
     config: null,
@@ -147,27 +148,53 @@
     updateSelectionBar();
   }
 
+  function renderPagination() {
+    const pagination = state.pagination;
+    const total = Number(pagination.total || 0);
+    const page = Number(pagination.page || 1);
+    const pageSize = Number(pagination.pageSize || 50);
+    const totalPages = Number(pagination.totalPages || 1);
+    const start = total ? ((page - 1) * pageSize) + 1 : 0;
+    const end = total ? Math.min(page * pageSize, total) : 0;
+
+    byId("account-pagination").hidden = total === 0;
+    byId("pagination-summary").textContent = `第 ${start}-${end} 条，共 ${total} 条`;
+    byId("current-page").textContent = String(page);
+    byId("total-pages").textContent = String(totalPages);
+    byId("page-size").value = String(pageSize);
+    byId("first-page").disabled = page <= 1;
+    byId("previous-page").disabled = page <= 1;
+    byId("next-page").disabled = page >= totalPages;
+    byId("last-page").disabled = page >= totalPages;
+  }
+
   async function loadState(options = {}) {
+    if (options.page !== undefined) state.pagination.page = Math.max(1, Number(options.page) || 1);
     if (options.loading) byId("account-loading").hidden = false;
     const query = new URLSearchParams();
     const search = byId("account-search").value.trim();
     const status = byId("status-filter").value;
     if (search) query.set("search", search);
     if (status) query.set("status", status);
+    query.set("page", String(state.pagination.page));
+    query.set("page_size", String(state.pagination.pageSize));
     try {
       const payload = await api(`/api/state?${query.toString()}`);
       state.accounts = payload.accounts || [];
       state.stats = payload.stats || {};
       state.tasks = payload.tasks || [];
+      state.pagination = payload.pagination || state.pagination;
       const visibleIds = new Set(state.accounts.map((account) => Number(account.id)));
       state.selected = new Set(Array.from(state.selected).filter((id) => visibleIds.has(id)));
       renderMetrics(state.stats);
       renderAccounts();
+      renderPagination();
       renderTaskList();
       scheduleTaskPolling();
     } catch (error) {
       byId("account-loading").hidden = true;
       byId("account-table-wrap").hidden = true;
+      byId("account-pagination").hidden = true;
       byId("account-empty").hidden = false;
       byId("account-empty").querySelector("strong").textContent = "账号数据加载失败";
       byId("account-empty").querySelector("p").textContent = error.message;
@@ -189,7 +216,11 @@
   function renderTaskList() {
     const list = byId("task-list");
     const running = state.tasks.filter((task) => !["succeeded", "failed", "cancelled"].includes(task.state));
+    const inspection = running.find((task) => task.kind === "inspect");
     byId("running-task-count").textContent = String(running.length);
+    byId("inspect-selected").disabled = Boolean(inspection);
+    byId("inspect-all").disabled = Boolean(inspection);
+    byId("cancel-inspection").disabled = !inspection || Boolean(inspection.cancelRequested);
     if (!state.tasks.length) {
       list.innerHTML = '<div class="empty-task"><strong>还没有任务</strong><p>导入、巡检、登录和注册任务会显示在这里。</p></div>';
       return;
@@ -209,7 +240,7 @@
     const detail = byId("task-detail");
     const stateName = safeStatus(task.state);
     const percent = task.total > 0 ? Math.min(100, Math.round((task.current / task.total) * 100)) : (task.state === "succeeded" ? 100 : 0);
-    const canCancel = ["queued", "running"].includes(task.state) && ["register", "login"].includes(task.kind);
+    const canCancel = ["queued", "running"].includes(task.state) && ["register", "login", "inspect"].includes(task.kind) && !task.cancelRequested;
     const logs = (task.logs || []).map((line) => `
       <div class="task-log-row"><time>${escapeHtml(line.time)}</time><span>${escapeHtml(line.message)}</span></div>`).join("");
     detail.innerHTML = `
@@ -281,6 +312,12 @@
     } catch (error) {
       toast(error.message, true);
     }
+  }
+
+  async function cancelInspection() {
+    const task = state.tasks.find((item) => item.kind === "inspect" && ["queued", "running"].includes(item.state));
+    if (!task || task.cancelRequested) return;
+    await cancelTask(task.id);
   }
 
   function scheduleTaskPolling(immediate = false) {
@@ -401,10 +438,9 @@
       setFormValues(byId("reference-config-form"), config.registration || {});
       byId("reference-json").value = JSON.stringify(config.registration || {}, null, 2);
       const manager = config.manager || {};
-      const registrationForm = byId("registration-form");
-      registrationForm.elements.count.value = manager.register_count ?? 1;
-      registrationForm.elements.threads.value = manager.register_threads ?? 1;
-      registrationForm.elements.mintWorkers.value = manager.mint_workers ?? 1;
+      byId("registration-count-summary").textContent = String(manager.register_count ?? 1);
+      byId("registration-threads-summary").textContent = String(manager.register_threads ?? 1);
+      byId("registration-mint-summary").textContent = String(manager.mint_workers ?? 1);
       if (config.registrationError) toast(config.registrationError, true);
     } catch (error) {
       toast(error.message, true);
@@ -502,6 +538,7 @@
       else inspect(ids);
     });
     byId("inspect-all").addEventListener("click", () => inspect([], true));
+    byId("cancel-inspection").addEventListener("click", cancelInspection);
     byId("login-selected").addEventListener("click", () => {
       const ids = selectedIds();
       if (!ids.length) toast("请先选择账号", true);
@@ -519,14 +556,25 @@
     let searchTimer;
     byId("account-search").addEventListener("input", () => {
       window.clearTimeout(searchTimer);
-      searchTimer = window.setTimeout(loadState, 260);
+      searchTimer = window.setTimeout(() => loadState({ page: 1 }), 260);
     });
-    byId("status-filter").addEventListener("change", loadState);
+    byId("status-filter").addEventListener("change", () => loadState({ page: 1 }));
+    byId("page-size").addEventListener("change", (event) => {
+      state.pagination.pageSize = Number(event.target.value) || 50;
+      loadState({ page: 1, loading: true });
+    });
+    byId("first-page").addEventListener("click", () => loadState({ page: 1, loading: true }));
+    byId("previous-page").addEventListener("click", () => loadState({ page: state.pagination.page - 1, loading: true }));
+    byId("next-page").addEventListener("click", () => loadState({ page: state.pagination.page + 1, loading: true }));
+    byId("last-page").addEventListener("click", () => loadState({ page: state.pagination.totalPages, loading: true }));
 
     byId("registration-form").addEventListener("submit", async (event) => {
       event.preventDefault();
-      const values = formValues(event.currentTarget);
-      await startTask("/api/register", values, "注册任务已开始");
+      await startTask("/api/register", {}, "注册任务已开始");
+    });
+    byId("open-task-settings").addEventListener("click", () => {
+      showView("settings");
+      showSettingsView("manager");
     });
     byId("cancel-browser-task").addEventListener("click", cancelLatestBrowserTask);
     byId("registration-diagnostics").addEventListener("click", runDiagnostics);

@@ -215,9 +215,31 @@ class GrokWebApplication:
     def state_json(self, query: Dict[str, List[str]]) -> Dict[str, Any]:
         search = (query.get("search") or [""])[0]
         status = (query.get("status") or [""])[0]
-        accounts = self.manager.store.list_accounts(search=search, status=status)
+        try:
+            requested_page = max(1, int((query.get("page") or ["1"])[0]))
+        except (TypeError, ValueError):
+            requested_page = 1
+        try:
+            page_size = max(1, min(200, int((query.get("page_size") or ["50"])[0])))
+        except (TypeError, ValueError):
+            page_size = 50
+        total = self.manager.store.count_accounts(search=search, status=status)
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        page = min(requested_page, total_pages)
+        accounts = self.manager.store.list_accounts(
+            search=search,
+            status=status,
+            limit=page_size,
+            offset=(page - 1) * page_size,
+        )
         return {
             "accounts": [self.account_json(account) for account in accounts],
+            "pagination": {
+                "page": page,
+                "pageSize": page_size,
+                "total": total,
+                "totalPages": total_pages,
+            },
             "stats": self.manager.store.stats(),
             "tasks": [task.serialize(include_logs=False) for task in self.tasks.latest()],
         }
@@ -282,12 +304,18 @@ class GrokWebApplication:
                 "开始%s巡检 %s 个账号的 SSO 与 CPA token"
                 % ("在线" if live else "本地", len(ids))
             )
+            task.progress(0, len(ids), "等待巡检 worker")
 
             def progress(result, completed, total):
                 task.progress(completed, total, "%s: %s" % (result.account_id, result.detail))
                 task.log("#%s %s: %s" % (result.account_id, result.status, result.detail))
 
-            results = self.manager.inspect_accounts(ids, live=live, progress=progress)
+            results = self.manager.inspect_accounts(
+                ids,
+                live=live,
+                progress=progress,
+                cancelled=lambda: task.cancel_requested,
+            )
             attention = sum(
                 1
                 for result in results
@@ -379,13 +407,15 @@ class GrokWebApplication:
             raise KeyError("任务不存在")
         if task.state in TERMINAL_STATES:
             return task
-        if task.kind not in ("register", "login"):
+        if task.kind not in ("register", "login", "inspect"):
             raise RuntimeError("该任务不支持中途取消")
         task.cancel_requested = True
         if task.kind == "register":
             self.manager.registration.cancel()
         elif task.kind == "login":
             self.manager.login.cancel()
+        elif task.kind == "inspect":
+            task.message = "正在停止巡检"
         task.log("已请求取消任务")
         return task
 

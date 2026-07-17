@@ -202,6 +202,35 @@ class ReferenceProject:
             return self.config_file
         return self.save_registration_config(self.load_registration_config())
 
+    def sync_cpa_hotload(self, auth_file: str | Path) -> Optional[Path]:
+        config = self.load_registration_config()
+        if not bool(config.get("cpa_copy_to_hotload", False)):
+            return None
+
+        configured = str(config.get("cpa_hotload_dir") or "").strip()
+        if not configured:
+            raise ReferenceProjectError(
+                "已启用 CPA hotload，但 cpa_hotload_dir 为空"
+            )
+
+        source = Path(auth_file).expanduser().resolve()
+        if not source.is_file():
+            raise ReferenceProjectError("CPA auth 文件不存在: %s" % source)
+
+        target_dir = Path(configured).expanduser()
+        if not target_dir.is_absolute():
+            target_dir = self.data_root / target_dir
+        target_dir = target_dir.resolve()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        destination = target_dir / source.name
+        if source != destination.resolve():
+            shutil.copy2(source, destination)
+        try:
+            destination.chmod(0o600)
+        except OSError:
+            pass
+        return destination
+
     def _legacy_root_from_manager_config(self) -> Tuple[Optional[Path], bool]:
         root = self.legacy_reference_root
         path = self.legacy_manager_config_file

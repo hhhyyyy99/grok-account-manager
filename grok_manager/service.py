@@ -8,7 +8,13 @@ from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 from .config import ConfigStore, ManagerConfig
 from .inspection import InspectionService, TokenInspector
 from .login import BatchLoginService, LoginSettings
-from .models import Account, AccountStatus, InspectionResult, LoginResult
+from .models import (
+    Account,
+    AccountStatus,
+    InspectionResult,
+    LoginResult,
+    status_label,
+)
 from .reference import (
     ReferenceProject,
     RegistrationRequest,
@@ -90,6 +96,7 @@ class GrokManager:
         account_ids: Iterable[int],
         live: Optional[bool] = None,
         progress=None,
+        cancelled: Optional[Callable[[], bool]] = None,
     ) -> List[InspectionResult]:
         use_live = self.config.live_probe if live is None else bool(live)
         try:
@@ -99,9 +106,25 @@ class GrokManager:
                 or registration_config.get("proxy")
                 or ""
             ).strip()
+            configured_hotload = str(
+                registration_config.get("cpa_hotload_dir") or ""
+            ).strip()
+            if configured_hotload:
+                hotload_path = Path(configured_hotload).expanduser()
+                if not hotload_path.is_absolute():
+                    hotload_path = self.reference.data_root / hotload_path
+                self.inspection.inspector.cpa_hotload_dir = hotload_path.resolve()
+            else:
+                self.inspection.inspector.cpa_hotload_dir = None
         except Exception:
             self.inspection.inspector.proxy = ""
-        return self.inspection.inspect_accounts(account_ids, live=use_live, progress=progress)
+            self.inspection.inspector.cpa_hotload_dir = None
+        return self.inspection.inspect_accounts(
+            account_ids,
+            live=use_live,
+            progress=progress,
+            cancelled=cancelled,
+        )
 
     def batch_login(self, account_ids: Iterable[int], log=None, progress=None) -> List[LoginResult]:
         registration_config = self.reference.load_registration_config()
@@ -117,11 +140,50 @@ class GrokManager:
             probe_after_login=False,
         )
         results = self.login.login_accounts(account_ids, settings, log=log, progress=progress)
-        refreshed_ids = [result.account_id for result in results if result.ok and result.account_id]
+        refreshed = [result for result in results if result.ok and result.account_id]
+        refreshed_ids = [result.account_id for result in refreshed]
         if refreshed_ids:
+            for result in refreshed:
+                try:
+                    hotload_path = self.reference.sync_cpa_hotload(result.auth_file)
+                except Exception as exc:
+                    if log:
+                        log("[%s] CPA hotload 更新失败: %s" % (result.email, exc))
+                else:
+                    if hotload_path is not None and log:
+                        log("[%s] CPA hotload 已更新: %s" % (result.email, hotload_path))
+
             if log:
                 log("登录完成，开始复核新的 SSO 与 CPA token")
-            self.inspect_accounts(refreshed_ids, live=self.config.live_probe)
+            reviews = self.inspect_accounts(
+                refreshed_ids,
+                live=self.config.live_probe,
+            )
+            reviews_by_id = {review.account_id: review for review in reviews}
+            reviewed_results: List[LoginResult] = []
+            for result in results:
+                review = reviews_by_id.get(result.account_id)
+                if review is None:
+                    reviewed_results.append(result)
+                    continue
+                summary = "复核 SSO=%s，CPA=%s" % (
+                    status_label(review.sso_status),
+                    status_label(review.cpa_status),
+                )
+                if log:
+                    log(
+                        "[%s] 复核完成: SSO=%s，CPA=%s"
+                        % (
+                            result.email,
+                            status_label(review.sso_status),
+                            status_label(review.cpa_status),
+                        )
+                    )
+                    log("[%s] 复核详情: %s" % (result.email, review.detail))
+                reviewed_results.append(
+                    replace(result, detail="%s；%s" % (result.detail, summary))
+                )
+            results = reviewed_results
         return results
 
     def relogin_candidate_ids(self) -> List[int]:

@@ -6,7 +6,7 @@ Proven flow (2026-07-10, free account):
   1. Open verification_uri_complete (user_code prefilled)
   2. Click 继续 on device page
   3. Cookie banner: 全部允许 (optional)
-  4. 使用邮箱登录 → fill email → 下一步
+  4. Login with email / 使用邮箱登录 → fill email → 下一步
   5. Wait cf-turnstile-response → fill password → REAL click 登录
   6. May land /account redirect or device page → 继续
   7. Consent page /oauth2/device/consent → REAL click exact 允许
@@ -34,6 +34,10 @@ from grok_register.paths import TURNSTILE_DIR
 from urllib.parse import urlparse
 
 LogFn = Callable[[str], None]
+
+PASSWORD_SELECTOR = (
+    "css:input[name='password'], input[data-testid='password'], input[type='password']"
+)
 
 
 def _noop_log(_: str) -> None:
@@ -523,6 +527,33 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
 
+def _fill(
+    page: Any,
+    selector: str,
+    value: str,
+    log: LogFn,
+    field_name: str,
+) -> bool:
+    """Clear and fill a form field without exposing its value in logs."""
+    try:
+        el = page.ele(selector, timeout=0.8)
+    except Exception as e:
+        log(f"find {field_name} input failed: {type(e).__name__}")
+        return False
+    if not el:
+        log(f"{field_name} input not found")
+        return False
+
+    try:
+        el.clear()
+        el.input(value)
+    except Exception as e:
+        log(f"fill {field_name} failed: {type(e).__name__}")
+        return False
+    log(f"filled {field_name}")
+    return True
+
+
 def _find_button_exact(page: Any, label: str) -> Any | None:
     try:
         for el in page.eles("tag:button") or []:
@@ -575,18 +606,85 @@ def _click_exact(
     return None
 
 
+def _click_email_login_chooser(
+    page: Any, log: LogFn, visible_text: str = ""
+) -> bool:
+    """Choose email login, preferring xAI's stable test id over translated text."""
+    labels = [
+        "使用邮箱登录",
+        "Login with email",
+        "Continue with email",
+        "Sign in with email",
+    ]
+
+    try:
+        el = page.ele("css:button[data-testid='continue-with-email']", timeout=0.3)
+    except Exception:
+        el = None
+
+    if el:
+        try:
+            el.click(by_js=True)
+            log("clicked email login chooser by test id")
+            return True
+        except Exception as e:
+            log(f"email login chooser test id click failed: {e}")
+
+    if visible_text and not any(label in visible_text for label in labels):
+        return False
+    return _click_exact(page, labels, log, real=False) is not None
+
+
+def _raise_for_login_error(visible_text: str) -> None:
+    low = (visible_text or "").lower()
+    messages = (
+        "wrong email address or password",
+        "incorrect email or password",
+        "invalid email or password",
+        "邮箱或密码错误",
+    )
+    if any(message in low for message in messages):
+        raise BrowserConfirmError("邮箱或密码错误")
+
+
 def _wait_turnstile(page: Any, log: LogFn, timeout: float = 45.0) -> bool:
     """Wait/click Cloudflare Turnstile on the mint browser page."""
+    try:
+        reset = page.run_js(
+            """
+if (window.turnstile && typeof window.turnstile.reset === 'function') {
+  window.turnstile.reset();
+  return true;
+}
+return false;
+            """
+        )
+        if reset:
+            log("turnstile reset")
+    except Exception:
+        pass
+
     deadline = time.time() + timeout
     clicked = False
     while time.time() < deadline:
         try:
-            el = page.ele("css:input[name='cf-turnstile-response']", timeout=0.3)
-            if el is not None:
-                v = (el.attr("value") or "").strip()
-                if len(v) > 20:
-                    log(f"turnstile ready len={len(v)}")
-                    return True
+            token = page.run_js(
+                """
+try {
+  const input = document.querySelector('input[name="cf-turnstile-response"]');
+  const byInput = String((input && input.value) || '').trim();
+  if (byInput) return byInput;
+  if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
+    return String(window.turnstile.getResponse() || '').trim();
+  }
+  return '';
+} catch (e) { return ''; }
+                """
+            )
+            token = str(token or "").strip()
+            if len(token) >= 80:
+                log(f"turnstile ready len={len(token)}")
+                return True
         except Exception:
             pass
 
@@ -647,6 +745,20 @@ if (nodes.length && typeof nodes[0].click === 'function') nodes[0].click();
     return False
 
 
+def _prepare_password_login(
+    page: Any,
+    email: str,
+    password: str,
+    log: LogFn,
+) -> bool:
+    _fill(page, "css:input[type='email']", email, log, "email")
+    if not _fill(
+        page, PASSWORD_SELECTOR, password, log, "password"
+    ):
+        return False
+    return _wait_turnstile(page, log, 45)
+
+
 def approve_device_code(
     page: Any,
     *,
@@ -698,6 +810,7 @@ def approve_device_code(
             if snip:
                 log(f"visible: {snip}")
 
+        _raise_for_login_error(text)
         # Done page
         if "device/done" in url or "设备已授权" in text or "device authorized" in text.lower():
             log("device done page — waiting for token poll")
@@ -788,20 +901,26 @@ def approve_device_code(
                 continue
 
         # Cookie banner (exact labels only)
-        if "全部允许" in text or "隐私偏好" in text:
-            _click_exact(page, ["全部允许", "全部拒绝"], log, real=False)
+        cookie_labels = [
+            "全部允许",
+            "全部拒绝",
+            "Accept All Cookies",
+            "Allow All",
+            "Reject All",
+        ]
+        if any(label in text for label in cookie_labels) or "隐私偏好" in text:
+            _click_exact(page, cookie_labels, log, real=False)
             _sleep(0.5)
 
         # Sign-in chooser
-        if "使用邮箱登录" in text or "Continue with email" in text:
-            if _click_exact(page, ["使用邮箱登录", "Continue with email", "Sign in with email"], log, real=False):
-                _sleep(1.5)
-                phase = "email"
-                continue
+        if _click_email_login_chooser(page, log, text):
+            _sleep(1.5)
+            phase = "email"
+            continue
 
         # Email only step
         if page.ele("css:input[type='email']", timeout=0.3) and not page.ele(
-            "css:input[type='password']", timeout=0.2
+            PASSWORD_SELECTOR, timeout=0.2
         ):
             phase = "email"
             _fill(page, "css:input[type='email']", email, log, "email")
@@ -810,17 +929,16 @@ def approve_device_code(
                 continue
 
         # Password login
-        if page.ele("css:input[type='password']", timeout=0.3):
+        if page.ele(PASSWORD_SELECTOR, timeout=0.3):
             phase = "password"
             if login_attempts >= 5:
                 _sleep(1.0)
                 continue
             login_attempts += 1
             log(f"login attempt {login_attempts}")
-            _fill(page, "css:input[type='email']", email, log, "email")
-            _wait_turnstile(page, log, 25)
-            _fill(page, "css:input[type='password']", password, log, "password")
-            _wait_turnstile(page, log, 12)
+            if not _prepare_password_login(page, email, password, log):
+                log("login submit deferred until turnstile is ready")
+                continue
             # REAL click login helps form submit
             if not _click_exact(page, ["登录", "Sign in", "Log in"], log, real=True):
                 try:
@@ -837,7 +955,8 @@ def approve_device_code(
                 if stop_event is not None and stop_event.is_set():
                     return
                 _sleep(0.5)
-                if not page.ele("css:input[type='password']", timeout=0.2):
+                _raise_for_login_error(_visible_text(page))
+                if not page.ele(PASSWORD_SELECTOR, timeout=0.2):
                     break
                 if "sign-in" not in _page_url(page):
                     break
@@ -932,6 +1051,10 @@ def mint_with_browser(
         stop_event = threading.Event()
         token_box: dict[str, Any] = {}
         err_box: dict[str, BaseException] = {}
+        browser_error: BrowserConfirmError | None = None
+
+        def _poll_cancel() -> bool:
+            return stop_event.is_set() or bool(cancel and cancel())
 
         def _poll() -> None:
             try:
@@ -941,7 +1064,7 @@ def mint_with_browser(
                     interval=max(sess.interval, 5),
                     expires_in=min(sess.expires_in, int(browser_timeout_sec) + 60),
                     log=log,
-                    cancel=cancel,
+                    cancel=_poll_cancel,
                     proxy=resolved or None,
                 )
                 token_box["token"] = tr
@@ -965,7 +1088,9 @@ def mint_with_browser(
                 log=log,
             )
         except BrowserConfirmError as e:
-            log(f"browser confirm warning: {e}")
+            browser_error = e
+            stop_event.set()
+            log(f"browser confirm failed: {e}")
 
         t.join(timeout=max(browser_timeout_sec, 60) + 30)
         if "token" in token_box:
@@ -979,6 +1104,8 @@ def mint_with_browser(
                 "expires_in": tr.expires_in,
                 "user_code": sess.user_code,
             }
+        if browser_error is not None:
+            raise browser_error
         if "err" in err_box:
             raise err_box["err"]
         raise OAuthDeviceError("token poll thread ended without result")

@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 from .models import Account, AccountDraft, AccountStatus, InspectionResult, utc_now_iso
 from .paths import DATABASE_FILE, ensure_data_dirs
@@ -239,9 +239,32 @@ class AccountStore:
         search: str = "",
         status: str = "",
         limit: Optional[int] = None,
+        offset: int = 0,
     ) -> List[Account]:
+        where_sql, params = self._account_filter(search, status)
+        sql = "SELECT * FROM accounts" + where_sql
+        sql += " ORDER BY id DESC"
+        clean_offset = max(0, int(offset))
+        if limit is not None:
+            sql += " LIMIT ? OFFSET ?"
+            params.extend((max(1, int(limit)), clean_offset))
+        elif clean_offset:
+            sql += " LIMIT -1 OFFSET ?"
+            params.append(clean_offset)
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [Account.from_row(row) for row in rows]
+
+    def count_accounts(self, search: str = "", status: str = "") -> int:
+        where_sql, params = self._account_filter(search, status)
+        with self._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM accounts" + where_sql, params).fetchone()
+        return int(row[0])
+
+    @staticmethod
+    def _account_filter(search: str, status: str) -> Tuple[str, List[str]]:
         clauses = []
-        params = []
+        params: List[str] = []
         if search.strip():
             escaped_search = (
                 search.strip()
@@ -254,16 +277,7 @@ class AccountStore:
         if status.strip():
             clauses.append("status = ?")
             params.append(status.strip())
-        sql = "SELECT * FROM accounts"
-        if clauses:
-            sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY updated_at DESC, id DESC"
-        if limit is not None:
-            sql += " LIMIT ?"
-            params.append(max(1, int(limit)))
-        with self._connect() as conn:
-            rows = conn.execute(sql, params).fetchall()
-        return [Account.from_row(row) for row in rows]
+        return (" WHERE " + " AND ".join(clauses) if clauses else "", params)
 
     def ids_for_statuses(self, statuses: Sequence[str]) -> List[int]:
         clean = [str(value) for value in statuses if str(value)]

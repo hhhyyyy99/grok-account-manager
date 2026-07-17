@@ -70,6 +70,7 @@
                 <select id="status-filter">
                   <option value="">全部状态</option>
                   <option value="unknown">未巡检</option>
+                  <option value="checking">巡检中</option>
                   <option value="active">正常</option>
                   <option value="expired">已过期</option>
                   <option value="invalid">凭据无效</option>
@@ -83,6 +84,7 @@
               <button class="button" type="button" id="refresh-accounts">刷新</button>
               <button class="button" type="button" id="inspect-selected">巡检所选</button>
               <button class="button" type="button" id="inspect-all">巡检全部</button>
+              <button class="button button-danger" type="button" id="cancel-inspection" disabled>停止巡检</button>
               <button class="button button-primary" type="button" id="login-candidates">登录异常账号</button>
             </div>
           </div>
@@ -99,7 +101,7 @@
             <table class="account-table">
               <thead>
                 <tr>
-                  <th class="check-column"><input type="checkbox" id="select-all" aria-label="选择全部账号"></th>
+                  <th class="check-column"><input type="checkbox" id="select-all" aria-label="选择当前页全部账号"></th>
                   <th>邮箱</th>
                   <th>总状态</th>
                   <th>SSO</th>
@@ -110,6 +112,27 @@
               </thead>
               <tbody id="account-table-body"></tbody>
             </table>
+          </div>
+
+          <div class="account-pagination" id="account-pagination" hidden>
+            <div class="pagination-summary" id="pagination-summary">第 0-0 条，共 0 条</div>
+            <div class="pagination-actions">
+              <label class="page-size-control">
+                <span>每页</span>
+                <select id="page-size" aria-label="每页账号数量">
+                  <option value="25">25</option>
+                  <option value="50" selected>50</option>
+                  <option value="100">100</option>
+                </select>
+              </label>
+              <div class="pagination-buttons" aria-label="账号分页">
+                <button type="button" class="pagination-button" id="first-page" aria-label="首页" title="首页">&laquo;</button>
+                <button type="button" class="pagination-button" id="previous-page" aria-label="上一页" title="上一页">&lsaquo;</button>
+                <span class="pagination-page">第 <strong id="current-page">1</strong> / <span id="total-pages">1</span> 页</span>
+                <button type="button" class="pagination-button" id="next-page" aria-label="下一页" title="下一页">&rsaquo;</button>
+                <button type="button" class="pagination-button" id="last-page" aria-label="末页" title="末页">&raquo;</button>
+              </div>
+            </div>
           </div>
 
           <div class="empty-state" id="account-empty" hidden>
@@ -140,24 +163,24 @@
           <form class="panel form-panel" id="registration-form">
             <div class="panel-heading">
               <h2>新建注册任务</h2>
-              <p>并发数越高，浏览器和邮箱服务压力越大。建议从 1 到 2 开始。</p>
             </div>
-            <div class="form-grid three-columns">
-              <label class="field">
+            <div class="run-config-summary">
+              <div>
                 <span>注册数量</span>
-                <input type="number" name="count" min="1" max="10000" required>
-              </label>
-              <label class="field">
+                <strong id="registration-count-summary">-</strong>
+              </div>
+              <div>
                 <span>注册并发</span>
-                <input type="number" name="threads" min="1" max="10" required>
-              </label>
-              <label class="field">
-                <span>Mint 并发</span>
-                <input type="number" name="mintWorkers" min="0" max="10" required>
-              </label>
+                <strong id="registration-threads-summary">-</strong>
+              </div>
+              <div>
+                <span>CPA Mint 并发</span>
+                <strong id="registration-mint-summary">-</strong>
+              </div>
             </div>
             <div class="form-actions">
               <button class="button button-primary" type="submit">开始注册</button>
+              <button class="button" type="button" id="open-task-settings">任务参数</button>
               <button class="button button-danger" type="button" id="cancel-browser-task">停止浏览器任务</button>
             </div>
           </form>
@@ -186,8 +209,8 @@
         </div>
 
         <div class="settings-tabs" role="tablist" aria-label="配置分类">
-          <button class="settings-tab is-active" type="button" data-settings-target="manager" role="tab">管理端</button>
-          <button class="settings-tab" type="button" data-settings-target="reference" role="tab">注册常用配置</button>
+          <button class="settings-tab is-active" type="button" data-settings-target="manager" role="tab">任务参数</button>
+          <button class="settings-tab" type="button" data-settings-target="reference" role="tab">注册环境</button>
           <button class="settings-tab" type="button" data-settings-target="json" role="tab">完整 JSON</button>
           <button class="settings-tab" type="button" data-settings-target="environment" role="tab">环境检查</button>
         </div>
@@ -195,20 +218,36 @@
         <div class="settings-view is-active" data-settings-view="manager">
           <form class="panel form-panel" id="manager-config-form">
             <div class="panel-heading">
-              <h2>管理端运行参数</h2>
-              <p>注册与登录运行时已内置，和管理端使用同一个 Python 环境。</p>
+              <h2>任务参数</h2>
+              <p>批量任务使用这里保存的数量、并发和超时设置。</p>
             </div>
-            <div class="form-grid two-columns">
-              <label class="field"><span>巡检超时（秒）</span><input type="number" name="probe_timeout_seconds" min="3" max="120"></label>
-              <label class="field"><span>巡检并发</span><input type="number" name="inspection_workers" min="1" max="32"></label>
-              <label class="field"><span>登录并发</span><input type="number" name="login_workers" min="1" max="10"></label>
-              <label class="field"><span>登录超时（秒）</span><input type="number" name="login_timeout_seconds" min="60" max="1800"></label>
-            </div>
-            <div class="check-row">
-              <label><input type="checkbox" name="live_probe"> 巡检时执行在线探测</label>
-              <label><input type="checkbox" name="auto_import_on_start"> 启动时自动导入</label>
-            </div>
-            <div class="form-actions"><button class="button button-primary" type="submit">保存管理端配置</button></div>
+            <section class="config-group" aria-labelledby="registration-config-title">
+              <h3 id="registration-config-title">批量注册</h3>
+              <div class="form-grid three-columns">
+                <label class="field"><span>每批注册数量</span><input type="number" name="register_count" min="1" max="10000"></label>
+                <label class="field"><span>注册并发</span><input type="number" name="register_threads" min="1" max="10"></label>
+                <label class="field"><span>CPA Mint 并发</span><input type="number" name="mint_workers" min="0" max="10"></label>
+              </div>
+            </section>
+            <section class="config-group" aria-labelledby="login-config-title">
+              <h3 id="login-config-title">重新登录</h3>
+              <div class="form-grid two-columns">
+                <label class="field"><span>重新登录并发</span><input type="number" name="login_workers" min="1" max="10"></label>
+                <label class="field"><span>单账号超时（秒）</span><input type="number" name="login_timeout_seconds" min="60" max="1800"></label>
+              </div>
+            </section>
+            <section class="config-group" aria-labelledby="inspection-config-title">
+              <h3 id="inspection-config-title">巡检与导入</h3>
+              <div class="form-grid two-columns">
+                <label class="field"><span>巡检请求超时（秒）</span><input type="number" name="probe_timeout_seconds" min="3" max="120"></label>
+                <label class="field"><span>巡检并发</span><input type="number" name="inspection_workers" min="1" max="32"></label>
+              </div>
+              <div class="check-row">
+                <label><input type="checkbox" name="live_probe"> 巡检时执行在线探测</label>
+                <label><input type="checkbox" name="auto_import_on_start"> 启动时自动导入</label>
+              </div>
+            </section>
+            <div class="form-actions"><button class="button button-primary" type="submit">保存任务参数</button></div>
           </form>
         </div>
 

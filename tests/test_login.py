@@ -5,18 +5,23 @@ import tempfile
 import textwrap
 import types
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
 import DrissionPage
 from grok_manager.models import AccountDraft
 from grok_manager.paths import MANAGED_AUTH_DIR
-from grok_register.cpa_xai import browser_confirm
+from grok_register.cpa_xai import browser_confirm, oauth_device
 from grok_register.paths import TURNSTILE_DIR
 from tests.support import make_manager
 
 
-def install_fake_login_modules(reference_root: Path, auth_email: str) -> None:
+def install_fake_login_modules(
+    reference_root: Path,
+    auth_email: str,
+    sso_token: str = "fresh-sso",
+) -> None:
     package = reference_root / "grok_register" / "cpa_xai"
     package.mkdir(parents=True)
     (reference_root / "grok_register" / "__init__.py").write_text("", encoding="utf-8")
@@ -76,10 +81,10 @@ def install_fake_login_modules(reference_root: Path, auth_email: str) -> None:
                 ),
                 encoding="utf-8",
             )
-            set_sso("fresh-sso")
+            set_sso(__SSO_TOKEN__)
             return {"ok": True, "path": str(path)}
         """
-    ).replace("__AUTH_EMAIL__", repr(auth_email))
+    ).replace("__AUTH_EMAIL__", repr(auth_email)).replace("__SSO_TOKEN__", repr(sso_token))
     (package / "mint.py").write_text(
         mint_source,
         encoding="utf-8",
@@ -87,6 +92,113 @@ def install_fake_login_modules(reference_root: Path, auth_email: str) -> None:
 
 
 class BatchLoginCredentialTests(unittest.TestCase):
+    def test_email_login_chooser_prefers_stable_test_id(self) -> None:
+        clicks = []
+
+        class FakeElement:
+            def click(self, *, by_js=False):
+                clicks.append(by_js)
+
+        class FakePage:
+            def ele(self, selector, timeout=0):
+                self.request = (selector, timeout)
+                return FakeElement()
+
+        page = FakePage()
+        logs = []
+
+        clicked = browser_confirm._click_email_login_chooser(page, logs.append)
+
+        self.assertTrue(clicked)
+        self.assertEqual(
+            ("css:button[data-testid='continue-with-email']", 0.3),
+            page.request,
+        )
+        self.assertEqual([True], clicks)
+
+    def test_fill_clears_field_without_logging_credential(self) -> None:
+        actions = []
+
+        class FakeElement:
+            def clear(self):
+                actions.append(("clear", ""))
+
+            def input(self, value):
+                actions.append(("input", value))
+
+        class FakePage:
+            def ele(self, selector, timeout=0):
+                self.request = (selector, timeout)
+                return FakeElement()
+
+        page = FakePage()
+        logs = []
+
+        filled = browser_confirm._fill(
+            page, "css:input[type='password']", "secret-value", logs.append, "password"
+        )
+
+        self.assertTrue(filled)
+        self.assertEqual(("css:input[type='password']", 0.8), page.request)
+        self.assertEqual([("clear", ""), ("input", "secret-value")], actions)
+        self.assertNotIn("secret-value", " ".join(logs))
+
+    def test_password_is_filled_before_waiting_for_turnstile(self) -> None:
+        events = []
+        selectors = {}
+
+        def fake_fill(_page, _selector, _value, _log, field_name):
+            events.append(("fill", field_name))
+            selectors[field_name] = _selector
+            return True
+
+        def fake_wait(_page, _log, timeout):
+            events.append(("turnstile", timeout))
+            return True
+
+        with patch.object(browser_confirm, "_fill", side_effect=fake_fill), patch.object(
+            browser_confirm, "_wait_turnstile", side_effect=fake_wait
+        ):
+            ready = browser_confirm._prepare_password_login(
+                object(), "email", "password", lambda _: None
+            )
+
+        self.assertTrue(ready)
+        self.assertEqual(
+            [
+                ("fill", "email"),
+                ("fill", "password"),
+                ("turnstile", 45),
+            ],
+            events,
+        )
+        self.assertIn("input[name='password']", selectors["password"])
+
+    def test_login_rejects_invalid_credentials_message(self) -> None:
+        with self.assertRaisesRegex(browser_confirm.BrowserConfirmError, "邮箱或密码错误"):
+            browser_confirm._raise_for_login_error("Wrong email address or password.")
+
+    def test_oauth_poll_retries_transient_network_error(self) -> None:
+        response = {
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        }
+        logs = []
+
+        with patch.object(
+            oauth_device,
+            "_post_form",
+            side_effect=[urllib.error.URLError("transient"), (200, response)],
+        ), patch.object(oauth_device.time, "sleep"):
+            result = oauth_device.poll_device_token(
+                "device-code", expires_in=60, log=logs.append
+            )
+
+        self.assertEqual("access", result.access_token)
+        self.assertTrue(any("network error" in line for line in logs))
+
     def test_login_fallback_uses_packaged_turnstile_extension(self) -> None:
         extensions = []
 
@@ -208,6 +320,55 @@ class BatchLoginCredentialTests(unittest.TestCase):
                     Path(stored.auth_file) if stored else Path(),
                 ),
             )
+
+    def test_login_syncs_cpa_hotload_and_logs_review_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = make_manager(root)
+            hotload_dir = root / "cpa-hotload"
+            manager.reference.config_file.write_text(
+                json.dumps(
+                    {
+                        "cpa_copy_to_hotload": True,
+                        "cpa_hotload_dir": str(hotload_dir),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            future_sso = "e30.eyJleHAiOjQxMDI0NDQ4MDB9.sig"
+            install_fake_login_modules(
+                manager.reference.root,
+                "hotload@example.com",
+                sso_token=future_sso,
+            )
+            account = manager.store.upsert(
+                AccountDraft(
+                    email="hotload@example.com",
+                    password="password",
+                )
+            )
+            logs = []
+
+            result = manager.batch_login([account.id], log=logs.append)[0]
+            stored = manager.store.get(account.id)
+            hotloaded = json.loads(
+                (hotload_dir / "xai-hotload@example.com.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            self.assertEqual(
+                (True, "active", "active", "active", "fresh-access"),
+                (
+                    result.ok,
+                    stored.status if stored else "",
+                    stored.sso_status if stored else "",
+                    stored.cpa_status if stored else "",
+                    hotloaded.get("access_token"),
+                ),
+            )
+            self.assertTrue(any("CPA hotload 已更新" in line for line in logs))
+            self.assertTrue(any("复核完成: SSO=正常，CPA=正常" in line for line in logs))
 
     def test_login_updates_sso_and_cpa_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
