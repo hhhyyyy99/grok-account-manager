@@ -102,7 +102,7 @@ process.stdout.write(JSON.stringify(orderAccountsById(accounts).map((item) => it
         ]
 
         self.assertNotIn("hidden", selection_bar.split(">", 1)[0])
-        self.assertIn('id="select-current-page"', selection_bar)
+        self.assertNotIn('id="select-current-page"', selection_bar)
         self.assertIn('id="select-all-results"', selection_bar)
         self.assertIn('id="clear-selection"', selection_bar)
         for control_id in ("inspect-selected", "login-selected", "export-accounts", "delete-selected"):

@@ -128,9 +128,6 @@
     const selectAll = byId("select-all");
     selectAll.checked = state.accounts.length > 0 && pageSelected === state.accounts.length;
     selectAll.indeterminate = pageSelected > 0 && pageSelected < state.accounts.length;
-    byId("select-current-page").disabled = (
-      state.accounts.length === 0 || pageSelected === state.accounts.length
-    );
     byId("select-all-results").disabled = (
       Number(state.pagination.total || 0) === 0
       || count === Number(state.pagination.total || 0)
@@ -144,11 +141,6 @@
       (task) => task.kind === "inspect" && ["queued", "running"].includes(task.state),
     );
     byId("inspect-selected").disabled = !hasSelection || Boolean(inspection);
-  }
-
-  function selectCurrentPage() {
-    state.accounts.forEach((account) => state.selected.add(Number(account.id)));
-    renderAccounts();
   }
 
   async function selectAllResults() {
@@ -650,7 +642,6 @@
     byId("import-file-button").addEventListener("click", () => byId("import-file-input").click());
     byId("import-file-input").addEventListener("change", (event) => importFile(event.target.files[0]));
     byId("refresh-accounts").addEventListener("click", () => loadState({ loading: true }));
-    byId("select-current-page").addEventListener("click", selectCurrentPage);
     byId("select-all-results").addEventListener("click", selectAllResults);
     byId("clear-selection").addEventListener("click", () => clearSelection());
     byId("export-accounts").addEventListener("click", exportAccounts);
