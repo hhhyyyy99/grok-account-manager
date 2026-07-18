@@ -453,19 +453,40 @@
     </main>
   </div>
 
-  <button class="task-trigger" type="button" data-open-tasks aria-controls="task-drawer">
-    <span>任务</span>
+  <button class="task-trigger" type="button" data-open-tasks aria-controls="task-drawer" aria-expanded="false">
+    <span class="task-trigger-mark" aria-hidden="true"></span>
+    <span>任务中心</span>
     <strong id="running-task-count">0</strong>
   </button>
 
-  <aside class="task-drawer" id="task-drawer" aria-label="任务详情" aria-hidden="true">
-    <header>
-      <div><strong>任务中心</strong><span id="task-drawer-subtitle">最近任务</span></div>
-      <button class="icon-button" type="button" id="close-task-drawer" aria-label="关闭任务中心">关闭</button>
+  <aside class="task-drawer" id="task-drawer" aria-label="任务详情" aria-hidden="true" inert>
+    <header class="task-drawer-header">
+      <div>
+        <span class="task-drawer-eyebrow">Operations / live queue</span>
+        <strong>任务中心</strong>
+        <span id="task-drawer-subtitle">最近任务</span>
+      </div>
+      <div class="task-drawer-header-actions">
+        <button class="icon-button" type="button" id="refresh-tasks" aria-label="刷新任务" title="刷新任务">刷新</button>
+        <button class="icon-button" type="button" id="close-task-drawer" aria-label="关闭任务中心" title="关闭任务中心">关闭</button>
+      </div>
     </header>
-    <div class="task-list" id="task-list"></div>
-    <div class="task-detail" id="task-detail">
-      <div class="empty-task"><strong>选择一个任务</strong><p>查看实时进度、日志和结果。</p></div>
+    <div class="task-summary" aria-label="任务状态摘要">
+      <div class="task-summary-item is-running"><span>进行中</span><strong id="task-running-summary">0</strong></div>
+      <div class="task-summary-item"><span>已完成</span><strong id="task-succeeded-summary">0</strong></div>
+      <div class="task-summary-item is-failed"><span>需关注</span><strong id="task-failed-summary">0</strong></div>
+    </div>
+    <nav class="task-filters" aria-label="任务筛选" role="tablist">
+      <button class="task-filter is-active" type="button" data-task-filter="all" role="tab" aria-selected="true">全部</button>
+      <button class="task-filter" type="button" data-task-filter="running" role="tab" aria-selected="false">进行中</button>
+      <button class="task-filter" type="button" data-task-filter="succeeded" role="tab" aria-selected="false">已完成</button>
+      <button class="task-filter" type="button" data-task-filter="failed" role="tab" aria-selected="false">需关注</button>
+    </nav>
+    <div class="task-workspace">
+      <div class="task-list" id="task-list" aria-live="polite"></div>
+      <section class="task-detail" id="task-detail" aria-live="polite" aria-label="选中任务详情">
+        <div class="empty-task"><strong>选择一个任务</strong><p>查看实时进度、日志和结果。</p></div>
+      </section>
     </div>
   </aside>
   <div class="drawer-backdrop" id="drawer-backdrop" hidden></div>

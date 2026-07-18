@@ -19,6 +19,8 @@
     selectedTaskId: "",
     config: null,
     taskTimer: null,
+    taskFilter: "all",
+    drawerReturnFocus: null,
     lastTaskStates: new Map(),
   };
 
@@ -268,24 +270,106 @@
     return labels[task.state] || task.state;
   }
 
+  function isTaskRunning(task) {
+    return !["succeeded", "failed", "cancelled"].includes(task.state);
+  }
+
+  function taskKindLabel(task) {
+    const labels = {
+      inspect: "账号巡检",
+      login: "账号登录",
+      register: "批量注册",
+      import: "账号导入",
+      "reset-password": "密码重置",
+      diagnostics: "环境检查",
+    };
+    return labels[task.kind] || "后台任务";
+  }
+
+  function taskPercent(task) {
+    if (Number(task.total) > 0) {
+      return Math.min(100, Math.max(0, Math.round((Number(task.current) / Number(task.total)) * 100)));
+    }
+    return task.state === "succeeded" ? 100 : 0;
+  }
+
+  function formatTaskTime(value) {
+    if (!value) return "-";
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return String(value);
+    return new Intl.DateTimeFormat("zh-CN", {
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).format(parsed);
+  }
+
+  function taskMatchesFilter(task, filter = state.taskFilter) {
+    if (filter === "running") return isTaskRunning(task);
+    if (filter === "succeeded") return task.state === "succeeded";
+    if (filter === "failed") return ["failed", "cancelled"].includes(task.state);
+    return true;
+  }
+
+  function visibleTasks() {
+    return state.tasks.filter((task) => taskMatchesFilter(task));
+  }
+
   function renderTaskList() {
     const list = byId("task-list");
-    const running = state.tasks.filter((task) => !["succeeded", "failed", "cancelled"].includes(task.state));
+    const running = state.tasks.filter(isTaskRunning);
+    const succeeded = state.tasks.filter((task) => task.state === "succeeded");
+    const failed = state.tasks.filter((task) => ["failed", "cancelled"].includes(task.state));
     const inspection = running.find((task) => task.kind === "inspect");
+    const filtered = visibleTasks();
+    const trigger = document.querySelector(".task-trigger");
+
     byId("running-task-count").textContent = String(running.length);
+    byId("task-running-summary").textContent = String(running.length);
+    byId("task-succeeded-summary").textContent = String(succeeded.length);
+    byId("task-failed-summary").textContent = String(failed.length);
+    byId("task-drawer-subtitle").textContent = running.length
+      ? `${running.length} 个任务正在执行 · 最近 ${state.tasks.length} 条`
+      : `当前空闲 · 最近 ${state.tasks.length} 条`;
+    trigger.classList.toggle("is-live", running.length > 0);
+    trigger.setAttribute("aria-label", running.length ? `打开任务中心，${running.length} 个任务进行中` : "打开任务中心");
+    all("[data-task-filter]").forEach((button) => {
+      const active = button.dataset.taskFilter === state.taskFilter;
+      button.classList.toggle("is-active", active);
+      button.setAttribute("aria-selected", String(active));
+    });
+
     byId("inspect-selected").disabled = Boolean(inspection) || state.selected.size === 0;
     byId("inspect-all").disabled = Boolean(inspection);
     byId("cancel-inspection").disabled = !inspection || Boolean(inspection.cancelRequested);
+
     if (!state.tasks.length) {
       list.innerHTML = '<div class="empty-task"><strong>还没有任务</strong><p>导入、巡检、登录和注册任务会显示在这里。</p></div>';
       return;
     }
-    list.innerHTML = state.tasks.map((task) => {
+    if (!filtered.length) {
+      list.innerHTML = '<div class="empty-task"><strong>没有符合条件的任务</strong><p>切换筛选可查看其他任务记录。</p></div>';
+      return;
+    }
+
+    list.innerHTML = filtered.map((task) => {
       const status = safeStatus(task.state);
+      const percent = taskPercent(task);
+      const showProgress = isTaskRunning(task) || Number(task.total) > 0;
       return `
-        <button class="task-list-item${state.selectedTaskId === task.id ? " is-active" : ""}" type="button" data-task-id="${escapeHtml(task.id)}">
-          <span><strong>${escapeHtml(task.label)}</strong><small>${escapeHtml(task.message || formatTime(task.createdAt))}</small></span>
-          <span class="task-state task-${status}">${escapeHtml(taskLabelState(task))}</span>
+        <button class="task-list-item task-item-${status}${state.selectedTaskId === task.id ? " is-active" : ""}" type="button" data-task-id="${escapeHtml(task.id)}"${state.selectedTaskId === task.id ? ' aria-current="true"' : ""}>
+          <span class="task-list-main">
+            <span class="task-kind-label">${escapeHtml(taskKindLabel(task))}</span>
+            <strong>${escapeHtml(task.label)}</strong>
+            <small>${escapeHtml(task.message || "等待任务更新")}</small>
+          </span>
+          <span class="task-list-meta">
+            <span class="task-state task-${status}">${escapeHtml(taskLabelState(task))}</span>
+            <small>${escapeHtml(formatTaskTime(task.startedAt || task.createdAt))}</small>
+          </span>
+          ${showProgress ? `<progress class="task-list-progress" max="100" value="${percent}" aria-label="进度 ${percent}%">${percent}%</progress>` : ""}
         </button>`;
     }).join("");
     all("[data-task-id]", list).forEach((button) => button.addEventListener("click", () => selectTask(button.dataset.taskId)));
@@ -293,25 +377,71 @@
 
   function renderTaskDetail(task) {
     const detail = byId("task-detail");
+    const previousTaskId = detail.dataset.taskId || "";
+    const previousLog = byId("active-task-log");
+    const shouldStickToBottom = Boolean(
+      previousLog
+      && previousLog.scrollHeight - previousLog.scrollTop - previousLog.clientHeight < 24,
+    );
     const stateName = safeStatus(task.state);
-    const percent = task.total > 0 ? Math.min(100, Math.round((task.current / task.total) * 100)) : (task.state === "succeeded" ? 100 : 0);
-    const canCancel = ["queued", "running"].includes(task.state) && ["register", "login", "reset-password", "inspect"].includes(task.kind) && !task.cancelRequested;
-    const logs = (task.logs || []).map((line) => `
+    const percent = taskPercent(task);
+    const canCancel = ["queued", "running"].includes(task.state)
+      && ["register", "login", "reset-password", "inspect"].includes(task.kind)
+      && !task.cancelRequested;
+    const logs = task.logs || [];
+    const logMarkup = logs.map((line) => `
       <div class="task-log-row"><time>${escapeHtml(line.time)}</time><span>${escapeHtml(line.message)}</span></div>`).join("");
+    const progressCaption = Number(task.total) > 0
+      ? `${Number(task.current)} / ${Number(task.total)}`
+      : taskLabelState(task);
+    const statusMessage = task.error || task.message || "等待任务更新";
+
+    detail.setAttribute("aria-busy", "false");
+    detail.dataset.taskId = task.id;
     detail.innerHTML = `
       <div class="task-detail-heading">
-        <div><h3>${escapeHtml(task.label)}</h3><p>${escapeHtml(task.message || "")}</p></div>
+        <div><span class="task-kind-label">${escapeHtml(taskKindLabel(task))}</span><h3>${escapeHtml(task.label)}</h3><p>${escapeHtml(statusMessage)}</p></div>
         <span class="task-state task-${stateName}">${escapeHtml(taskLabelState(task))}</span>
       </div>
-      <div class="task-progress">
-        <progress class="task-progress-bar" max="100" value="${percent}">${percent}%</progress>
-        <small>${task.total > 0 ? `${Number(task.current)} / ${Number(task.total)}` : formatTime(task.startedAt || task.createdAt)}</small>
+      <div class="task-detail-meta">
+        <div class="task-detail-meta-item"><span>任务编号</span><strong>${escapeHtml(task.id)}</strong></div>
+        <div class="task-detail-meta-item"><span>启动时间</span><strong>${escapeHtml(formatTime(task.startedAt || task.createdAt))}</strong></div>
+        <div class="task-detail-meta-item"><span>任务类型</span><strong>${escapeHtml(taskKindLabel(task))}</strong></div>
+        <div class="task-detail-meta-item"><span>结束时间</span><strong>${escapeHtml(formatTime(task.finishedAt))}</strong></div>
       </div>
-      ${canCancel ? '<button class="button button-danger" type="button" id="cancel-selected-task">取消任务</button>' : ""}
-      <div class="task-log" id="active-task-log">${logs || '<span class="muted">任务还没有产生日志。</span>'}</div>`;
+      <div class="task-progress">
+        <div class="task-progress-heading"><span>完成进度</span><strong>${percent}%</strong></div>
+        <progress class="task-progress-bar" max="100" value="${percent}">${percent}%</progress>
+        <small>${escapeHtml(progressCaption)}</small>
+      </div>
+      <div class="task-action-row">
+        ${logs.length ? '<button class="button button-quiet" type="button" id="copy-task-logs">复制日志</button>' : ""}
+        ${canCancel ? '<button class="button button-danger" type="button" id="cancel-selected-task">取消任务</button>' : ""}
+      </div>
+      <div class="task-log-label"><span>执行日志</span><span>${logs.length} 条</span></div>
+      <div class="task-log" id="active-task-log">${logMarkup || '<span class="muted">任务还没有产生日志。</span>'}</div>`;
+
     const logBox = byId("active-task-log");
-    if (logBox) logBox.scrollTop = logBox.scrollHeight;
-    if (canCancel) byId("cancel-selected-task").addEventListener("click", () => cancelTask(task.id));
+    if (logBox && (previousTaskId !== task.id || shouldStickToBottom)) {
+      logBox.scrollTop = logBox.scrollHeight;
+    }
+    if (logs.length) {
+      byId("copy-task-logs").addEventListener("click", async () => {
+        const text = logs.map((line) => `[${line.time}] ${line.message}`).join("\n");
+        try {
+          await navigator.clipboard.writeText(text);
+          toast("任务日志已复制");
+        } catch (_) {
+          toast("浏览器未允许复制，请在日志区域手动选择", true);
+        }
+      });
+    }
+    if (canCancel) {
+      byId("cancel-selected-task").addEventListener("click", async () => {
+        const confirmed = await confirmOperation("取消任务", `确定取消“${task.label}”吗？已完成的步骤不会回退。`, true);
+        if (confirmed) cancelTask(task.id);
+      });
+    }
     if (task.kind === "diagnostics" && task.result && task.result.checks) {
       renderDiagnostics(task.result.checks);
     }
@@ -320,26 +450,117 @@
   async function selectTask(taskId) {
     state.selectedTaskId = taskId;
     renderTaskList();
+    const detail = byId("task-detail");
+    detail.setAttribute("aria-busy", "true");
+    detail.innerHTML = '<div class="task-detail-loading" aria-label="正在加载任务详情"><span></span><span></span><span></span></div>';
     try {
       const task = await api(`/api/tasks/${encodeURIComponent(taskId)}`);
-      renderTaskDetail(task);
+      if (state.selectedTaskId === taskId) renderTaskDetail(task);
     } catch (error) {
+      if (state.selectedTaskId !== taskId) return;
+      detail.setAttribute("aria-busy", "false");
+      detail.innerHTML = `<div class="task-detail-error"><strong>任务详情加载失败</strong><p>${escapeHtml(error.message)}</p><button class="button" type="button" id="retry-task-detail">重试</button></div>`;
+      byId("retry-task-detail").addEventListener("click", () => selectTask(taskId));
       toast(error.message, true);
     }
   }
 
-  function openTaskDrawer(taskId = "") {
-    byId("task-drawer").classList.add("is-open");
-    byId("task-drawer").setAttribute("aria-hidden", "false");
+  function setTaskFilter(filter) {
+    if (!["all", "running", "succeeded", "failed"].includes(filter)) return;
+    state.taskFilter = filter;
+    renderTaskList();
+    const filtered = visibleTasks();
+    if (!filtered.length) {
+      state.selectedTaskId = "";
+      byId("task-detail").innerHTML = '<div class="empty-task"><strong>此筛选暂无任务</strong><p>切换上方分类继续查看。</p></div>';
+      return;
+    }
+    if (!filtered.some((task) => task.id === state.selectedTaskId)) selectTask(filtered[0].id);
+  }
+
+  function setTaskDrawerExpanded(expanded) {
+    const drawer = byId("task-drawer");
+    drawer.inert = !expanded;
+    all("[data-open-tasks]").forEach((button) => button.setAttribute("aria-expanded", String(expanded)));
+  }
+
+  function openTaskDrawer(taskId = "", trigger = null) {
+    const drawer = byId("task-drawer");
+    const wasOpen = drawer.classList.contains("is-open");
+    if (!wasOpen) {
+      state.drawerReturnFocus = trigger || (document.activeElement instanceof HTMLElement ? document.activeElement : null);
+    }
+    drawer.classList.add("is-open");
+    drawer.setAttribute("aria-hidden", "false");
     byId("drawer-backdrop").hidden = false;
-    if (taskId) selectTask(taskId);
-    else if (state.selectedTaskId) selectTask(state.selectedTaskId);
+    document.body.classList.add("task-drawer-open");
+    setTaskDrawerExpanded(true);
+    const targetId = taskId
+      || (visibleTasks().some((task) => task.id === state.selectedTaskId) ? state.selectedTaskId : "")
+      || (visibleTasks()[0] && visibleTasks()[0].id)
+      || "";
+    if (targetId) selectTask(targetId);
+    if (!wasOpen) window.requestAnimationFrame(() => byId("close-task-drawer").focus());
   }
 
   function closeTaskDrawer() {
-    byId("task-drawer").classList.remove("is-open");
-    byId("task-drawer").setAttribute("aria-hidden", "true");
+    const drawer = byId("task-drawer");
+    if (!drawer.classList.contains("is-open")) return;
+    drawer.classList.remove("is-open");
+    drawer.setAttribute("aria-hidden", "true");
     byId("drawer-backdrop").hidden = true;
+    document.body.classList.remove("task-drawer-open");
+    setTaskDrawerExpanded(false);
+    const returnFocus = state.drawerReturnFocus;
+    state.drawerReturnFocus = null;
+    if (returnFocus && document.contains(returnFocus)) returnFocus.focus({ preventScroll: true });
+  }
+
+  function handleTaskDrawerKeydown(event) {
+    const drawer = byId("task-drawer");
+    if (!drawer.classList.contains("is-open") || document.querySelector("dialog[open]")) return;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeTaskDrawer();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const focusable = all('button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])', drawer)
+      .filter((element) => element.getClientRects().length > 0);
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+
+  async function refreshTaskCenter() {
+    const button = byId("refresh-tasks");
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+    try {
+      const payload = await api("/api/tasks");
+      const tasks = payload.tasks || [];
+      state.tasks = tasks.map((task) => {
+        const copy = { ...task };
+        delete copy.logs;
+        return copy;
+      });
+      renderTaskList();
+      const selected = tasks.find((task) => task.id === state.selectedTaskId);
+      if (selected) renderTaskDetail(selected);
+      scheduleTaskPolling();
+    } catch (error) {
+      toast(error.message, true);
+    } finally {
+      button.disabled = false;
+      button.removeAttribute("aria-busy");
+    }
   }
 
   async function startTask(path, body, message) {
@@ -643,9 +864,12 @@
   function bindEvents() {
     all("[data-view-target]").forEach((button) => button.addEventListener("click", () => showView(button.dataset.viewTarget)));
     all("[data-settings-target]").forEach((button) => button.addEventListener("click", () => showSettingsView(button.dataset.settingsTarget)));
-    all("[data-open-tasks]").forEach((button) => button.addEventListener("click", () => openTaskDrawer()));
+    all("[data-open-tasks]").forEach((button) => button.addEventListener("click", () => openTaskDrawer("", button)));
+    all("[data-task-filter]").forEach((button) => button.addEventListener("click", () => setTaskFilter(button.dataset.taskFilter)));
+    byId("refresh-tasks").addEventListener("click", refreshTaskCenter);
     byId("close-task-drawer").addEventListener("click", closeTaskDrawer);
     byId("drawer-backdrop").addEventListener("click", closeTaskDrawer);
+    document.addEventListener("keydown", handleTaskDrawerKeydown);
     byId("mobile-nav-toggle").addEventListener("click", () => document.querySelector(".sidebar").classList.toggle("is-open"));
 
     byId("import-history-button").addEventListener("click", importHistory);
