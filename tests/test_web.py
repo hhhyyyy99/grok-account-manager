@@ -6,8 +6,34 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from grok_manager.web import ASSET_DIR, GrokWebApplication
+from grok_manager.web import (
+    ASSET_DIR,
+    GrokWebApplication,
+    host_header_hostname,
+    is_loopback_host,
+    is_wildcard_host,
+    normalize_bind_host,
+)
 from tests.support import make_manager
+
+
+class LanAccessTests(unittest.TestCase):
+    def test_host_helpers(self) -> None:
+        self.assertEqual("0.0.0.0", normalize_bind_host("0.0.0.0"))
+        self.assertEqual("::", normalize_bind_host("[::]"))
+        self.assertTrue(is_loopback_host("127.0.0.1"))
+        self.assertTrue(is_loopback_host("::1"))
+        self.assertFalse(is_loopback_host("0.0.0.0"))
+        self.assertTrue(is_wildcard_host("0.0.0.0"))
+        self.assertEqual("192.168.1.10", host_header_hostname("192.168.1.10:8787"))
+        self.assertEqual("::1", host_header_hostname("[::1]:8787"))
+        self.assertIsNone(host_header_hostname(""))
+
+    def test_serve_rejects_non_loopback_without_lan_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            application = GrokWebApplication(make_manager(Path(directory)))
+            with self.assertRaisesRegex(ValueError, "--lan"):
+                application.serve(host="0.0.0.0", port=0, open_browser=False, allow_lan=False)
 
 
 class ManagerTaskConfigTests(unittest.TestCase):

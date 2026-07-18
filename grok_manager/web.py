@@ -23,6 +23,8 @@ from .service import GrokManager
 
 ASSET_DIR = Path(__file__).resolve().parent / "web_assets"
 TERMINAL_STATES = {"succeeded", "failed", "cancelled"}
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+WILDCARD_HOSTS = frozenset({"0.0.0.0", "::", "[::]"})
 
 
 def now_iso() -> str:
@@ -31,6 +33,44 @@ def now_iso() -> str:
 
 def safe_visible(value: Any) -> str:
     return str(value or "").replace("—", "-").replace("–", "-")
+
+
+def normalize_bind_host(host: str) -> str:
+    value = (host or "").strip()
+    if not value:
+        raise ValueError("host 不能为空")
+    if value.startswith("[") and value.endswith("]") and len(value) > 2:
+        value = value[1:-1]
+    return value
+
+
+def is_loopback_host(host: str) -> bool:
+    return normalize_bind_host(host).lower() in LOOPBACK_HOSTS
+
+
+def is_wildcard_host(host: str) -> bool:
+    return normalize_bind_host(host).lower() in WILDCARD_HOSTS
+
+
+def host_header_hostname(host_header: str) -> Optional[str]:
+    host = (host_header or "").strip().lower()
+    if not host:
+        return None
+    if host.startswith("["):
+        closing = host.find("]")
+        if closing < 0:
+            return None
+        hostname = host[1:closing]
+        suffix = host[closing + 1 :]
+        if suffix and not (suffix.startswith(":") and suffix[1:].isdigit()):
+            return None
+        return hostname
+    hostname, separator, port = host.rpartition(":")
+    if not separator:
+        return host
+    if not port.isdigit():
+        return None
+    return hostname
 
 
 class TaskRecord:
@@ -534,9 +574,20 @@ class GrokWebApplication:
         self.manager.reference.save_registration_config(payload)
         return self.config_json()
 
-    def serve(self, host: str = "127.0.0.1", port: int = 8787, open_browser: bool = True) -> None:
-        if host not in ("127.0.0.1", "localhost", "::1"):
-            raise ValueError("为保护账号凭据，管理端只允许绑定本机回环地址")
+    def serve(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 8787,
+        open_browser: bool = True,
+        allow_lan: bool = False,
+    ) -> None:
+        bind_host = normalize_bind_host(host)
+        if not allow_lan and not is_loopback_host(bind_host):
+            raise ValueError(
+                "为保护账号凭据，默认只允许绑定本机回环地址；如需局域网访问请加 --lan"
+            )
+        if allow_lan and is_loopback_host(bind_host):
+            bind_host = "0.0.0.0"
         application = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -609,24 +660,24 @@ class GrokWebApplication:
                 )
 
             def _trusted_host(self) -> bool:
-                host = self.headers.get("Host", "").strip().lower()
-                if host.startswith("["):
-                    closing = host.find("]")
-                    if closing < 0 or host[: closing + 1] != "[::1]":
-                        return False
-                    suffix = host[closing + 1 :]
-                    return not suffix or (suffix.startswith(":") and suffix[1:].isdigit())
-                hostname, separator, port = host.rpartition(":")
-                if not separator:
-                    hostname = host
-                elif not port.isdigit():
+                hostname = host_header_hostname(self.headers.get("Host", ""))
+                if not hostname:
                     return False
-                return hostname in ("127.0.0.1", "localhost")
+                if hostname in LOOPBACK_HOSTS:
+                    return True
+                if not allow_lan:
+                    return False
+                if is_wildcard_host(bind_host):
+                    return True
+                return hostname == bind_host.lower()
 
             def _allow_request(self) -> bool:
                 if self._trusted_host():
                     return True
-                self._error(403, "仅允许通过本机回环地址访问")
+                if allow_lan:
+                    self._error(403, "Host 头不被当前绑定地址允许")
+                else:
+                    self._error(403, "仅允许通过本机回环地址访问")
                 return False
 
             def do_GET(self) -> None:
@@ -747,19 +798,30 @@ class GrokWebApplication:
                     self._error(500, str(exc))
 
         server_class = ThreadingHTTPServer
-        if host == "::1":
+        if ":" in bind_host:
             class IPv6ThreadingHTTPServer(ThreadingHTTPServer):
                 address_family = socket.AF_INET6
 
             server_class = IPv6ThreadingHTTPServer
-        server = server_class((host, int(port)), Handler)
+        server = server_class((bind_host, int(port)), Handler)
         server.daemon_threads = True
         self._server = server
-        display_host = "[%s]" % host if host == "::1" else host
-        url = "http://%s:%s" % (display_host, server.server_address[1])
-        print("Grok Account Manager: %s" % url, flush=True)
+        bound_port = server.server_address[1]
+        if allow_lan:
+            local_url = "http://127.0.0.1:%s" % bound_port
+            print("Grok Account Manager: %s (监听 %s)" % (local_url, bind_host), flush=True)
+            print(
+                "已开启局域网访问：请用本机局域网 IP 访问，例如 http://<局域网IP>:%s" % bound_port,
+                flush=True,
+            )
+            print("警告：局域网内其他设备可访问此管理端；请确保网络可信。", flush=True)
+            browser_url = local_url
+        else:
+            display_host = "[%s]" % bind_host if ":" in bind_host else bind_host
+            browser_url = "http://%s:%s" % (display_host, bound_port)
+            print("Grok Account Manager: %s" % browser_url, flush=True)
         if open_browser:
-            threading.Timer(0.4, lambda: webbrowser.open(url)).start()
+            threading.Timer(0.4, lambda: webbrowser.open(browser_url)).start()
         try:
             server.serve_forever(poll_interval=0.25)
         except KeyboardInterrupt:

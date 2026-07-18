@@ -34,7 +34,7 @@ Grok Account Manager
 └── 批量登录 worker ────→ grok_register.cpa_xai.mint
 ```
 
-注册运行时代码和 Turnstile 扩展随本项目一起安装。浏览器自动化仍在独立子进程中运行，避免阻塞管理端。本地 HTTP 服务仅绑定回环地址并校验 `Host`，账号、配置、任务详情与全部写操作都要求页面内的随机请求令牌。
+注册运行时代码和 Turnstile 扩展随本项目一起安装。浏览器自动化仍在独立子进程中运行，避免阻塞管理端。本地 HTTP 服务默认仅绑定回环地址并校验 `Host`；需要局域网访问时显式加 `--lan`。账号、配置、任务详情与全部写操作都要求页面内的随机请求令牌。
 
 ## 环境要求
 
@@ -64,12 +64,18 @@ uv run --locked python run.py
 
 首次启动会要求创建至少 12 个字符的主密码，后续每次启动需要先解锁凭据保险库。主密码不会落盘；忘记主密码后无法恢复已加密凭据。
 
-启动后会打开 `http://127.0.0.1:8787`。不自动打开浏览器或更换端口时直接传参数，不需要再写 `ui`：
+启动后会打开 `http://127.0.0.1:8787`。不自动打开浏览器、更换端口或开放局域网访问时直接传参数，不需要再写 `ui`：
 
 ```bash
 uv run --locked python run.py --no-browser
 uv run --locked python run.py --port 9000
+# 局域网访问：默认绑定 0.0.0.0，然后用本机局域网 IP 访问，例如 http://192.168.1.10:8787
+uv run --locked python run.py --lan --no-browser
+# 也可在开启 --lan 后指定具体网卡地址
+uv run --locked python run.py --lan --host 192.168.1.10
 ```
+
+默认只监听本机。只有显式传入 `--lan` 后才会开放局域网访问；请确保网络可信。
 
 Linux/macOS 也可以这样运行：
 

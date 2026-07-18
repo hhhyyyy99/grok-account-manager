@@ -229,6 +229,7 @@ def command_ui(args: argparse.Namespace) -> int:
             host=getattr(args, "host", "127.0.0.1"),
             port=getattr(args, "port", 8787),
             open_browser=not getattr(args, "no_browser", False),
+            allow_lan=bool(getattr(args, "lan", False)),
         )
         return 0
     except (OSError, ValueError) as exc:
@@ -241,8 +242,17 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
 
     ui = subparsers.add_parser("ui", help="启动本地 Web 管理端")
-    ui.add_argument("--host", default="127.0.0.1")
+    ui.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="绑定地址；默认 127.0.0.1。配合 --lan 可指定网卡地址",
+    )
     ui.add_argument("--port", type=int, default=8787)
+    ui.add_argument(
+        "--lan",
+        action="store_true",
+        help="允许局域网访问（默认绑定 0.0.0.0，并放宽 Host 校验）",
+    )
     ui.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
     ui.set_defaults(handler=command_ui)
 
