@@ -18,7 +18,8 @@
 - 对过期、无效或缺少 SSO 的账号批量登录
   - 复用内置的真实 Chrome/DrissionPage 登录与 OAuth mint 流程
   - 同一次浏览器登录刷新 SSO 与 CPA OAuth 凭据
-  - 登录结果逐账号回写管理库和 `xai-*.json`，随后自动复核
+  - 登录结果逐账号回写管理库和 `xai-*.json`
+  - 每个账号成功后立即更新 CPA hotload 与 Grok2API，不等待整批结束，随后统一复核
 - 同一套服务同时提供 CLI，方便无界面操作和故障排查
 
 ## 设计关系
@@ -79,6 +80,9 @@ uv run --locked ./run.py
 uv run --locked python run.py config check
 uv run --locked python run.py list
 uv run --locked python run.py login --expired
+
+# 邮箱密码错误时，重置密码并自动重新登录指定账号
+uv run --locked python run.py reset-password --ids 4461
 ```
 
 源码目录运行时，首次启动会创建：
@@ -161,6 +165,8 @@ uv run --locked python -m unittest discover -v
 - SSO 在线巡检只把 SSO cookie 发往 `accounts.x.ai/account`，使用 GET 且不修改账号。
 - CPA 在线巡检只把 access token 发往 CPA `base_url` 的 `/models`；若凭据文件指定了 `base_url`，优先使用该地址。
 - 批量登录会将密码写入权限收紧的临时 JSON，子进程退出后立即删除。
+- 密码重置会使用对应批次的 `mail_credentials.txt` 获取验证码，生成的新密码同步写入管理库和账号产物，然后自动重新登录；找不到邮箱访问凭据的账号会跳过。
+- Grok 密码重置路径为 `accounts.x.ai/sign-in` → “使用邮箱登录” → 邮箱“下一步” → 密码页“忘记密码？”；临时邮箱只用于接收验证码，不会重置邮箱密码。
 
 ## 当前机器首次运行提示
 

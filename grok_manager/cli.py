@@ -126,6 +126,35 @@ def command_login(args: argparse.Namespace) -> int:
     return 0 if success == len(results) else 1
 
 
+def command_reset_password(args: argparse.Namespace) -> int:
+    manager = GrokManager()
+    ids = _selected_ids(manager, args.ids, args.all)
+    if not ids:
+        print("没有待重置密码账号，请指定 --ids 或 --all", file=sys.stderr)
+        return 2
+
+    def progress(result, completed, total):
+        label = "成功" if result.ok else "失败"
+        print("[%s/%s] #%s %s %s - %s" % (
+            completed, total, result.account_id, result.email, label, result.detail
+        ))
+
+    reset_results = manager.reset_passwords(
+        ids, log=lambda line: print("[reset] %s" % line), progress=progress
+    )
+    reset_ids = [result.account_id for result in reset_results if result.ok]
+    if not reset_ids:
+        print("密码重置完成：没有成功账号")
+        return 1
+    login_results = manager.batch_login(
+        reset_ids,
+        log=lambda line: print("[login] %s" % line),
+        progress=progress,
+    )
+    success = sum(1 for result in login_results if result.ok)
+    print("密码重置并登录完成: 重置 %s 个，登录成功 %s 个" % (len(reset_ids), success))
+    return 0 if success == len(reset_ids) else 1
+
 def command_register(args: argparse.Namespace) -> int:
     manager = GrokManager()
     request = RegistrationRequest(args.count, args.threads, args.mint_workers)
@@ -212,6 +241,11 @@ def build_parser() -> argparse.ArgumentParser:
     login.add_argument("--all", action="store_true")
     login.add_argument("--expired", action="store_true", help="登录巡检判定为过期/无效/待登录的账号")
     login.set_defaults(handler=command_login)
+
+    reset_password = subparsers.add_parser("reset-password", help="重置邮箱密码并重新登录")
+    reset_password.add_argument("--ids", default="", help="逗号分隔账号 ID")
+    reset_password.add_argument("--all", action="store_true")
+    reset_password.set_defaults(handler=command_reset_password)
 
     register = subparsers.add_parser("register", help="调用内置运行时批量注册")
     register.add_argument("--count", type=int, default=1)

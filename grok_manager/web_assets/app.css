@@ -1422,3 +1422,13 @@ input[type="checkbox"] {
     transition-duration: 0.01ms !important;
   }
 }
+
+.button-warning {
+  border-color: #d9bc83;
+  background: var(--warning-bg);
+  color: #855314;
+}
+
+.button-warning:hover {
+  border-color: var(--warning);
+}

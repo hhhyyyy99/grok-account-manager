@@ -409,6 +409,48 @@ def cloudflare_create_temp_address(api_base):
     return address, jwt
 
 
+def cloudflare_admin_get_messages(address):
+    target = str(address or "").strip().lower()
+    if not target or "@" not in target:
+        raise ValueError("无效邮箱地址")
+    api_base = get_cloudflare_api_base()
+    if not api_base:
+        raise Exception("Cloudflare API Base 未配置")
+    if not get_cloudflare_api_key():
+        raise Exception("Cloudflare 管理密钥未配置")
+
+    results = []
+    offset = 0
+    limit = 100
+    while True:
+        params = cloudflare_apply_auth_params(
+            {"address": target, "limit": limit, "offset": offset}
+        )
+        response = http_get(
+            f"{api_base}/admin/mails",
+            headers=cloudflare_build_headers(content_type=False),
+            params=params,
+        )
+        response.raise_for_status()
+        data = response.json()
+        rows = _pick_list_payload(data)
+        results.extend(
+            row
+            for row in rows
+            if str(row.get("address") or "").strip().casefold() == target.casefold()
+        )
+        try:
+            total = int(data.get("count") or len(rows))
+        except (AttributeError, TypeError, ValueError):
+            total = len(rows)
+        offset += len(rows)
+        if not rows or offset >= total:
+            break
+    return results
+
+
+
+
 def get_user_agent():
     return config.get(
         "user_agent",
@@ -416,13 +458,17 @@ def get_user_agent():
     )
 
 
-def resolve_grok2api_local_token_file():
-    batch_dir = get_active_batch_dir()
-    if batch_dir is not None:
-        return str(batch_dir / "grok2api_tokens.json")
-    configured = str(config.get("grok2api_local_token_file", "") or "").strip()
+def resolve_grok2api_local_token_file(settings=None, default_token_file=None):
+    values = config if settings is None else settings
+    if settings is None:
+        batch_dir = get_active_batch_dir()
+        if batch_dir is not None:
+            return str(batch_dir / "grok2api_tokens.json")
+    configured = str(values.get("grok2api_local_token_file", "") or "").strip()
     if configured:
         return configured
+    if default_token_file is not None:
+        return str(default_token_file)
     return str(TOKEN_JSON)
 
 
@@ -433,15 +479,57 @@ def _normalize_sso_token(raw_token):
     return token
 
 
-def add_token_to_grok2api_local_pool(raw_token, email="", log_callback=None):
+def _upsert_grok2api_pool(pool, token, email="", replace_email=False):
+    items = list(pool) if isinstance(pool, list) else []
+    target_email = str(email or "").strip().casefold() if replace_email else ""
+    if target_email:
+        replacement = None
+        retained = []
+        for item in items:
+            note = str(item.get("note") or "").strip().casefold() if isinstance(item, dict) else ""
+            if note == target_email:
+                if replacement is None and isinstance(item, dict):
+                    replacement = dict(item)
+                continue
+            retained.append(item)
+        if replacement is not None or len(retained) != len(items):
+            entry = replacement or {}
+            entry["token"] = token
+            entry["tags"] = entry.get("tags") or ["auto-relogin"]
+            entry["note"] = email
+            retained.append(entry)
+            return retained, True
+
+    existing = set()
+    for item in items:
+        if isinstance(item, str):
+            existing.add(_normalize_sso_token(item))
+        elif isinstance(item, dict):
+            existing.add(_normalize_sso_token(item.get("token", "")))
+    if token in existing:
+        return items, False
+    tag = "auto-relogin" if replace_email else "auto-register"
+    items.append({"token": token, "tags": [tag], "note": email})
+    return items, True
+
+
+def add_token_to_grok2api_local_pool(
+    raw_token,
+    email="",
+    log_callback=None,
+    settings=None,
+    default_token_file=None,
+    replace_email=False,
+):
     token = _normalize_sso_token(raw_token)
     if not token:
         return False
-    token_file = resolve_grok2api_local_token_file()
-    pool_name = str(config.get("grok2api_pool_name", "ssoBasic") or "ssoBasic").strip()
+    values = config if settings is None else settings
+    token_file = resolve_grok2api_local_token_file(settings, default_token_file)
+    pool_name = str(values.get("grok2api_pool_name", "ssoBasic") or "ssoBasic").strip()
     if not pool_name:
         pool_name = "ssoBasic"
-    os.makedirs(os.path.dirname(token_file), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(token_file)), exist_ok=True)
     with _output_file_lock:
         data = {}
         if os.path.exists(token_file):
@@ -452,26 +540,19 @@ def add_token_to_grok2api_local_pool(raw_token, email="", log_callback=None):
                 data = {}
         if not isinstance(data, dict):
             data = {}
-        pool = data.get(pool_name)
-        if not isinstance(pool, list):
-            pool = []
-        existing = set()
-        for item in pool:
-            if isinstance(item, str):
-                existing.add(_normalize_sso_token(item))
-            elif isinstance(item, dict):
-                existing.add(_normalize_sso_token(item.get("token", "")))
-        if token in existing:
+        pool, changed = _upsert_grok2api_pool(
+            data.get(pool_name), token, email=email, replace_email=replace_email
+        )
+        if not changed:
             if log_callback:
                 log_callback(f"[*] grok2api 本地池已存在 token: {pool_name}")
             return True
-        entry = {"token": token, "tags": ["auto-register"], "note": email}
-        pool.append(entry)
         data[pool_name] = pool
         with open(token_file, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     if log_callback:
-        log_callback(f"[+] 已写入 grok2api 本地池: {pool_name} ({token_file})")
+        action = "已更新" if replace_email else "已写入"
+        log_callback(f"[+] {action} grok2api 本地池: {pool_name} ({token_file})")
     return True
 
 
@@ -504,13 +585,16 @@ def get_grok2api_remote_api_bases(base):
     return unique
 
 
-def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
+def add_token_to_grok2api_remote_pool(
+    raw_token, email="", log_callback=None, settings=None, replace_email=False
+):
     token = _normalize_sso_token(raw_token)
     if not token:
         return False
-    base = str(config.get("grok2api_remote_base", "") or "").strip().rstrip("/")
-    app_key = str(config.get("grok2api_remote_app_key", "") or "").strip()
-    pool_name = str(config.get("grok2api_pool_name", "ssoBasic") or "ssoBasic").strip() or "ssoBasic"
+    values = config if settings is None else settings
+    base = str(values.get("grok2api_remote_base", "") or "").strip().rstrip("/")
+    app_key = str(values.get("grok2api_remote_app_key", "") or "").strip()
+    pool_name = str(values.get("grok2api_pool_name", "ssoBasic") or "ssoBasic").strip() or "ssoBasic"
     if not base or not app_key:
         if log_callback:
             log_callback("[Debug] grok2api 远端未配置 base/app_key，跳过")
@@ -522,7 +606,8 @@ def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
     api_bases = get_grok2api_remote_api_bases(base)
     add_errors = []
     # 优先使用 add 接口，避免全量覆盖远端池
-    add_payload = {"tokens": [token], "pool": remote_pool, "tags": ["auto-register"]}
+    tag = "auto-relogin" if replace_email else "auto-register"
+    add_payload = {"tokens": [token], "pool": remote_pool, "tags": [tag]}
     for api_base in api_bases:
         endpoint = f"{api_base}/tokens/add"
         try:
@@ -536,7 +621,8 @@ def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
             )
             resp_add.raise_for_status()
             if log_callback:
-                log_callback(f"[+] 已写入 grok2api 远端池: {pool_name} ({endpoint})")
+                action = "已更新" if replace_email else "已写入"
+                log_callback(f"[+] {action} grok2api 远端池: {pool_name} ({endpoint})")
             return True
         except Exception as add_exc:
             add_errors.append(f"{endpoint}: {add_exc}")
@@ -558,17 +644,13 @@ def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
             continue
     if not isinstance(current, dict):
         current = {}
-    pool = current.get(pool_name)
-    if not isinstance(pool, list):
-        pool = []
-    existing = set()
-    for item in pool:
-        if isinstance(item, str):
-            existing.add(_normalize_sso_token(item))
-        elif isinstance(item, dict):
-            existing.add(_normalize_sso_token(item.get("token", "")))
-    if token not in existing:
-        pool.append({"token": token, "tags": ["auto-register"], "note": email})
+    pool, changed = _upsert_grok2api_pool(
+        current.get(pool_name), token, email=email, replace_email=replace_email
+    )
+    if not changed:
+        if log_callback:
+            log_callback(f"[*] grok2api 远端池已存在 token: {pool_name}")
+        return True
     current[pool_name] = pool
     save_errors = []
     save_bases = []
@@ -580,23 +662,45 @@ def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
             resp2 = http_post(f"{api_base}/tokens", headers=headers, params=query, json=current, timeout=30, proxies={})
             resp2.raise_for_status()
             if log_callback:
-                log_callback(f"[+] 已写入 grok2api 远端池: {pool_name} ({api_base}/tokens)")
+                action = "已更新" if replace_email else "已写入"
+                log_callback(f"[+] {action} grok2api 远端池: {pool_name} ({api_base}/tokens)")
             return True
         except Exception as save_exc:
             save_errors.append(f"{api_base}/tokens: {save_exc}")
     raise RuntimeError(f"grok2api 远端 /tokens 全量模式写入失败: {'; '.join(save_errors)}")
 
 
-def add_token_to_grok2api_pools(raw_token, email="", log_callback=None):
-    if config.get("grok2api_auto_add_local", True):
+def add_token_to_grok2api_pools(
+    raw_token,
+    email="",
+    log_callback=None,
+    settings=None,
+    default_token_file=None,
+    replace_email=False,
+):
+    values = config if settings is None else settings
+    if values.get("grok2api_auto_add_local", True):
         try:
-            add_token_to_grok2api_local_pool(raw_token, email=email, log_callback=log_callback)
+            add_token_to_grok2api_local_pool(
+                raw_token,
+                email=email,
+                log_callback=log_callback,
+                settings=settings,
+                default_token_file=default_token_file,
+                replace_email=replace_email,
+            )
         except Exception as exc:
             if log_callback:
                 log_callback(f"[Debug] 写入 grok2api 本地池失败: {exc}")
-    if config.get("grok2api_auto_add_remote", False):
+    if values.get("grok2api_auto_add_remote", False):
         try:
-            add_token_to_grok2api_remote_pool(raw_token, email=email, log_callback=log_callback)
+            add_token_to_grok2api_remote_pool(
+                raw_token,
+                email=email,
+                log_callback=log_callback,
+                settings=settings,
+                replace_email=replace_email,
+            )
         except Exception as exc:
             if log_callback:
                 log_callback(f"[Debug] 写入 grok2api 远端池失败: {exc}")
@@ -1034,9 +1138,10 @@ def yyds_get_oai_code(
     log_callback=None,
     jwt=None,
     cancel_callback=None,
+    excluded_message_ids=None,
 ):
     deadline = time.time() + timeout
-    seen_ids = set()
+    seen_ids = {str(value) for value in (excluded_message_ids or ())}
     last_wait_log = 0
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -1054,9 +1159,9 @@ def yyds_get_oai_code(
             continue
         for msg in messages:
             msg_id = msg.get("id")
-            if not msg_id or msg_id in seen_ids:
+            if not msg_id or str(msg_id) in seen_ids:
                 continue
-            seen_ids.add(msg_id)
+            seen_ids.add(str(msg_id))
             to_addrs = [t.get("address", "").lower() for t in (msg.get("to") or [])]
             if address.lower() not in to_addrs:
                 continue
@@ -1161,6 +1266,20 @@ def get_email_and_token(api_key=None):
         raise Exception("鑾峰彇 DuckMail token 澶辫触")
     return address, token
 
+def list_oai_message_ids(dev_token, email):
+    provider = get_email_provider()
+    if provider == "yyds":
+        messages = yyds_get_messages(email, token=dev_token, jwt=get_yyds_jwt())
+    elif provider == "cloudflare":
+        messages = cloudflare_get_messages(get_cloudflare_api_base(), dev_token)
+    else:
+        messages = get_messages(dev_token)
+    return {
+        str(message.get("id") or message.get("msgid"))
+        for message in (messages or [])
+        if message.get("id") or message.get("msgid")
+    }
+
 
 def get_oai_code(
     dev_token,
@@ -1170,6 +1289,8 @@ def get_oai_code(
     log_callback=None,
     cancel_callback=None,
     resend_callback=None,
+    excluded_message_ids=None,
+    cloudflare_admin_address="",
 ):
     provider = get_email_provider()
     if provider == "yyds":
@@ -1181,6 +1302,7 @@ def get_oai_code(
             log_callback=log_callback,
             jwt=get_yyds_jwt(),
             cancel_callback=cancel_callback,
+            excluded_message_ids=excluded_message_ids,
         )
     if provider == "cloudflare":
         return cloudflare_get_oai_code(
@@ -1191,6 +1313,8 @@ def get_oai_code(
             log_callback=log_callback,
             cancel_callback=cancel_callback,
             resend_callback=resend_callback,
+            excluded_message_ids=excluded_message_ids,
+            cloudflare_admin_address=cloudflare_admin_address,
         )
     return duckmail_get_oai_code(
         dev_token,
@@ -1198,6 +1322,7 @@ def get_oai_code(
         timeout=timeout,
         poll_interval=poll_interval,
         log_callback=log_callback,
+        excluded_message_ids=excluded_message_ids,
         cancel_callback=cancel_callback,
     )
 
@@ -1229,9 +1354,10 @@ def duckmail_get_oai_code(
     poll_interval=3,
     log_callback=None,
     cancel_callback=None,
+    excluded_message_ids=None,
 ):
     deadline = time.time() + timeout
-    seen_ids = set()
+    seen_ids = {str(value) for value in (excluded_message_ids or ())}
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
         try:
@@ -1243,9 +1369,9 @@ def duckmail_get_oai_code(
             continue
         for msg in messages:
             msg_id = msg.get("id") or msg.get("msgid")
-            if not msg_id or msg_id in seen_ids:
+            if not msg_id or str(msg_id) in seen_ids:
                 continue
-            seen_ids.add(msg_id)
+            seen_ids.add(str(msg_id))
             recipients = [t.get("address", "").lower() for t in (msg.get("to") or [])]
             if email.lower() not in recipients:
                 continue
@@ -1283,13 +1409,15 @@ def cloudflare_get_oai_code(
     log_callback=None,
     cancel_callback=None,
     resend_callback=None,
+    excluded_message_ids=None,
+    cloudflare_admin_address="",
 ):
     api_base = get_cloudflare_api_base()
     if not api_base:
         raise Exception("Cloudflare API Base 未配置")
     deadline = time.time() + timeout
     # 同一封邮件正文可能延迟可读，允许多次重试解析，避免偶发漏码
-    seen_attempts = {}
+    seen_attempts = {str(value): 5 for value in (excluded_message_ids or ())}
     next_resend_at = time.time() + 35
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -1303,7 +1431,11 @@ def cloudflare_get_oai_code(
                     log_callback(f"[Debug] 触发重发验证码失败: {exc}")
             next_resend_at = time.time() + 35
         try:
-            messages = cloudflare_get_messages(api_base, dev_token)
+            messages = (
+                cloudflare_admin_get_messages(cloudflare_admin_address)
+                if cloudflare_admin_address
+                else cloudflare_get_messages(api_base, dev_token)
+            )
         except Exception as exc:
             if log_callback:
                 log_callback(f"[Debug] Cloudflare 拉取邮件列表失败: {exc}")
@@ -1316,10 +1448,10 @@ def cloudflare_get_oai_code(
             msg_id = msg.get("id") or msg.get("msgid")
             if not msg_id:
                 continue
-            attempt = int(seen_attempts.get(msg_id, 0))
+            attempt = int(seen_attempts.get(str(msg_id), 0))
             if attempt >= 5:
                 continue
-            seen_attempts[msg_id] = attempt + 1
+            seen_attempts[str(msg_id)] = attempt + 1
             recipients = [t.get("address", "").lower() for t in (msg.get("to") or [])]
             msg_addr = str(msg.get("address", "")).lower()
             # 优先匹配目标邮箱；若结构不一致也允许继续解析，避免接口字段漂移导致漏码
@@ -1345,22 +1477,23 @@ def cloudflare_get_oai_code(
             subject = str(msg.get("subject", "") or "")
             combined = "\n".join(parts)
             # 再尝试 detail 接口补全内容
-            try:
-                detail = cloudflare_get_message_detail(api_base, dev_token, msg_id)
-                for field in ("text", "raw", "content", "intro", "body", "snippet"):
-                    value = detail.get(field)
-                    if isinstance(value, str) and value.strip():
-                        combined += "\n" + value
-                html_list2 = detail.get("html") or []
-                if isinstance(html_list2, str):
-                    html_list2 = [html_list2]
-                for h in html_list2:
-                    combined += "\n" + re.sub(r"<[^>]+>", " ", h)
-                if not subject:
-                    subject = str(detail.get("subject", "") or "")
-            except Exception as exc:
-                if log_callback:
-                    log_callback(f"[Debug] Cloudflare detail接口失败，改用列表内容解析: {exc}")
+            if not cloudflare_admin_address:
+                try:
+                    detail = cloudflare_get_message_detail(api_base, dev_token, msg_id)
+                    for field in ("text", "raw", "content", "intro", "body", "snippet"):
+                        value = detail.get(field)
+                        if isinstance(value, str) and value.strip():
+                            combined += "\n" + value
+                    html_list2 = detail.get("html") or []
+                    if isinstance(html_list2, str):
+                        html_list2 = [html_list2]
+                    for h in html_list2:
+                        combined += "\n" + re.sub(r"<[^>]+>", " ", h)
+                    if not subject:
+                        subject = str(detail.get("subject", "") or "")
+                except Exception as exc:
+                    if log_callback:
+                        log_callback(f"[Debug] Cloudflare detail接口失败，改用列表内容解析: {exc}")
             if log_callback:
                 log_callback(f"[Debug] Cloudflare 收到邮件: {subject}")
             code = extract_verification_code(combined, subject)
@@ -1369,7 +1502,7 @@ def cloudflare_get_oai_code(
                     log_callback(f"[*] Cloudflare 从邮件中提取到验证码: {code}")
                 return code
             elif log_callback:
-                log_callback(f"[Debug] 邮件已解析但未提取到验证码 id={msg_id} attempt={seen_attempts[msg_id]}")
+                log_callback(f"[Debug] 邮件已解析但未提取到验证码 id={msg_id} attempt={seen_attempts[str(msg_id)]}")
         sleep_with_cancel(poll_interval, cancel_callback)
     raise Exception(f"Cloudflare 在 {timeout}s 内未收到验证码邮件")
 

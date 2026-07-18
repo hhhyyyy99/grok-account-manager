@@ -49,6 +49,35 @@ def current_sso_cookie() -> str:
         return ""
 
 
+def run_password_reset_item(
+    item: Dict[str, Any], settings: Dict[str, Any]
+) -> Dict[str, Any]:
+    account_id = int(item.get("id") or 0)
+    email = str(item.get("email") or "").strip()
+
+    def log(message: str) -> None:
+        emit("GM_LOG ", {"id": account_id, "email": email, "message": str(message)})
+
+    log("开始读取重置前邮件")
+    try:
+        from grok_register.password_reset import reset_password
+
+        result = reset_password(
+            email=email,
+            mail_credential=str(item.get("mail_credential") or ""),
+            proxy=str(settings.get("proxy") or "") or None,
+            headless=bool(settings.get("headless", False)),
+            timeout_seconds=float(settings.get("timeout_seconds") or 300),
+            log=log,
+        )
+    except Exception as exc:
+        result = {"ok": False, "error": str(exc)}
+        log("密码重置失败: %s" % exc)
+    result["id"] = account_id
+    result["email"] = email
+    emit("GM_RESULT ", result)
+    return result
+
 def run_login_item(item: Dict[str, Any], settings: Dict[str, Any], mint_and_export) -> Dict[str, Any]:
     account_id = int(item.get("id") or 0)
     email = str(item.get("email") or "").strip()
@@ -141,12 +170,44 @@ def batch_login(args: argparse.Namespace) -> int:
     return 0 if failures == 0 else 2
 
 
+def batch_password_reset(args: argparse.Namespace) -> int:
+    try:
+        document = json.loads(Path(args.input).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        emit("GM_FATAL ", {"error": "密码重置输入读取失败: %s" % exc})
+        return 3
+    accounts = document.get("accounts") or []
+    settings = document.get("settings") or {}
+    if not isinstance(accounts, list) or not accounts:
+        emit("GM_FATAL ", {"error": "密码重置没有账号"})
+        return 3
+
+    workers = max(1, min(int(settings.get("workers") or 1), 10, len(accounts)))
+    failures = 0
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(run_password_reset_item, item, settings)
+            for item in accounts
+        ]
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                failures += int(not result.get("ok"))
+            except Exception as exc:
+                failures += 1
+                emit("GM_FATAL ", {"error": "密码重置工作线程异常: %s" % exc})
+    return 0 if failures == 0 else 2
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="grok-manager reference browser worker")
     subparsers = parser.add_subparsers(dest="command", required=True)
     login = subparsers.add_parser("batch-login")
     login.add_argument("--input", required=True)
     login.set_defaults(handler=batch_login)
+    reset = subparsers.add_parser("reset-password")
+    reset.add_argument("--input", required=True)
+    reset.set_defaults(handler=batch_password_reset)
+
     return parser
 
 

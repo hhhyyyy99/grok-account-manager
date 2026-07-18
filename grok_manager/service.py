@@ -8,11 +8,13 @@ from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 from .config import ConfigStore, ManagerConfig
 from .inspection import InspectionService, TokenInspector
 from .login import BatchLoginService, LoginSettings
+from .password_reset import BatchPasswordResetService, PasswordResetSettings
 from .models import (
     Account,
     AccountStatus,
     InspectionResult,
     LoginResult,
+    PasswordResetResult,
     status_label,
 )
 from .reference import (
@@ -53,6 +55,7 @@ class GrokManager:
             max_workers=self.config.inspection_workers,
         )
         self.login = BatchLoginService(self.store, self.reference, self.python_executable)
+        self.password_reset = BatchPasswordResetService(self.store, self.reference, self.python_executable)
 
     def save_manager_config(self, config: ManagerConfig) -> None:
         self.config_store.save(config)
@@ -126,6 +129,34 @@ class GrokManager:
             cancelled=cancelled,
         )
 
+    def _sync_relogin_credentials(self, result: LoginResult, log=None) -> None:
+        try:
+            hotload_path = self.reference.sync_cpa_hotload(result.auth_file)
+        except Exception as exc:
+            if log:
+                log("[%s] CPA hotload 更新失败: %s" % (result.email, exc))
+        else:
+            if hotload_path is not None and log:
+                log("[%s] CPA hotload 已更新: %s" % (result.email, hotload_path))
+
+        account = self.store.get(result.account_id)
+        if account is None or not account.sso_token:
+            if log:
+                log("[%s] Grok2API 更新失败: 管理库没有新的 SSO token" % result.email)
+            return
+        grok_log = None
+        if log:
+            grok_log = lambda message: log("[%s] %s" % (result.email, message))
+        try:
+            self.reference.sync_grok2api(
+                account.sso_token,
+                email=result.email,
+                log_callback=grok_log,
+            )
+        except Exception as exc:
+            if log:
+                log("[%s] Grok2API 更新失败: %s" % (result.email, exc))
+
     def batch_login(self, account_ids: Iterable[int], log=None, progress=None) -> List[LoginResult]:
         registration_config = self.reference.load_registration_config()
         settings = LoginSettings(
@@ -139,20 +170,21 @@ class GrokManager:
             ),
             probe_after_login=False,
         )
-        results = self.login.login_accounts(account_ids, settings, log=log, progress=progress)
+        def handle_result(result: LoginResult, completed: int, total: int) -> None:
+            if result.ok and result.account_id:
+                self._sync_relogin_credentials(result, log=log)
+            if progress:
+                progress(result, completed, total)
+
+        results = self.login.login_accounts(
+            account_ids,
+            settings,
+            log=log,
+            progress=handle_result,
+        )
         refreshed = [result for result in results if result.ok and result.account_id]
         refreshed_ids = [result.account_id for result in refreshed]
         if refreshed_ids:
-            for result in refreshed:
-                try:
-                    hotload_path = self.reference.sync_cpa_hotload(result.auth_file)
-                except Exception as exc:
-                    if log:
-                        log("[%s] CPA hotload 更新失败: %s" % (result.email, exc))
-                else:
-                    if hotload_path is not None and log:
-                        log("[%s] CPA hotload 已更新: %s" % (result.email, hotload_path))
-
             if log:
                 log("登录完成，开始复核新的 SSO 与 CPA token")
             reviews = self.inspect_accounts(
@@ -185,6 +217,26 @@ class GrokManager:
                 )
             results = reviewed_results
         return results
+
+    def reset_passwords(
+        self,
+        account_ids: Iterable[int],
+        log=None,
+        progress=None,
+    ) -> List[PasswordResetResult]:
+        registration_config = self.reference.load_registration_config()
+        settings = PasswordResetSettings(
+            workers=self.config.login_workers,
+            timeout_seconds=self.config.login_timeout_seconds,
+            proxy=str(registration_config.get("cpa_proxy") or registration_config.get("proxy") or "").strip(),
+            headless=bool(registration_config.get("cpa_headless", False)),
+        )
+        return self.password_reset.reset_accounts(
+            account_ids,
+            settings,
+            log=log,
+            progress=progress,
+        )
 
     def relogin_candidate_ids(self) -> List[int]:
         return self.store.ids_for_statuses(

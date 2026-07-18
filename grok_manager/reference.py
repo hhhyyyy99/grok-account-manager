@@ -231,6 +231,35 @@ class ReferenceProject:
             pass
         return destination
 
+    def sync_grok2api(
+        self,
+        sso_token: str,
+        email: str = "",
+        log_callback: Optional[LogCallback] = None,
+    ) -> None:
+        config = self.load_registration_config()
+        if not bool(config.get("grok2api_auto_add_local", True)) and not bool(
+            config.get("grok2api_auto_add_remote", False)
+        ):
+            return
+        configured = str(config.get("grok2api_local_token_file") or "").strip()
+        if configured:
+            token_file = Path(configured).expanduser()
+            if not token_file.is_absolute():
+                token_file = self.data_root / token_file
+            config["grok2api_local_token_file"] = str(token_file.resolve())
+
+        from grok_register.app import add_token_to_grok2api_pools
+
+        add_token_to_grok2api_pools(
+            sso_token,
+            email=email,
+            log_callback=log_callback,
+            settings=config,
+            default_token_file=self.data_root / "registration-token.json",
+            replace_email=True,
+        )
+
     def _legacy_root_from_manager_config(self) -> Tuple[Optional[Path], bool]:
         root = self.legacy_reference_root
         path = self.legacy_manager_config_file
@@ -407,6 +436,84 @@ class ReferenceProject:
                 if path.is_file():
                     candidates[str(path.resolve())] = path.resolve()
         return sorted(candidates.values(), key=lambda item: (item.stat().st_mtime, str(item)))
+
+    def discover_mail_credential_files(self) -> List[Path]:
+        candidates: Dict[str, Path] = {}
+        for path in self.output_dir.glob("**/mail_credentials.txt"):
+            if path.is_file():
+                candidates[str(path.resolve())] = path.resolve()
+        return sorted(
+            candidates.values(),
+            key=lambda item: (item.stat().st_mtime, str(item)),
+            reverse=True,
+        )
+
+    @staticmethod
+    def _mail_credential_from_file(path: Path, email: str) -> str:
+        target = str(email or "").strip().casefold()
+        if not target or not Path(path).is_file():
+            return ""
+        try:
+            lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return ""
+        for line in reversed(lines):
+            address, separator, credential = line.partition("\t")
+            if separator and address.strip().casefold() == target:
+                return credential.strip()
+        return ""
+
+    def find_mail_credential(self, email: str, source: str = "") -> str:
+        checked = set()
+        source_path = Path(str(source or "")).expanduser()
+        if source_path.is_file():
+            sibling = (source_path.parent / "mail_credentials.txt").resolve()
+            checked.add(str(sibling))
+            credential = self._mail_credential_from_file(sibling, email)
+            if credential:
+                return credential
+        for path in self.discover_mail_credential_files():
+            if str(path) in checked:
+                continue
+            credential = self._mail_credential_from_file(path, email)
+            if credential:
+                return credential
+        return ""
+
+    def persist_account_password(self, email: str, password: str, source: str = "") -> Path:
+        normalized_email = str(email or "").strip().lower()
+        normalized_password = str(password or "").strip()
+        if not normalized_email or not normalized_password:
+            raise ValueError("邮箱和新密码不能为空")
+
+        target = self.output_dir / "password-resets" / "accounts.txt"
+        source_path = Path(str(source or "")).expanduser()
+        if source_path.is_file():
+            try:
+                source_path.resolve().relative_to(self.output_dir.resolve())
+            except ValueError:
+                pass
+            else:
+                target = source_path.resolve()
+
+        lines: List[str] = []
+        if target.is_file():
+            lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+        updated = False
+        output: List[str] = []
+        for line in lines:
+            parts = line.split("----", 2)
+            if len(parts) >= 2 and parts[0].strip().casefold() == normalized_email.casefold():
+                suffix = "----" + parts[2] if len(parts) > 2 else ""
+                output.append("%s----%s%s" % (normalized_email, normalized_password, suffix))
+                updated = True
+            else:
+                output.append(line)
+        if not updated:
+            output.append("%s----%s" % (normalized_email, normalized_password))
+        write_private_text_atomic(target, "\n".join(output) + "\n")
+        return target
+
 
     def discover_auth_files(self, extra_dirs: Sequence[Path] = ()) -> List[Path]:
         candidates: Dict[str, Path] = {}

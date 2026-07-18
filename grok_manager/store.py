@@ -381,6 +381,29 @@ class AccountStore:
                 ),
             )
 
+    def apply_password_reset(self, account_id: int, password: str) -> None:
+        normalized = str(password or "").strip()
+        if not normalized:
+            raise ValueError("新密码不能为空")
+        now = utc_now_iso()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE accounts
+                SET password = ?, status = ?, status_detail = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    normalized,
+                    AccountStatus.NEEDS_LOGIN.value,
+                    "密码已重置，等待重新登录",
+                    now,
+                    int(account_id),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("密码重置对应的账号不存在")
+
     def delete(self, account_ids: Sequence[int]) -> int:
         ids = [int(value) for value in account_ids]
         if not ids:

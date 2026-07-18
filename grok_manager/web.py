@@ -403,6 +403,53 @@ class GrokWebApplication:
 
         return self.tasks.start("login", "批量登录", worker, exclusive_group="browser-automation")
 
+    def start_password_reset(self, payload: Dict[str, Any]) -> TaskRecord:
+        ids = self._ids(payload)
+        if not ids:
+            raise ValueError("没有待重置密码的账号")
+
+        def worker(task: TaskRecord) -> Dict[str, Any]:
+            task.log("开始重置 %s 个账号的密码" % len(ids))
+
+            def reset_progress(result, completed, total):
+                task.progress(completed, total * 2, "%s: %s" % (result.email, result.detail))
+                task.log("#%s %s: %s" % (result.account_id, result.email, result.detail))
+
+            reset_results = self.manager.reset_passwords(
+                ids,
+                log=task.log,
+                progress=reset_progress,
+            )
+            reset_ids = [result.account_id for result in reset_results if result.ok]
+            login_results = []
+            if reset_ids:
+                task.log("密码重置完成 %s 个，开始自动重新登录" % len(reset_ids))
+
+                def login_progress(result, completed, total):
+                    task.progress(
+                        len(ids) + completed,
+                        len(ids) * 2,
+                        "%s: %s" % (result.email, result.detail),
+                    )
+
+                login_results = self.manager.batch_login(
+                    reset_ids,
+                    log=task.log,
+                    progress=login_progress,
+                )
+            reset_succeeded = sum(1 for result in reset_results if result.ok)
+            login_succeeded = sum(1 for result in login_results if result.ok)
+            return {
+                "resetCount": len(reset_results),
+                "resetSucceeded": reset_succeeded,
+                "loginCount": len(login_results),
+                "loginSucceeded": login_succeeded,
+                "message": "密码重置 %s 个，自动登录成功 %s 个"
+                % (reset_succeeded, login_succeeded),
+            }
+
+        return self.tasks.start("reset-password", "重置密码并重新登录", worker, exclusive_group="browser-automation")
+
     def start_registration(self, payload: Dict[str, Any]) -> TaskRecord:
         request = RegistrationRequest(
             count=max(1, int(payload.get("count") or self.manager.config.register_count)),
@@ -449,13 +496,15 @@ class GrokWebApplication:
             raise KeyError("任务不存在")
         if task.state in TERMINAL_STATES:
             return task
-        if task.kind not in ("register", "login", "inspect"):
+        if task.kind not in ("register", "login", "reset-password", "inspect"):
             raise RuntimeError("该任务不支持中途取消")
         task.cancel_requested = True
         if task.kind == "register":
             self.manager.registration.cancel()
         elif task.kind == "login":
             self.manager.login.cancel()
+        elif task.kind == "reset-password":
+            self.manager.password_reset.cancel()
         elif task.kind == "inspect":
             task.message = "正在停止巡检"
         task.log("已请求取消任务")
@@ -645,6 +694,8 @@ class GrokWebApplication:
                         self._json({"task": application.start_import(payload).serialize(False)}, 202)
                     elif parsed.path == "/api/inspect":
                         self._json({"task": application.start_inspection(payload).serialize(False)}, 202)
+                    elif parsed.path == "/api/reset-password":
+                        self._json({"task": application.start_password_reset(payload).serialize(False)}, 202)
                     elif parsed.path == "/api/login":
                         self._json({"task": application.start_login(payload).serialize(False)}, 202)
                     elif parsed.path == "/api/register":

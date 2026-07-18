@@ -47,6 +47,13 @@ process.stdout.write(JSON.stringify(orderAccountsById(accounts).map((item) => it
         self.assertEqual(["a", "b", "c", "d", "e"], json.loads(completed.stdout))
 
 
+    def test_password_reset_action_is_exposed(self) -> None:
+        html = (ASSET_DIR / "index.html").read_text(encoding="utf-8")
+        script = (ASSET_DIR / "app.js").read_text(encoding="utf-8")
+        self.assertIn('id="reset-password-selected"', html)
+        self.assertIn('/api/reset-password', script)
+        self.assertIn('reset-password', script)
+
     def test_registration_config_is_split_by_integration(self) -> None:
         html = (ASSET_DIR / "index.html").read_text(encoding="utf-8")
         script = (ASSET_DIR / "app.js").read_text(encoding="utf-8")

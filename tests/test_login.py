@@ -478,6 +478,96 @@ class BatchLoginCredentialTests(unittest.TestCase):
             self.assertTrue(any("CPA hotload 已更新" in line for line in logs))
             self.assertTrue(any("复核完成: SSO=正常，CPA=正常" in line for line in logs))
 
+    def test_login_syncs_cpa_and_grok2api_before_next_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = make_manager(root)
+            hotload_dir = root / "cpa-hotload"
+            grok2api_file = root / "grok2api-tokens.json"
+            manager.reference.config_file.write_text(
+                json.dumps(
+                    {
+                        "cpa_copy_to_hotload": True,
+                        "cpa_hotload_dir": str(hotload_dir),
+                        "grok2api_auto_add_local": True,
+                        "grok2api_local_token_file": str(grok2api_file),
+                        "grok2api_pool_name": "ssoBasic",
+                        "grok2api_auto_add_remote": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            grok2api_file.write_text(
+                json.dumps(
+                    {
+                        "ssoBasic": [
+                            {
+                                "token": "old-sso",
+                                "tags": ["auto-register"],
+                                "note": "first@example.com",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            account = manager.store.upsert(
+                AccountDraft(email="first@example.com", password="password")
+            )
+            auth_file = root / "xai-first@example.com.json"
+            auth_file.write_text(
+                json.dumps(
+                    {
+                        "email": "first@example.com",
+                        "access_token": "fresh-access",
+                        "refresh_token": "fresh-refresh",
+                        "expired": "2099-01-01T00:00:00Z",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result_line = "GM_RESULT " + json.dumps(
+                {
+                    "id": account.id,
+                    "email": account.email,
+                    "ok": True,
+                    "path": str(auth_file),
+                    "sso_token": "fresh-sso",
+                }
+            )
+            observed = []
+
+            class ObservingOutput:
+                def __iter__(self):
+                    yield result_line
+                    hotloaded = hotload_dir / auth_file.name
+                    pool = json.loads(grok2api_file.read_text(encoding="utf-8"))[
+                        "ssoBasic"
+                    ]
+                    observed.append(
+                        (
+                            hotloaded.is_file(),
+                            [item.get("token") for item in pool],
+                        )
+                    )
+
+                def close(self):
+                    return None
+
+            class FakeProcess:
+                stdout = ObservingOutput()
+
+                @staticmethod
+                def wait():
+                    return 0
+
+            with patch(
+                "grok_manager.login.subprocess.Popen", return_value=FakeProcess()
+            ):
+                manager.batch_login([account.id])
+
+            self.assertEqual([(True, ["fresh-sso"])], observed)
+
     def test_login_updates_sso_and_cpa_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -134,6 +134,7 @@
     );
     byId("clear-selection").disabled = !hasSelection;
     byId("login-selected").disabled = !hasSelection;
+    byId("reset-password-selected").disabled = !hasSelection;
     byId("delete-selected").disabled = !hasSelection;
     byId("export-format").disabled = !hasSelection;
     byId("export-accounts").disabled = !hasSelection;
@@ -294,7 +295,7 @@
     const detail = byId("task-detail");
     const stateName = safeStatus(task.state);
     const percent = task.total > 0 ? Math.min(100, Math.round((task.current / task.total) * 100)) : (task.state === "succeeded" ? 100 : 0);
-    const canCancel = ["queued", "running"].includes(task.state) && ["register", "login", "inspect"].includes(task.kind) && !task.cancelRequested;
+    const canCancel = ["queued", "running"].includes(task.state) && ["register", "login", "reset-password", "inspect"].includes(task.kind) && !task.cancelRequested;
     const logs = (task.logs || []).map((line) => `
       <div class="task-log-row"><time>${escapeHtml(line.time)}</time><span>${escapeHtml(line.message)}</span></div>`).join("");
     detail.innerHTML = `
@@ -498,6 +499,16 @@
     await startTask("/api/login", { ids, candidates }, "批量登录已开始");
   }
 
+  async function resetPassword(ids) {
+    const confirmed = await confirmOperation(
+      "确认重置密码",
+      `将使用账号对应的临时邮箱接收验证码，生成新密码并自动重新登录 ${ids.length} 个账号。是否继续？`,
+      true,
+    );
+    if (!confirmed) return;
+    await startTask("/api/reset-password", { ids }, "密码重置任务已开始");
+  }
+
   async function deleteSelected() {
     const ids = selectedIds();
     if (!ids.length) return;
@@ -656,6 +667,11 @@
       const ids = selectedIds();
       if (!ids.length) toast("请先选择账号", true);
       else login(ids);
+    });
+    byId("reset-password-selected").addEventListener("click", () => {
+      const ids = selectedIds();
+      if (!ids.length) toast("请先选择账号", true);
+      else resetPassword(ids);
     });
     byId("login-candidates").addEventListener("click", () => login([], true));
     byId("delete-selected").addEventListener("click", deleteSelected);

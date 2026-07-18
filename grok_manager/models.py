@@ -123,3 +123,11 @@ class LoginResult:
     ok: bool
     detail: str
     auth_file: str = ""
+
+
+@dataclass(frozen=True)
+class PasswordResetResult:
+    account_id: int
+    email: str
+    ok: bool
+    detail: str

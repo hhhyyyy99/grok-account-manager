@@ -97,6 +97,7 @@
             <div class="bulk-actions">
               <button class="button" type="button" id="inspect-selected" disabled>巡检所选</button>
               <button class="button button-primary" type="button" id="login-selected" disabled>重新登录</button>
+              <button class="button button-warning" type="button" id="reset-password-selected" disabled>重置密码并登录</button>
               <div class="export-actions">
                 <select id="export-format" class="export-format-select" aria-label="导出格式" title="导出格式" disabled>
                   <option value="cpa">CPA ZIP</option>
@@ -398,7 +399,7 @@
           <form class="panel form-panel" id="grok2api-config-form" data-config-label="Grok2API 配置">
             <div class="panel-heading">
               <h2>Grok2API</h2>
-              <p>配置 SSO token 写入本地池或远端 Grok2API 服务的方式。</p>
+              <p>配置注册和重新登录产生的 SSO token 如何更新本地池或远端 Grok2API 服务。</p>
             </div>
             <section class="config-group" aria-labelledby="grok2api-pool-title">
               <h3 id="grok2api-pool-title">Token 池</h3>
@@ -407,7 +408,7 @@
                 <label class="field"><span>本地 Token 文件</span><input name="grok2api_local_token_file" type="text"></label>
               </div>
               <div class="check-row">
-                <label><input type="checkbox" name="grok2api_auto_add_local"> 注册后写入本地池</label>
+                <label><input type="checkbox" name="grok2api_auto_add_local"> 注册/重新登录后更新本地池</label>
               </div>
             </section>
             <section class="config-group" aria-labelledby="grok2api-remote-title">
@@ -417,7 +418,7 @@
                 <label class="field field-wide"><span>远端 App Key</span><input name="grok2api_remote_app_key" type="password" autocomplete="off"></label>
               </div>
               <div class="check-row">
-                <label><input type="checkbox" name="grok2api_auto_add_remote"> 注册后写入远端池</label>
+                <label><input type="checkbox" name="grok2api_auto_add_remote"> 注册/重新登录后更新远端池</label>
               </div>
             </section>
             <div class="form-actions"><button class="button button-primary" type="submit">保存 Grok2API 配置</button></div>
