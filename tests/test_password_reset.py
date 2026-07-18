@@ -1,4 +1,5 @@
 import json
+import base64
 import tempfile
 import unittest
 from pathlib import Path
@@ -256,6 +257,43 @@ class PasswordResetTests(unittest.TestCase):
 
         messages = [payload["message"] for prefix, payload in events if prefix == "GM_LOG "]
         self.assertIn("开始读取重置前邮件", messages[0])
+    def test_unauthorized_mail_snapshot_renews_jwt_via_address_id(self) -> None:
+        header = base64.urlsafe_b64encode(b"{}").decode().rstrip("=")
+        claims = base64.urlsafe_b64encode(
+            json.dumps(
+                {
+                    "address": "target@example.com",
+                    "address_id": 4640,
+                }
+            ).encode()
+        ).decode().rstrip("=")
+        expired = "%s.%s.sig" % (header, claims)
+        calls = []
+
+        def list_ids(credential, _email):
+            calls.append(credential)
+            if len(calls) == 1:
+                raise RuntimeError("HTTP Error 401:")
+            return {"new-message"}
+
+        logs = []
+        with patch.object(registration_app, "get_email_provider", return_value="cloudflare"):
+            with patch.object(registration_app, "list_oai_message_ids", side_effect=list_ids):
+                with patch.object(
+                    registration_app,
+                    "cloudflare_admin_get_jwt",
+                    return_value="fresh-jwt",
+                    create=True,
+                ) as get_jwt:
+                    ids, credential, use_admin = _load_mail_snapshot(
+                        "target@example.com", expired, logs.append
+                    )
+
+        self.assertEqual(({"new-message"}, "fresh-jwt", False), (ids, credential, use_admin))
+        self.assertEqual([expired, "fresh-jwt"], calls)
+        get_jwt.assert_called_once_with("4640")
+        self.assertTrue(any("JWT" in message and "续期" in message for message in logs))
+
     def test_unauthorized_mail_snapshot_uses_cloudflare_admin_fallback(self) -> None:
         logs = []
         with patch.object(registration_app, "get_email_provider", return_value="cloudflare"):
@@ -320,6 +358,32 @@ class PasswordResetTests(unittest.TestCase):
             get.call_args.kwargs["params"]["address"],
         )
 
+
+    def test_cloudflare_admin_get_jwt_reads_show_password_response(self) -> None:
+        class Response:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"jwt": "fresh-jwt"}
+
+        with patch.dict(
+            registration_app.config,
+            {
+                "cloudflare_api_base": "https://mail.test",
+                "cloudflare_auth_mode": "x-admin-auth",
+                "cloudflare_api_key": "secret",
+            },
+            clear=False,
+        ):
+            with patch.object(registration_app, "http_get", return_value=Response()) as get:
+                token = registration_app.cloudflare_admin_get_jwt("4640")
+
+        self.assertEqual("fresh-jwt", token)
+        self.assertTrue(get.call_args.args[0].endswith("/admin/show_password/4640"))
+        self.assertEqual("secret", get.call_args.kwargs["headers"]["x-admin-auth"])
 
     def test_generated_password_has_required_character_classes(self) -> None:
         password = generate_password()

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import secrets
 import string
 import time
@@ -147,6 +150,32 @@ def _is_unauthorized(exc: BaseException) -> bool:
     return code == 401 or status == 401 or "401" in str(exc)
 
 
+def _decode_jwt_claims(token: str) -> dict[str, Any]:
+    parts = str(token or "").split(".")
+    if len(parts) != 3 or not parts[1]:
+        return {}
+    try:
+        segment = parts[1]
+        padded = segment + "=" * ((4 - len(segment) % 4) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+    except (ValueError, TypeError, UnicodeError, json.JSONDecodeError, binascii.Error):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _mail_address_id(email: str, credential: str) -> str:
+    claims = _decode_jwt_claims(credential)
+    claim_address = str(claims.get("address") or claims.get("email") or "").strip()
+    if claim_address and claim_address.casefold() != str(email or "").strip().casefold():
+        return ""
+    raw_id = claims.get("address_id") or claims.get("addressId")
+    try:
+        numeric_id = int(str(raw_id or "").strip())
+    except (TypeError, ValueError):
+        return ""
+    return str(numeric_id) if numeric_id > 0 else ""
+
+
 def _load_mail_snapshot(
     email: str,
     credential: str,
@@ -159,6 +188,28 @@ def _load_mail_snapshot(
         provider = str(app.get_email_provider() or "").strip().lower()
         if provider != "cloudflare" or not _is_unauthorized(exc):
             raise PasswordResetError("无法读取重置前邮件列表: %s" % exc) from exc
+
+        address_id = _mail_address_id(email, credential)
+        if address_id:
+            log("邮箱访问 JWT 已过期，使用管理员接口续期原邮箱 JWT")
+            try:
+                renewed_credential = app.cloudflare_admin_get_jwt(address_id)
+                renewed_claims = _decode_jwt_claims(renewed_credential)
+                renewed_address = str(
+                    renewed_claims.get("address") or renewed_claims.get("email") or ""
+                ).strip()
+                if renewed_address and renewed_address.casefold() != email.casefold():
+                    raise PasswordResetError("管理员接口返回的 JWT 与原邮箱不匹配")
+                message_ids = app.list_oai_message_ids(renewed_credential, email)
+            except PasswordResetError:
+                raise
+            except Exception as renew_exc:
+                log("管理员 JWT 续期失败，改用管理员邮件接口读取原邮箱: %s" % renew_exc)
+            else:
+                message_ids = {str(value) for value in (message_ids or ())}
+                log("邮箱访问 JWT 续期成功，重置前邮件快照完成，共 %s 封" % len(message_ids))
+                return message_ids, renewed_credential, False
+
         log("邮箱访问 JWT 已过期，改用管理员邮件接口读取原邮箱")
         try:
             messages = app.cloudflare_admin_get_messages(email)

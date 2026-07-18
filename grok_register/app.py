@@ -409,6 +409,34 @@ def cloudflare_create_temp_address(api_base):
     return address, jwt
 
 
+def cloudflare_admin_get_jwt(address_id):
+    try:
+        numeric_id = int(str(address_id or "").strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError("无效邮箱记录 ID") from exc
+    if numeric_id <= 0:
+        raise ValueError("无效邮箱记录 ID")
+    api_base = get_cloudflare_api_base()
+    if not api_base:
+        raise Exception("Cloudflare API Base 未配置")
+    if not get_cloudflare_api_key():
+        raise Exception("Cloudflare 管理密钥未配置")
+    response = http_get(
+        f"{api_base}/admin/show_password/{numeric_id}",
+        headers=cloudflare_build_headers(content_type=False),
+        params=cloudflare_apply_auth_params(),
+    )
+    response.raise_for_status()
+    data = response.json()
+    if isinstance(data, dict):
+        jwt = data.get("jwt")
+        if not jwt and isinstance(data.get("data"), dict):
+            jwt = data["data"].get("jwt")
+        if jwt:
+            return str(jwt).strip()
+    raise Exception("Cloudflare 管理接口未返回 JWT")
+
+
 def cloudflare_admin_get_messages(address):
     target = str(address or "").strip().lower()
     if not target or "@" not in target:

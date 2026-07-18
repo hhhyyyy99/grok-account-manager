@@ -167,6 +167,7 @@ uv run --locked python -m unittest discover -v
 - CPA 在线巡检只把 access token 发往 CPA `base_url` 的 `/models`；若凭据文件指定了 `base_url`，优先使用该地址。
 - 批量登录会将密码写入权限收紧的临时 JSON，子进程退出后立即删除。
 - 密码重置会使用对应批次的 `mail_credentials.txt` 获取验证码，生成的新密码同步写入管理库和账号产物，然后自动重新登录；找不到邮箱访问凭据的账号会跳过。
+- Cloudflare 邮箱 JWT 过期时，会优先从旧 JWT 的 `address_id` 调用管理员 `show_password` 续期；续期失败才回退到管理员邮件列表接口。
 - Grok 密码重置路径为 `accounts.x.ai/sign-in` → “使用邮箱登录” → 邮箱“下一步” → 密码页“忘记密码？”；临时邮箱只用于接收验证码，不会重置邮箱密码。
 
 ## 当前机器首次运行提示
