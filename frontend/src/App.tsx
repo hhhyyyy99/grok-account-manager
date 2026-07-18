@@ -703,8 +703,20 @@ function TaskDrawer({ open, tasks, selectedTask, selectedTaskId, onClose, onSele
 }
 
 function TaskDetail({ task, onCancel }: { task?: Task; onCancel: (id: string) => void }) {
+  const logRef = useRef<HTMLDivElement>(null);
+  const followLogsRef = useRef(true);
+  const previousTaskIdRef = useRef<string>();
+  const logs: TaskLog[] = task?.logs ?? [];
+
+  useEffect(() => {
+    const taskChanged = previousTaskIdRef.current !== task?.id;
+    previousTaskIdRef.current = task?.id;
+    if (taskChanged) followLogsRef.current = true;
+    if (!followLogsRef.current || !logRef.current) return;
+    logRef.current.scrollTop = logRef.current.scrollHeight;
+  }, [task?.id, logs.length]);
+
   if (!task) return <section className="react-task-detail drawer-empty"><span aria-hidden="true">↗</span><strong>选择任务查看详情</strong></section>;
-  const logs: TaskLog[] = task.logs ?? [];
   return (
     <section className="react-task-detail">
       <div className="task-detail-top">
@@ -719,9 +731,30 @@ function TaskDetail({ task, onCancel }: { task?: Task; onCancel: (id: string) =>
         <span>结束时间<strong>{formatTime(task.finishedAt)}</strong></span>
       </div>
       {!TERMINAL_STATES.has(task.state) && <button className="button danger" type="button" onClick={() => onCancel(task.id)}>取消任务</button>}
-      <div className="task-log-title">执行日志 <span>{logs.length} 条</span></div>
-      <div className="task-log">
-        {logs.length ? logs.map((log) => <div key={log.seq}><time>{log.time}</time><span>{log.message}</span></div>) : <span className="log-empty">任务还没有产生日志</span>}
+      <div className="task-log-terminal">
+        <div className="task-log-title">
+          <span className="terminal-mark" aria-hidden="true">&gt;_</span>
+          <strong>执行日志</strong>
+          <span>{isRunning(task) ? "实时" : "已结束"} · {logs.length} 行</span>
+        </div>
+        <div
+          className="task-log"
+          ref={logRef}
+          role="log"
+          aria-label="任务执行日志"
+          onScroll={(event) => {
+            const target = event.currentTarget;
+            followLogsRef.current = target.scrollHeight - target.scrollTop - target.clientHeight < 32;
+          }}
+        >
+          {logs.length ? logs.map((log) => (
+            <div className="task-log-line" key={log.seq}>
+              <time>{log.time}</time>
+              <span className="log-prompt" aria-hidden="true">›</span>
+              <span>{log.message}</span>
+            </div>
+          )) : <div className="log-empty"><span aria-hidden="true">_</span><span>等待任务输出</span></div>}
+        </div>
       </div>
     </section>
   );
