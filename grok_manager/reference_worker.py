@@ -6,6 +6,7 @@ local management server can still start and report missing automation packages.
 
 from __future__ import annotations
 
+import sys
 import argparse
 import json
 import threading
@@ -133,6 +134,15 @@ def run_login_batch(
             pass
 
 
+def _read_input_document(input_path: str) -> Dict[str, Any]:
+    if str(input_path) == "-":
+        raw = sys.stdin.read()
+    else:
+        raw = Path(str(input_path)).read_text(encoding="utf-8")
+    document = json.loads(raw)
+    if not isinstance(document, dict):
+        raise ValueError("worker 输入必须是 JSON 对象")
+    return document
 def batch_login(args: argparse.Namespace) -> int:
     try:
         from grok_register.cpa_xai.mint import mint_and_export
@@ -141,8 +151,8 @@ def batch_login(args: argparse.Namespace) -> int:
         return 3
 
     try:
-        document = json.loads(Path(args.input).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        document = _read_input_document(args.input)
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
         emit("GM_FATAL ", {"error": "批量登录输入读取失败: %s" % exc})
         return 3
     accounts = document.get("accounts") or []
@@ -172,8 +182,8 @@ def batch_login(args: argparse.Namespace) -> int:
 
 def batch_password_reset(args: argparse.Namespace) -> int:
     try:
-        document = json.loads(Path(args.input).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        document = _read_input_document(args.input)
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
         emit("GM_FATAL ", {"error": "密码重置输入读取失败: %s" % exc})
         return 3
     accounts = document.get("accounts") or []

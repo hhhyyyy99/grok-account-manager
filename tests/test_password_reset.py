@@ -173,9 +173,9 @@ class PasswordResetTests(unittest.TestCase):
                 "target@example.com", "New-password-123!", str(source)
             )
 
-            self.assertEqual(source, path)
+            self.assertEqual(manager.vault.path, path)
             self.assertEqual(
-                "target@example.com----New-password-123!----old-sso\n",
+                "target@example.com----old-password----old-sso\n",
                 source.read_text(encoding="utf-8"),
             )
 
@@ -210,7 +210,7 @@ class PasswordResetTests(unittest.TestCase):
             )
             stored = manager.store.get(account.id)
 
-            self.assertEqual((True, "密码已重置，已写入 accounts.txt"), (result.ok, result.detail))
+            self.assertEqual((True, "密码已重置，已写入 credentials.vault.json"), (result.ok, result.detail))
             self.assertEqual(
                 ("New-password-123!", AccountStatus.NEEDS_LOGIN.value),
                 (stored.password if stored else "", stored.status if stored else ""),

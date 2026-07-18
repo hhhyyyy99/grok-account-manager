@@ -6,14 +6,12 @@ import signal
 import subprocess
 import threading
 import time
-import uuid
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from .models import Account, AccountStatus, PasswordResetResult
-from .paths import JOBS_DIR, ensure_data_dirs, write_private_text_atomic
+from .paths import JOBS_DIR, ensure_data_dirs
 from .reference import ReferenceProject
 from .store import AccountStore
 
@@ -108,13 +106,6 @@ class BatchPasswordResetService:
             return results
 
         self.project.validate()
-        ensure_data_dirs()
-        run_dir = JOBS_DIR / (
-            "password-reset-%s-%s"
-            % (datetime.now().strftime("%Y%m%d-%H%M%S"), uuid.uuid4().hex[:6])
-        )
-        run_dir.mkdir(parents=True, exist_ok=False)
-        input_file = run_dir / "input.json"
         document = {
             "settings": {
                 "workers": max(1, min(int(settings.workers), 10)),
@@ -131,7 +122,6 @@ class BatchPasswordResetService:
                 for account, credential in ready
             ],
         }
-        write_private_text_atomic(input_file, json.dumps(document, ensure_ascii=False))
         process: Optional[subprocess.Popen] = None
         worker_script = Path(__file__).with_name("reference_worker.py")
         command = [
@@ -139,7 +129,7 @@ class BatchPasswordResetService:
             str(worker_script),
             "reset-password",
             "--input",
-            str(input_file),
+            "-",
         ]
         env = self.project.environment()
         env["PYTHONUNBUFFERED"] = "1"
@@ -152,6 +142,7 @@ class BatchPasswordResetService:
                     command,
                     cwd=str(self.project.work_dir),
                     env=env,
+                    stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -159,6 +150,14 @@ class BatchPasswordResetService:
                     start_new_session=(os.name != "nt"),
                 )
                 process = self._process
+            if not hasattr(process, "stdin"):
+                pass
+            elif process.stdin is None:
+                raise OSError("密码重置 worker 未创建输入管道")
+            else:
+                process.stdin.write(json.dumps(document, ensure_ascii=False))
+                process.stdin.close()
+                process.stdin = None
             if process.stdout is not None:
                 for line in process.stdout:
                     text = line.rstrip("\r\n")
@@ -186,10 +185,6 @@ class BatchPasswordResetService:
             with self._lock:
                 if self._process is process:
                     self._process = None
-            try:
-                input_file.unlink()
-            except OSError:
-                pass
 
         for account, _credential in ready:
             if account.id in parsed_ids:

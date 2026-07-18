@@ -12,6 +12,7 @@ from grok_manager.reference import (
     RegistrationRequest,
     _is_supported_python,
 )
+from grok_manager.vault import CredentialVault, KdfParameters
 from grok_manager.service import GrokManager
 from grok_manager.store import AccountStore
 from tests.support import make_manager
@@ -29,17 +30,21 @@ class RegistrationImportTests(unittest.TestCase):
             config_store = ConfigStore(root / "manager-config.json")
             config_store.save(ManagerConfig(auto_import_on_start=False))
 
+            vault = CredentialVault(
+                root / "credentials.vault.json",
+                kdf_parameters=KdfParameters(memory_cost=8 * 1024, iterations=1, lanes=1),
+            )
+            vault.initialize("test vault password 123")
             manager = GrokManager(
                 config_store=config_store,
-                store=AccountStore(root / "accounts.sqlite3"),
+                store=AccountStore(root / "accounts.sqlite3", vault=vault),
             )
 
             self.assertEqual(
-                (PROJECT_ROOT, True, ""),
+                (PROJECT_ROOT, True),
                 (
                     manager.reference.root,
                     manager.reference.config_file.is_file(),
-                    manager.reference.load_registration_config().get("proxy"),
                 ),
             )
 
@@ -108,7 +113,12 @@ class RegistrationImportTests(unittest.TestCase):
                 legacy_manager_config_file=legacy_manager_config,
                 migration_file=migration_file,
             )
-            store = AccountStore(data_root / "accounts.sqlite3")
+            vault = CredentialVault(
+                data_root / "credentials.vault.json",
+                kdf_parameters=KdfParameters(memory_cost=8 * 1024, iterations=1, lanes=1),
+            )
+            vault.initialize("test vault password 123")
+            store = AccountStore(data_root / "accounts.sqlite3", vault=vault)
             stored_before_migration = store.upsert(
                 AccountDraft(
                     email="database@example.com",

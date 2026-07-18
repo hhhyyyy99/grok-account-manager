@@ -3,10 +3,14 @@ from __future__ import annotations
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from .models import Account, AccountDraft, AccountStatus, InspectionResult, utc_now_iso
-from .paths import DATABASE_FILE, ensure_data_dirs
+from .paths import DATABASE_FILE, ensure_data_dirs, write_private_text_atomic
+from .vault import CredentialVault, VaultLockedError
+
+
+SENSITIVE_ACCOUNT_FIELDS = ("password", "sso_token", "access_token", "refresh_token", "auth_file")
 
 
 SCHEMA = """
@@ -55,11 +59,21 @@ class AccountStore:
     independent and avoids sharing sqlite connection state across threads.
     """
 
-    def __init__(self, path: Path = DATABASE_FILE):
+    def __init__(
+        self,
+        path: Path = DATABASE_FILE,
+        vault: Optional[CredentialVault] = None,
+    ):
         ensure_data_dirs()
         self.path = Path(path)
+        self.vault = vault or CredentialVault(
+            self.path.with_name("credentials.vault.json")
+        )
+        if not self.vault.is_unlocked:
+            raise VaultLockedError("账号存储需要已解锁的凭据保险库")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
+            conn.execute("PRAGMA secure_delete = ON")
             conn.executescript(SCHEMA)
             conn.execute("BEGIN IMMEDIATE")
             existing = {
@@ -73,11 +87,89 @@ class AccountStore:
                 "UPDATE accounts SET status = 'unknown', status_detail = '' "
                 "WHERE status = 'logging_in'"
             )
-            conn.execute("PRAGMA user_version = 3")
+            conn.execute("PRAGMA user_version = 4")
+        if self._migrate_plaintext_credentials():
+            self._compact_after_migration()
         try:
             self.path.chmod(0o600)
         except OSError:
             pass
+
+    def _credential_context(self, email: str, field: str) -> str:
+        return "account:%s:%s" % (email.strip().lower(), field)
+
+    def _encrypt_credential(self, email: str, field: str, value: str) -> str:
+        normalized = str(value or "").strip()
+        return (
+            self.vault.encrypt_text(normalized, self._credential_context(email, field))
+            if normalized
+            else ""
+        )
+
+    def _decrypt_row(self, row: Mapping[str, Any]) -> Account:
+        values = dict(row)
+        email = str(values.get("email") or "").strip().lower()
+        for field in SENSITIVE_ACCOUNT_FIELDS:
+            raw = str(values.get(field) or "")
+            if raw and not self.vault.is_encrypted(raw):
+                raise VaultLockedError(
+                    "账号库仍包含未迁移的明文凭据，请使用带主密码的应用启动"
+                )
+            values[field] = (
+                self.vault.decrypt_text(raw, self._credential_context(email, field))
+                if raw
+                else ""
+            )
+        return Account.from_row(values)
+
+    def _migrate_plaintext_credentials(self) -> bool:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM accounts").fetchall()
+            plaintext_rows = [
+                row
+                for row in rows
+                if any(
+                    str(row[field] or "") and not self.vault.is_encrypted(str(row[field]))
+                    for field in SENSITIVE_ACCOUNT_FIELDS
+                )
+            ]
+            if not plaintext_rows:
+                return False
+            dump = "\n".join(conn.iterdump()) + "\n"
+            backup = self.path.with_name("accounts.sqlite3.pre-vault-v1.sql.gmvault")
+            if not backup.exists():
+                write_private_text_atomic(
+                    backup,
+                    self.vault.encrypt_text(dump, "account-store:pre-vault-v1-backup"),
+                )
+            for row in plaintext_rows:
+                email = str(row["email"]).strip().lower()
+                updates = {
+                    field: self._encrypt_credential(email, field, str(row[field] or ""))
+                    for field in SENSITIVE_ACCOUNT_FIELDS
+                }
+                conn.execute(
+                    "UPDATE accounts SET password = ?, sso_token = ?, "
+                    "access_token = ?, refresh_token = ?, auth_file = ? WHERE id = ?",
+                    (
+                        updates["password"],
+                        updates["sso_token"],
+                        updates["access_token"],
+                        updates["refresh_token"],
+                        updates["auth_file"],
+                        int(row["id"]),
+                    ),
+                )
+            return True
+
+    def _compact_after_migration(self) -> None:
+        connection = sqlite3.connect(str(self.path), timeout=30)
+        try:
+            connection.execute("PRAGMA secure_delete = ON")
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            connection.execute("VACUUM")
+        finally:
+            connection.close()
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -91,6 +183,7 @@ class AccountStore:
                 if "locked" not in str(exc).lower():
                     raise
             conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA secure_delete = ON")
             with conn:
                 yield conn
         finally:
@@ -101,14 +194,31 @@ class AccountStore:
         if not email or "@" not in email:
             raise ValueError("无效邮箱: %r" % draft.email)
         now = utc_now_iso()
+        existing = self.get_by_email(email)
+        password = draft.password.strip()
+        sso_token = draft.sso_token.strip()
+        access_token = draft.access_token.strip()
+        refresh_token = draft.refresh_token.strip()
+        auth_file = draft.auth_file.strip()
+        if existing is not None:
+            if password == existing.password:
+                password = ""
+            if sso_token == existing.sso_token:
+                sso_token = ""
+            if access_token == existing.access_token:
+                access_token = ""
+            if refresh_token == existing.refresh_token:
+                refresh_token = ""
+            if auth_file == existing.auth_file:
+                auth_file = ""
         values = (
             email,
-            draft.password.strip(),
-            draft.sso_token.strip(),
-            draft.access_token.strip(),
-            draft.refresh_token.strip(),
+            self._encrypt_credential(email, "password", password),
+            self._encrypt_credential(email, "sso_token", sso_token),
+            self._encrypt_credential(email, "access_token", access_token),
+            self._encrypt_credential(email, "refresh_token", refresh_token),
             draft.token_expires_at.strip(),
-            draft.auth_file.strip(),
+            self._encrypt_credential(email, "auth_file", auth_file),
             draft.source.strip(),
             draft.source_modified_at.strip(),
             now,
@@ -133,19 +243,19 @@ class AccountStore:
                     END,
                     access_token = CASE
                         WHEN excluded.access_token != '' AND (
-                            accounts.last_login_at = '' OR excluded.auth_file = accounts.auth_file
+                            accounts.last_login_at = '' OR excluded.source_modified_at >= accounts.last_login_at
                         ) THEN excluded.access_token ELSE accounts.access_token END,
                     refresh_token = CASE
                         WHEN excluded.refresh_token != '' AND (
-                            accounts.last_login_at = '' OR excluded.auth_file = accounts.auth_file
+                            accounts.last_login_at = '' OR excluded.source_modified_at >= accounts.last_login_at
                         ) THEN excluded.refresh_token ELSE accounts.refresh_token END,
                     token_expires_at = CASE
                         WHEN excluded.token_expires_at != '' AND (
-                            accounts.last_login_at = '' OR excluded.auth_file = accounts.auth_file
+                            accounts.last_login_at = '' OR excluded.source_modified_at >= accounts.last_login_at
                         ) THEN excluded.token_expires_at ELSE accounts.token_expires_at END,
                     auth_file = CASE
                         WHEN excluded.auth_file != '' AND (
-                            accounts.last_login_at = '' OR excluded.auth_file = accounts.auth_file
+                            accounts.last_login_at = '' OR excluded.source_modified_at >= accounts.last_login_at
                         ) THEN excluded.auth_file ELSE accounts.auth_file END,
                     source = CASE WHEN excluded.source != '' THEN excluded.source ELSE accounts.source END,
                     source_modified_at = CASE
@@ -159,7 +269,7 @@ class AccountStore:
                             excluded.source_modified_at >= accounts.last_login_at
                         ) THEN 'unknown'
                         WHEN excluded.access_token != '' AND excluded.access_token != accounts.access_token AND (
-                            accounts.last_login_at = '' OR excluded.auth_file = accounts.auth_file
+                            accounts.last_login_at = '' OR excluded.source_modified_at >= accounts.last_login_at
                         ) THEN 'unknown'
                         ELSE accounts.status
                     END,
@@ -169,7 +279,7 @@ class AccountStore:
                             excluded.source_modified_at >= accounts.last_login_at
                         ) THEN ''
                         WHEN excluded.access_token != '' AND excluded.access_token != accounts.access_token AND (
-                            accounts.last_login_at = '' OR excluded.auth_file = accounts.auth_file
+                            accounts.last_login_at = '' OR excluded.source_modified_at >= accounts.last_login_at
                         ) THEN ''
                         ELSE accounts.status_detail
                     END,
@@ -189,13 +299,13 @@ class AccountStore:
                     END,
                     cpa_status = CASE
                         WHEN excluded.access_token != '' AND excluded.access_token != accounts.access_token AND (
-                            accounts.last_login_at = '' OR excluded.auth_file = accounts.auth_file
+                            accounts.last_login_at = '' OR excluded.source_modified_at >= accounts.last_login_at
                         ) THEN 'unknown'
                         ELSE accounts.cpa_status
                     END,
                     cpa_detail = CASE
                         WHEN excluded.access_token != '' AND excluded.access_token != accounts.access_token AND (
-                            accounts.last_login_at = '' OR excluded.auth_file = accounts.auth_file
+                            accounts.last_login_at = '' OR excluded.source_modified_at >= accounts.last_login_at
                         ) THEN ''
                         ELSE accounts.cpa_detail
                     END,
@@ -218,14 +328,14 @@ class AccountStore:
     def get(self, account_id: int) -> Optional[Account]:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM accounts WHERE id = ?", (int(account_id),)).fetchone()
-        return Account.from_row(row) if row else None
+        return self._decrypt_row(row) if row else None
 
     def get_by_email(self, email: str) -> Optional[Account]:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM accounts WHERE email = ? COLLATE NOCASE", (email.strip(),)
             ).fetchone()
-        return Account.from_row(row) if row else None
+        return self._decrypt_row(row) if row else None
 
     def get_many(self, account_ids: Sequence[int]) -> List[Account]:
         ids = [int(value) for value in account_ids]
@@ -236,7 +346,7 @@ class AccountStore:
             rows = conn.execute(
                 "SELECT * FROM accounts WHERE id IN (%s) ORDER BY id" % placeholders, ids
             ).fetchall()
-        return [Account.from_row(row) for row in rows]
+        return [self._decrypt_row(row) for row in rows]
 
     def list_accounts(
         self,
@@ -257,7 +367,7 @@ class AccountStore:
             params.append(clean_offset)
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
-        return [Account.from_row(row) for row in rows]
+        return [self._decrypt_row(row) for row in rows]
 
     def count_accounts(self, search: str = "", status: str = "") -> int:
         where_sql, params = self._account_filter(search, status)
@@ -351,6 +461,9 @@ class AccountStore:
         sso_token: str = "",
     ) -> None:
         now = utc_now_iso()
+        account = self.get(account_id)
+        if account is None:
+            raise ValueError("登录凭据对应的账号不存在")
         with self._connect() as conn:
             conn.execute(
                 """
@@ -363,12 +476,12 @@ class AccountStore:
                 WHERE id = ?
                 """,
                 (
-                    access_token.strip(),
-                    refresh_token.strip(),
+                    self._encrypt_credential(account.email, "access_token", access_token),
+                    self._encrypt_credential(account.email, "refresh_token", refresh_token),
                     expires_at.strip(),
-                    sso_token.strip(),
-                    sso_token.strip(),
-                    auth_file.strip(),
+                    self._encrypt_credential(account.email, "sso_token", sso_token),
+                    self._encrypt_credential(account.email, "sso_token", sso_token),
+                    self._encrypt_credential(account.email, "auth_file", auth_file),
                     AccountStatus.UNKNOWN.value,
                     detail[:1000],
                     AccountStatus.UNKNOWN.value,
@@ -386,6 +499,9 @@ class AccountStore:
         if not normalized:
             raise ValueError("新密码不能为空")
         now = utc_now_iso()
+        account = self.get(account_id)
+        if account is None:
+            raise ValueError("密码重置对应的账号不存在")
         with self._connect() as conn:
             cursor = conn.execute(
                 """
@@ -394,7 +510,7 @@ class AccountStore:
                 WHERE id = ?
                 """,
                 (
-                    normalized,
+                    self._encrypt_credential(account.email, "password", normalized),
                     AccountStatus.NEEDS_LOGIN.value,
                     "密码已重置，等待重新登录",
                     now,

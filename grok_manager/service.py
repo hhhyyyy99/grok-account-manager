@@ -25,6 +25,7 @@ from .reference import (
 )
 from .store import AccountStore
 from .paths import migrate_legacy_install_data
+from .vault import CredentialVault, VaultLockedError
 
 
 class GrokManager:
@@ -36,14 +37,25 @@ class GrokManager:
         store: Optional[AccountStore] = None,
         reference: Optional[ReferenceProject] = None,
         python_executable: str = "",
+        vault: Optional[CredentialVault] = None,
     ):
         migrate_legacy_install_data()
         self.config_store = config_store or ConfigStore()
         self.config = self.config_store.load()
-        self.store = store or AccountStore()
         self.reference = reference or ReferenceProject()
-        self.python_executable = python_executable or sys.executable
+        migration_vault = store.vault if store is not None else vault
+        if migration_vault is not None:
+            self.reference.credential_vault = migration_vault
         self.reference.migrate_legacy_data()
+        if store is not None:
+            self.store = store
+            self.vault = store.vault
+        elif vault is not None:
+            self.vault = vault
+            self.store = AccountStore(vault=vault)
+        else:
+            raise VaultLockedError("启动管理端前必须先解锁凭据保险库")
+        self.python_executable = python_executable or sys.executable
         self.reference.ensure_registration_config()
         self._wire_adapters()
 
@@ -67,8 +79,30 @@ class GrokManager:
         account_files: Optional[Sequence[Path]] = None,
         extra_auth_dirs: Sequence[Path] = (),
     ) -> List[Account]:
-        drafts = self.reference.import_records(account_files, extra_auth_dirs)
-        return self.store.upsert_many(drafts)
+        files = (
+            [Path(path) for path in account_files]
+            if account_files is not None
+            else self.reference.discover_account_files()
+        )
+        auth_files = self.reference.discover_auth_files(extra_auth_dirs)
+        mail_files = self.reference.discover_mail_credential_files()
+        drafts = self.reference.import_records(files, extra_auth_dirs)
+        for draft in drafts:
+            self.reference.find_mail_credential(draft.email, draft.source)
+        accounts = self.store.upsert_many(
+            replace(draft, auth_file="") for draft in drafts
+        )
+        for artifact in [*files, *auth_files, *mail_files]:
+            path = Path(artifact)
+            try:
+                path.resolve().relative_to(self.reference.data_root.resolve())
+            except (OSError, ValueError):
+                continue
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return accounts
 
     def import_account_text(self, text: str, source: str = "manual-import") -> List[Account]:
         auth_index = self.reference.build_auth_index()

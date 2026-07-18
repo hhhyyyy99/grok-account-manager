@@ -594,7 +594,7 @@ class BatchLoginCredentialTests(unittest.TestCase):
                     "fresh-access",
                     "fresh-refresh",
                     True,
-                    MANAGED_AUTH_DIR.resolve(),
+                    Path(),
                 ),
                 (
                     result.ok,

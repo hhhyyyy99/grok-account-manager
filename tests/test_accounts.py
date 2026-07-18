@@ -5,6 +5,7 @@ from pathlib import Path
 
 from grok_manager.models import AccountDraft, AccountStatus, InspectionResult
 from grok_manager.store import AccountStore
+from grok_manager.vault import CredentialVault, KdfParameters
 from grok_manager.web import GrokWebApplication
 from tests.support import make_manager
 
@@ -163,7 +164,12 @@ class AccountImportQueryTests(unittest.TestCase):
     def test_store_removes_legacy_logging_in_status(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "accounts.sqlite3"
-            store = AccountStore(database)
+            vault = CredentialVault(
+                database.with_name("credentials.vault.json"),
+                kdf_parameters=KdfParameters(memory_cost=8 * 1024, iterations=1, lanes=1),
+            )
+            vault.initialize("test vault password 123")
+            store = AccountStore(database, vault=vault)
             account = store.upsert(
                 AccountDraft(email="legacy@example.com", password="password")
             )
@@ -177,7 +183,7 @@ class AccountImportQueryTests(unittest.TestCase):
             finally:
                 connection.close()
 
-            migrated = AccountStore(database).get(account.id)
+            migrated = AccountStore(database, vault=vault).get(account.id)
 
             self.assertIsNotNone(migrated)
             self.assertEqual(

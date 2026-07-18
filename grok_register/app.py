@@ -175,6 +175,7 @@ DEFAULT_CONFIG = {
 }
 
 config = DEFAULT_CONFIG.copy()
+_protected_config_values = {}
 _cf_domain_index = 0
 _yyds_runtime_blocked_domains = set()
 _output_file_lock = threading.Lock()
@@ -226,22 +227,49 @@ def get_code_poll_interval():
 
 
 def load_config():
-    global config
+    global config, _protected_config_values
+    _protected_config_values = {}
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
                 loaded = json.load(f)
+            if isinstance(loaded, dict):
+                _protected_config_values = {
+                    key: loaded.get(key)
+                    for key in (
+                        "duckmail_api_key",
+                        "cloudflare_api_key",
+                        "proxy",
+                        "yyds_api_key",
+                        "yyds_jwt",
+                        "grok2api_remote_app_key",
+                        "cpa_proxy",
+                        "cpa_cloud_management_key",
+                    )
+                    if loaded.get(key)
+                }
             config = {**DEFAULT_CONFIG, **loaded}
         except Exception as e:
             safe_print(f"[!] 读取配置失败，已回退默认配置: {e}")
             config = DEFAULT_CONFIG.copy()
+    runtime_raw = os.environ.get("GROK_REGISTER_CONFIG_SECRETS", "").strip()
+    if runtime_raw:
+        try:
+            runtime_secrets = json.loads(runtime_raw)
+            if isinstance(runtime_secrets, dict):
+                config.update(runtime_secrets)
+        except (TypeError, ValueError):
+            safe_print("[!] 受保护注册配置环境变量无效")
     return config
 
 
 def save_config():
     try:
+        document = dict(config)
+        if _protected_config_values:
+            document.update(_protected_config_values)
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=4, ensure_ascii=False)
+            json.dump(document, f, indent=4, ensure_ascii=False)
     except Exception as e:
         safe_print(f"保存配置失败: {e}")
 

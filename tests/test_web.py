@@ -174,5 +174,38 @@ process.stdout.write(JSON.stringify(orderAccountsById(accounts).map((item) => it
             request_type.assert_called_once_with(count=40, threads=3, mint_workers=2)
 
 
+    def test_registration_config_masks_secrets_and_merges_partial_updates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            manager.reference.save_registration_config(
+                {
+                    "proxy": "http://user:pass@example.test:8080",
+                    "cloudflare_api_key": "cloudflare-secret",
+                    "email_provider": "cloudflare",
+                    "cpa_base_url": "https://cpa.example.test/v1",
+                }
+            )
+            application = GrokWebApplication(manager)
+            response = application.config_json()
+            self.assertEqual("", response["registration"]["proxy"])
+            self.assertEqual("", response["registration"]["cloudflare_api_key"])
+            self.assertTrue(response["registrationSecrets"]["proxy"])
+            self.assertTrue(response["registrationSecrets"]["cloudflare_api_key"])
+
+            application.save_reference_config(
+                {
+                    "email_provider": "duckmail",
+                    "cpa_base_url": "https://cpa.example.test/v2",
+                }
+            )
+            loaded = manager.reference.load_registration_config()
+            self.assertEqual("http://user:pass@example.test:8080", loaded["proxy"])
+            self.assertEqual("cloudflare-secret", loaded["cloudflare_api_key"])
+            self.assertEqual("duckmail", loaded["email_provider"])
+            self.assertEqual("https://cpa.example.test/v2", loaded["cpa_base_url"])
+
+            application.save_reference_config({"proxy": None})
+            self.assertEqual("", manager.reference.load_registration_config()["proxy"])
+
 if __name__ == "__main__":
     unittest.main()

@@ -17,7 +17,7 @@ from urllib.parse import parse_qs, urlparse
 from .config import ManagerConfig
 from .exports import AccountExport, AccountExporter
 from .models import Account, AccountStatus, status_label
-from .reference import RegistrationRequest
+from .reference import RegistrationRequest, SENSITIVE_CONFIG_KEYS
 from .service import GrokManager
 
 
@@ -266,13 +266,19 @@ class GrokWebApplication:
     def config_json(self) -> Dict[str, Any]:
         reference_config: Dict[str, Any] = {}
         reference_error = ""
+        registration_secrets: Dict[str, bool] = {}
         try:
             reference_config = self.manager.reference.load_registration_config()
+            for key in SENSITIVE_CONFIG_KEYS:
+                registration_secrets[key] = bool(str(reference_config.get(key) or ""))
+                if registration_secrets[key]:
+                    reference_config[key] = ""
         except Exception as exc:
             reference_error = safe_visible(exc)
         return {
             "manager": asdict(self.manager.config),
             "registration": reference_config,
+            "registrationSecrets": registration_secrets,
             "registrationError": reference_error,
             "runtimePython": self.manager.python_executable,
             "runtimeRoot": str(self.manager.reference.root),
@@ -638,6 +644,9 @@ class GrokWebApplication:
                         return
                     if parsed.path == "/assets/app.js":
                         self._bytes((ASSET_DIR / "app.js").read_bytes(), "text/javascript; charset=utf-8")
+                        return
+                    if parsed.path == "/assets/app.bundle.js":
+                        self._bytes((ASSET_DIR / "app.bundle.js").read_bytes(), "text/javascript; charset=utf-8")
                         return
                     if parsed.path == "/api/health":
                         self._json({"ok": True})

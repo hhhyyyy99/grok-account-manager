@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import sys
 from dataclasses import asdict
@@ -8,9 +9,34 @@ from pathlib import Path
 from typing import Iterable, List, Optional
 
 from .models import Account, STATUS_LABELS
+from .paths import VAULT_FILE
 from .reference import RegistrationRequest
 from .service import GrokManager
+from .vault import CredentialVault, VaultError
 
+
+_CURRENT_VAULT: Optional[CredentialVault] = None
+
+
+def unlock_vault() -> CredentialVault:
+    vault = CredentialVault(VAULT_FILE)
+    if not vault.is_initialized:
+        print("首次启动需要创建凭据保险库主密码（至少 12 个字符）。", file=sys.stderr)
+        password = getpass.getpass("创建主密码: ")
+        confirmation = getpass.getpass("再次输入主密码: ")
+        if password != confirmation:
+            raise VaultError("两次输入的主密码不一致")
+        vault.initialize(password)
+        return vault
+    password = getpass.getpass("请输入凭据保险库主密码: ")
+    vault.unlock(password)
+    return vault
+
+
+def _manager() -> GrokManager:
+    if _CURRENT_VAULT is None:
+        raise VaultError("应用尚未解锁凭据保险库")
+    return GrokManager(vault=_CURRENT_VAULT)
 
 def _parse_ids(raw: str) -> List[int]:
     values = []
@@ -58,7 +84,7 @@ def _account_summary(account: Account) -> dict:
 
 
 def command_list(args: argparse.Namespace) -> int:
-    manager = GrokManager()
+    manager = _manager()
     accounts = manager.store.list_accounts(search=args.search, status=args.status, limit=args.limit)
     if args.json:
         print(json.dumps([_account_summary(account) for account in accounts], ensure_ascii=False, indent=2))
@@ -83,7 +109,7 @@ def command_list(args: argparse.Namespace) -> int:
 
 
 def command_import(args: argparse.Namespace) -> int:
-    manager = GrokManager()
+    manager = _manager()
     files = [Path(value).expanduser().resolve() for value in args.file] if args.file else None
     accounts = manager.import_reference_accounts(files)
     print("已导入/更新 %s 个账号" % len(accounts))
@@ -91,7 +117,7 @@ def command_import(args: argparse.Namespace) -> int:
 
 
 def command_inspect(args: argparse.Namespace) -> int:
-    manager = GrokManager()
+    manager = _manager()
     ids = _selected_ids(manager, args.ids, args.all)
     if not ids:
         print("没有待巡检账号，请指定 --ids 或 --all", file=sys.stderr)
@@ -107,7 +133,7 @@ def command_inspect(args: argparse.Namespace) -> int:
 
 
 def command_login(args: argparse.Namespace) -> int:
-    manager = GrokManager()
+    manager = _manager()
     if args.expired:
         ids = manager.relogin_candidate_ids()
     else:
@@ -127,7 +153,7 @@ def command_login(args: argparse.Namespace) -> int:
 
 
 def command_reset_password(args: argparse.Namespace) -> int:
-    manager = GrokManager()
+    manager = _manager()
     ids = _selected_ids(manager, args.ids, args.all)
     if not ids:
         print("没有待重置密码账号，请指定 --ids 或 --all", file=sys.stderr)
@@ -157,7 +183,7 @@ def command_reset_password(args: argparse.Namespace) -> int:
     return 0 if success == len(reset_ids) else 1
 
 def command_register(args: argparse.Namespace) -> int:
-    manager = GrokManager()
+    manager = _manager()
     request = RegistrationRequest(args.count, args.threads, args.mint_workers)
     result = manager.run_registration(request, log=lambda line: print(line, flush=True))
     print(
@@ -170,7 +196,7 @@ def command_register(args: argparse.Namespace) -> int:
 
 
 def command_config_check(args: argparse.Namespace) -> int:
-    manager = GrokManager()
+    manager = _manager()
     checks = manager.diagnostics()
     for ok, message in checks:
         print("%s %s" % ("✓" if ok else "✗", message))
@@ -178,13 +204,13 @@ def command_config_check(args: argparse.Namespace) -> int:
 
 
 def command_config_show(args: argparse.Namespace) -> int:
-    manager = GrokManager()
+    manager = _manager()
     print(json.dumps(asdict(manager.config), ensure_ascii=False, indent=2))
     return 0
 
 
 def command_delete(args: argparse.Namespace) -> int:
-    manager = GrokManager()
+    manager = _manager()
     ids = _parse_ids(args.ids)
     if not ids:
         print("请通过 --ids 指定账号", file=sys.stderr)
@@ -197,7 +223,7 @@ def command_delete(args: argparse.Namespace) -> int:
 def command_ui(args: argparse.Namespace) -> int:
     from .web import GrokWebApplication
 
-    application = GrokWebApplication()
+    application = GrokWebApplication(_manager())
     try:
         application.serve(
             host=getattr(args, "host", "127.0.0.1"),
@@ -268,8 +294,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
+    global _CURRENT_VAULT
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
-    if not args.command:
-        return command_ui(args)
-    return int(args.handler(args))
+    try:
+        _CURRENT_VAULT = unlock_vault()
+    except (VaultError, EOFError, KeyboardInterrupt) as exc:
+        print("凭据保险库解锁失败: %s" % exc, file=sys.stderr)
+        return 2
+    try:
+        if not args.command:
+            return command_ui(args)
+        return int(args.handler(args))
+    finally:
+        if _CURRENT_VAULT is not None:
+            _CURRENT_VAULT.lock()
+        _CURRENT_VAULT = None

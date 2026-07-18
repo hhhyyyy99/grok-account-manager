@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .models import AccountDraft
+from .vault import CredentialVault
 from .paths import (
     DATA_DIR,
     DEFAULT_LEGACY_REFERENCE_ROOT,
@@ -32,6 +33,20 @@ from .paths import (
 
 
 LogCallback = Callable[[str], None]
+
+
+SENSITIVE_CONFIG_KEYS = frozenset(
+    {
+        "duckmail_api_key",
+        "cloudflare_api_key",
+        "proxy",
+        "yyds_api_key",
+        "yyds_jwt",
+        "grok2api_remote_app_key",
+        "cpa_proxy",
+        "cpa_cloud_management_key",
+    }
+)
 
 
 def _is_supported_python(version_text: str) -> bool:
@@ -112,6 +127,7 @@ class ReferenceProject:
                 else self.data_root / ".legacy-registration-migration-v2.json"
             )
         )
+        self.credential_vault = None
 
     @property
     def entrypoint(self) -> Path:
@@ -140,6 +156,12 @@ class ReferenceProject:
 
     def environment(self, base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         env = dict(base or os.environ)
+        config = self.load_registration_config()
+        runtime_secrets = {
+            key: str(config.get(key) or "")
+            for key in SENSITIVE_CONFIG_KEYS
+            if str(config.get(key) or "")
+        }
         env.update(
             {
                 "GROK_REGISTER_PROJECT_ROOT": str(self.data_root),
@@ -149,6 +171,7 @@ class ReferenceProject:
                 "GROK_REGISTER_TURNSTILE_DIR": str(self.turnstile_dir),
                 "GROK_REGISTER_CRASH_LOG": str(self.data_root / "registration-crash.log"),
                 "GROK_REGISTER_TOKEN_FILE": str(self.data_root / "registration-token.json"),
+                "GROK_REGISTER_CONFIG_SECRETS": json.dumps(runtime_secrets, ensure_ascii=True),
             }
         )
         existing_path = env.get("PYTHONPATH", "").strip()
@@ -186,17 +209,57 @@ class ReferenceProject:
             if not isinstance(local, dict):
                 raise ReferenceProjectError("注册配置必须是 JSON 对象")
             base.update(local)
+        vault = self.credential_vault
+        for key in SENSITIVE_CONFIG_KEYS:
+            raw = str(base.get(key) or "")
+            if not raw:
+                continue
+            if not CredentialVault.is_encrypted(raw):
+                continue
+            if vault is None or not vault.is_unlocked:
+                raise ReferenceProjectError("读取受保护注册配置前必须解锁保险库")
+            try:
+                base[key] = vault.decrypt_text(raw, "registration-config:%s" % key)
+            except Exception as exc:
+                raise ReferenceProjectError("注册配置密文无法解密: %s" % key) from exc
         return base
 
     def save_registration_config(self, values: Dict[str, Any]) -> Path:
         if not isinstance(values, dict):
             raise ValueError("注册配置必须是 JSON 对象")
         self.validate()
+        existing: Dict[str, Any] = {}
+        if self.config_file.is_file():
+            try:
+                raw_existing = json.loads(self.config_file.read_text(encoding="utf-8-sig"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ReferenceProjectError("现有注册配置读取失败: %s" % exc) from exc
+            if not isinstance(raw_existing, dict):
+                raise ReferenceProjectError("现有注册配置必须是 JSON 对象")
+            existing = raw_existing
+        document = dict(existing)
+        document.update(values)
+        vault = self.credential_vault
+        for key in SENSITIVE_CONFIG_KEYS:
+            if key in values and values.get(key) is None:
+                document[key] = ""
+                continue
+            incoming = str(values.get(key) or "") if key in values else ""
+            existing_raw = str(existing.get(key) or "")
+            if key in values and not incoming and existing_raw:
+                document[key] = existing_raw
+                continue
+            raw = str(document.get(key) or "")
+            if not raw:
+                continue
+            if vault is None or not vault.is_unlocked:
+                raise ReferenceProjectError("保存受保护注册配置前必须解锁保险库")
+            if not vault.is_encrypted(raw):
+                document[key] = vault.encrypt_text(raw, "registration-config:%s" % key)
         return write_private_text_atomic(
             self.config_file,
-            json.dumps(values, ensure_ascii=False, indent=2) + "\n",
+            json.dumps(document, ensure_ascii=False, indent=2) + "\n",
         )
-
     def ensure_registration_config(self) -> Path:
         if self.config_file.is_file():
             return self.config_file
@@ -402,10 +465,17 @@ class ReferenceProject:
             if "id" not in columns or "auth_file" not in columns:
                 return 0
             updates = []
-            for account_id, raw in connection.execute(
-                "SELECT id, auth_file FROM accounts WHERE auth_file != ''"
+            for account_id, email, encoded_path in connection.execute(
+                "SELECT id, email, auth_file FROM accounts WHERE auth_file != ''"
             ):
-                path = Path(str(raw)).expanduser()
+                vault = getattr(self, "credential_vault", None)
+                if vault is not None and vault.is_encrypted(str(encoded_path)):
+                    path_text = vault.decrypt_text(
+                        str(encoded_path), "account:%s:auth_file" % str(email).strip().lower()
+                    )
+                else:
+                    path_text = str(encoded_path)
+                path = Path(path_text).expanduser()
                 if not path.is_absolute():
                     continue
                 try:
@@ -414,7 +484,7 @@ class ReferenceProject:
                     continue
                 updates.append(
                     (
-                        str((self.output_dir / "legacy-import" / relative).resolve()),
+                        vault.encrypt_text(str((self.output_dir / "legacy-import" / relative).resolve()), "account:%s:auth_file" % str(email).strip().lower()) if vault is not None and vault.is_unlocked else str((self.output_dir / "legacy-import" / relative).resolve()),
                         int(account_id),
                     )
                 )
@@ -464,6 +534,15 @@ class ReferenceProject:
         return ""
 
     def find_mail_credential(self, email: str, source: str = "") -> str:
+        vault = self.credential_vault
+        normalized_email = str(email or "").strip().lower()
+        if vault is not None and vault.is_unlocked:
+            try:
+                stored = vault.get_secret("mail-credential:%s" % normalized_email)
+            except Exception:
+                stored = ""
+            if stored:
+                return stored
         checked = set()
         source_path = Path(str(source or "")).expanduser()
         if source_path.is_file():
@@ -471,12 +550,16 @@ class ReferenceProject:
             checked.add(str(sibling))
             credential = self._mail_credential_from_file(sibling, email)
             if credential:
+                if vault is not None and vault.is_unlocked:
+                    vault.put_secret("mail-credential:%s" % normalized_email, credential)
                 return credential
         for path in self.discover_mail_credential_files():
             if str(path) in checked:
                 continue
             credential = self._mail_credential_from_file(path, email)
             if credential:
+                if vault is not None and vault.is_unlocked:
+                    vault.put_secret("mail-credential:%s" % normalized_email, credential)
                 return credential
         return ""
 
@@ -485,36 +568,11 @@ class ReferenceProject:
         normalized_password = str(password or "").strip()
         if not normalized_email or not normalized_password:
             raise ValueError("邮箱和新密码不能为空")
-
-        target = self.output_dir / "password-resets" / "accounts.txt"
-        source_path = Path(str(source or "")).expanduser()
-        if source_path.is_file():
-            try:
-                source_path.resolve().relative_to(self.output_dir.resolve())
-            except ValueError:
-                pass
-            else:
-                target = source_path.resolve()
-
-        lines: List[str] = []
-        if target.is_file():
-            lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
-        updated = False
-        output: List[str] = []
-        for line in lines:
-            parts = line.split("----", 2)
-            if len(parts) >= 2 and parts[0].strip().casefold() == normalized_email.casefold():
-                suffix = "----" + parts[2] if len(parts) > 2 else ""
-                output.append("%s----%s%s" % (normalized_email, normalized_password, suffix))
-                updated = True
-            else:
-                output.append(line)
-        if not updated:
-            output.append("%s----%s" % (normalized_email, normalized_password))
-        write_private_text_atomic(target, "\n".join(output) + "\n")
-        return target
-
-
+        vault = self.credential_vault
+        if vault is None or not vault.is_unlocked:
+            raise ReferenceProjectError("保存账号密码前必须解锁保险库")
+        vault.put_secret("account-password:%s" % normalized_email, normalized_password)
+        return vault.path
     def discover_auth_files(self, extra_dirs: Sequence[Path] = ()) -> List[Path]:
         candidates: Dict[str, Path] = {}
         for path in self.output_dir.glob("**/xai-*.json"):

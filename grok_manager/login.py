@@ -6,9 +6,7 @@ import signal
 import subprocess
 import threading
 import time
-import uuid
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
@@ -16,7 +14,6 @@ from .models import Account, AccountStatus, LoginResult
 from .paths import (
     JOBS_DIR,
     ensure_data_dirs,
-    write_private_text_atomic,
 )
 from .reference import ReferenceProject
 from .store import AccountStore
@@ -107,12 +104,6 @@ class BatchLoginService:
             return results
 
         self.project.validate()
-        ensure_data_dirs()
-        run_dir = JOBS_DIR / (
-            "login-%s-%s" % (datetime.now().strftime("%Y%m%d-%H%M%S"), uuid.uuid4().hex[:6])
-        )
-        run_dir.mkdir(parents=True, exist_ok=False)
-        input_file = run_dir / "input.json"
         document = {
             "settings": {
                 "workers": max(1, min(int(settings.workers), 10)),
@@ -127,7 +118,6 @@ class BatchLoginService:
             },
             "accounts": [self._worker_account(account) for account in ready],
         }
-        write_private_text_atomic(input_file, json.dumps(document, ensure_ascii=False))
         process: Optional[subprocess.Popen] = None
         worker_script = Path(__file__).with_name("reference_worker.py")
         command = [
@@ -135,7 +125,7 @@ class BatchLoginService:
             str(worker_script),
             "batch-login",
             "--input",
-            str(input_file),
+            "-",
         ]
         env = self.project.environment()
         env["PYTHONUNBUFFERED"] = "1"
@@ -148,6 +138,7 @@ class BatchLoginService:
                     command,
                     cwd=str(self.project.work_dir),
                     env=env,
+                    stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -155,6 +146,14 @@ class BatchLoginService:
                     start_new_session=(os.name != "nt"),
                 )
                 process = self._process
+            if not hasattr(process, "stdin"):
+                pass
+            elif process.stdin is None:
+                raise OSError("批量登录 worker 未创建输入管道")
+            else:
+                process.stdin.write(json.dumps(document, ensure_ascii=False))
+                process.stdin.close()
+                process.stdin = None
             if process.stdout is not None:
                 for line in process.stdout:
                     text = line.rstrip("\r\n")
@@ -169,6 +168,7 @@ class BatchLoginService:
                             progress(result, completed, total)
                     elif text.startswith("GM_FATAL "):
                         self._handle_log(text[9:], log)
+                        self._remove_transient_auth_file(result.auth_file)
                     elif text:
                         log(text)
             return_code = process.wait()
@@ -182,10 +182,6 @@ class BatchLoginService:
             with self._lock:
                 if self._process is process:
                     self._process = None
-            try:
-                input_file.unlink()
-            except OSError:
-                pass
 
         for account in ready:
             if account.id in parsed_ids:
@@ -206,6 +202,16 @@ class BatchLoginService:
             "password": account.password,
             "auth_dir": str(self.project.managed_auth_dir),
         }
+
+    def _remove_transient_auth_file(self, auth_file: str) -> None:
+        if not auth_file:
+            return
+        try:
+            target = Path(auth_file).expanduser().resolve()
+            target.relative_to(self.project.managed_auth_dir.resolve())
+            target.unlink(missing_ok=True)
+        except (OSError, ValueError):
+            pass
 
     @staticmethod
     def _handle_log(payload: str, log: LogCallback) -> None:
@@ -248,7 +254,7 @@ class BatchLoginService:
                     access_token,
                     refresh_token,
                     str(auth.get("expired") or ""),
-                    auth_file,
+                    "",
                     detail="SSO 与 CPA 凭据已刷新" if sso_token else "CPA 凭据已刷新",
                     sso_token=sso_token,
                 )
