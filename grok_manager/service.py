@@ -157,7 +157,110 @@ class GrokManager:
             if log:
                 log("[%s] Grok2API 更新失败: %s" % (result.email, exc))
 
-    def batch_login(self, account_ids: Iterable[int], log=None, progress=None) -> List[LoginResult]:
+    @staticmethod
+    def _is_wrong_password_login(result: LoginResult) -> bool:
+        if result.ok:
+            return False
+        detail = str(result.detail or "").casefold()
+        return any(
+            marker in detail
+            for marker in (
+                "邮箱或密码错误",
+                "wrong email address or password",
+                "incorrect email or password",
+                "invalid email or password",
+            )
+        )
+
+    def _auto_reset_login_failures(self, results: List[LoginResult], log=None, progress=None) -> List[LoginResult]:
+        candidates = [
+            result
+            for result in results
+            if result.account_id and self._is_wrong_password_login(result)
+        ]
+        if not candidates:
+            return results
+        log = log or (lambda _message: None)
+        candidate_ids = [result.account_id for result in candidates]
+        log("检测到 %s 个账号邮箱或密码错误，开始自动重置密码" % len(candidates))
+        for result in candidates:
+            log("[%s] 登录密码错误，开始自动重置密码" % result.email)
+        try:
+            reset_results = self.reset_passwords(candidate_ids, log=log)
+        except Exception as exc:
+            log("自动重置密码任务失败: %s" % exc)
+            return [
+                replace(
+                    result,
+                    detail="%s；自动重置密码任务失败：%s" % (result.detail, exc),
+                )
+                if result in candidates
+                else result
+                for result in results
+            ]
+        reset_by_id = {result.account_id: result for result in reset_results}
+        retry_ids = [
+            result.account_id
+            for result in candidates
+            if reset_by_id.get(result.account_id) and reset_by_id[result.account_id].ok
+        ]
+        retries: List[LoginResult] = []
+        if retry_ids:
+            log("自动重置密码完成 %s 个，开始使用新密码重新登录" % len(retry_ids))
+            retries = self.batch_login(
+                retry_ids,
+                log=log,
+                progress=None,
+                auto_reset_password=False,
+                _skip_review=True,
+            )
+        retry_by_id = {result.account_id: result for result in retries}
+        merged: List[LoginResult] = []
+        candidate_id_set = set(candidate_ids)
+        for result in results:
+            if result.account_id not in candidate_id_set:
+                merged.append(result)
+                continue
+            reset_result = reset_by_id.get(result.account_id)
+            if reset_result is None:
+                merged.append(
+                    replace(result, detail="%s；自动重置密码未返回结果" % result.detail)
+                )
+                continue
+            if not reset_result.ok:
+                merged.append(
+                    replace(
+                        result,
+                        detail="%s；自动重置密码失败：%s"
+                        % (result.detail, reset_result.detail),
+                    )
+                )
+                continue
+            retry = retry_by_id.get(result.account_id)
+            if retry is None:
+                merged.append(
+                    replace(result, detail="密码已重置，但重新登录未返回结果")
+                )
+                continue
+            merged.append(
+                replace(
+                    retry,
+                    detail="自动重置密码后：%s" % retry.detail,
+                )
+            )
+            if progress:
+                progress(retry, len(results), len(results))
+        return merged
+
+    def batch_login(
+        self,
+        account_ids: Iterable[int],
+        log=None,
+        progress=None,
+        auto_reset_password: bool = True,
+        _skip_review: bool = False,
+    ) -> List[LoginResult]:
+        log = log or (lambda _message: None)
         registration_config = self.reference.load_registration_config()
         settings = LoginSettings(
             workers=self.config.login_workers,
@@ -170,6 +273,7 @@ class GrokManager:
             ),
             probe_after_login=False,
         )
+
         def handle_result(result: LoginResult, completed: int, total: int) -> None:
             if result.ok and result.account_id:
                 self._sync_relogin_credentials(result, log=log)
@@ -182,11 +286,14 @@ class GrokManager:
             log=log,
             progress=handle_result,
         )
+        if auto_reset_password:
+            results = self._auto_reset_login_failures(results, log=log, progress=progress)
+        if _skip_review:
+            return results
         refreshed = [result for result in results if result.ok and result.account_id]
         refreshed_ids = [result.account_id for result in refreshed]
         if refreshed_ids:
-            if log:
-                log("登录完成，开始复核新的 SSO 与 CPA token")
+            log("登录完成，开始复核新的 SSO 与 CPA token")
             reviews = self.inspect_accounts(
                 refreshed_ids,
                 live=self.config.live_probe,
@@ -202,16 +309,15 @@ class GrokManager:
                     status_label(review.sso_status),
                     status_label(review.cpa_status),
                 )
-                if log:
-                    log(
-                        "[%s] 复核完成: SSO=%s，CPA=%s"
-                        % (
-                            result.email,
-                            status_label(review.sso_status),
-                            status_label(review.cpa_status),
-                        )
+                log(
+                    "[%s] 复核完成: SSO=%s，CPA=%s"
+                    % (
+                        result.email,
+                        status_label(review.sso_status),
+                        status_label(review.cpa_status),
                     )
-                    log("[%s] 复核详情: %s" % (result.email, review.detail))
+                )
+                log("[%s] 复核详情: %s" % (result.email, review.detail))
                 reviewed_results.append(
                     replace(result, detail="%s；%s" % (result.detail, summary))
                 )

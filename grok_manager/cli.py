@@ -150,6 +150,7 @@ def command_reset_password(args: argparse.Namespace) -> int:
         reset_ids,
         log=lambda line: print("[login] %s" % line),
         progress=progress,
+        auto_reset_password=False,
     )
     success = sum(1 for result in login_results if result.ok)
     print("密码重置并登录完成: 重置 %s 个，登录成功 %s 个" % (len(reset_ids), success))

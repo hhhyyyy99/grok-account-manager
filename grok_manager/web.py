@@ -436,6 +436,7 @@ class GrokWebApplication:
                     reset_ids,
                     log=task.log,
                     progress=login_progress,
+                    auto_reset_password=False,
                 )
             reset_succeeded = sum(1 for result in reset_results if result.ok)
             login_succeeded = sum(1 for result in login_results if result.ok)
@@ -502,6 +503,7 @@ class GrokWebApplication:
         if task.kind == "register":
             self.manager.registration.cancel()
         elif task.kind == "login":
+            self.manager.password_reset.cancel()
             self.manager.login.cancel()
         elif task.kind == "reset-password":
             self.manager.password_reset.cancel()

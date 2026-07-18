@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import DrissionPage
 from grok_manager.login import LoginSettings
-from grok_manager.models import AccountDraft, AccountStatus
+from grok_manager.models import AccountDraft, AccountStatus, LoginResult, PasswordResetResult
 from grok_manager.paths import MANAGED_AUTH_DIR
 from grok_register.cpa_xai import browser_confirm, oauth_device
 from grok_register.paths import TURNSTILE_DIR
@@ -606,6 +606,49 @@ class BatchLoginCredentialTests(unittest.TestCase):
                 ),
             )
 
+
+    def test_batch_login_does_not_reset_non_password_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            account = manager.store.upsert(
+                AccountDraft(email="turnstile@example.com", password="password")
+            )
+            failure = LoginResult(account.id, account.email, False, "安全验证未完成")
+            with patch.object(manager.login, "login_accounts", return_value=[failure]):
+                with patch.object(manager, "reset_passwords") as reset_passwords:
+                    result = manager.batch_login([account.id])[0]
+
+            reset_passwords.assert_not_called()
+            self.assertEqual((False, "安全验证未完成"), (result.ok, result.detail))
+
+    def test_batch_login_auto_resets_wrong_password_and_retries_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            account = manager.store.upsert(
+                AccountDraft(email="wrong-password@example.com", password="old-password")
+            )
+            first = LoginResult(account.id, account.email, False, "邮箱或密码错误")
+            retried = LoginResult(account.id, account.email, True, "批量登录成功")
+            reset = PasswordResetResult(account.id, account.email, True, "密码已重置")
+            calls = []
+
+            def fake_login(_ids, _settings, log=None, progress=None):
+                calls.append(list(_ids))
+                return [first] if len(calls) == 1 else [retried]
+
+            logs = []
+            with patch.object(manager.login, "login_accounts", side_effect=fake_login):
+                with patch.object(manager, "reset_passwords", return_value=[reset]) as reset_passwords:
+                    with patch.object(manager, "_sync_relogin_credentials"):
+                        with patch.object(manager, "inspect_accounts", return_value=[]):
+                            results = manager.batch_login([account.id], log=logs.append)
+
+            self.assertEqual(2, len(calls))
+            self.assertEqual([[account.id], [account.id]], calls)
+            reset_passwords.assert_called_once_with([account.id], log=logs.append)
+            self.assertEqual(True, results[0].ok)
+            self.assertIn("自动重置密码后", results[0].detail)
+            self.assertTrue(any("邮箱或密码错误" in line for line in logs))
 
 if __name__ == "__main__":
     unittest.main()
