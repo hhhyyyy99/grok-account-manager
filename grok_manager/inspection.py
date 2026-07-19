@@ -102,6 +102,7 @@ class TokenInspector:
         expiry_skew_seconds: int = 30,
         proxy: str = "",
         cpa_hotload_dir: str = "",
+        cpa_base_url: str = "",
     ):
         self.timeout_seconds = max(3, int(timeout_seconds))
         self.expiry_skew = timedelta(seconds=max(0, int(expiry_skew_seconds)))
@@ -112,6 +113,7 @@ class TokenInspector:
             if configured_hotload
             else None
         )
+        self.cpa_base_url = str(cpa_base_url or "").strip().rstrip("/")
 
     def _opener(self) -> urllib.request.OpenerDirector:
         if self.proxy:
@@ -264,7 +266,7 @@ class TokenInspector:
         return self._probe_cpa(account, expires_at)
 
     def _probe_cpa(self, account: Account, expires_at: str) -> CredentialCheck:
-        base_url = DEFAULT_BASE_URL
+        base_url = self.cpa_base_url or DEFAULT_BASE_URL
         auth_payload = self._load_account_auth_payload(account)
         if auth_payload is not None:
             configured = str(auth_payload.get("base_url") or "").strip()

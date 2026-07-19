@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import sys
+import threading
 from dataclasses import replace
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -61,7 +62,35 @@ class GrokManager:
             raise VaultLockedError("启动管理端前必须先解锁凭据保险库")
         self.python_executable = python_executable or sys.executable
         self.reference.ensure_registration_config()
+        self._cpa_account_locks: Dict[int, threading.Lock] = {}
+        self._cpa_account_locks_guard = threading.Lock()
         self._wire_adapters()
+
+    def _cpa_lock_for(self, account_id: int) -> threading.Lock:
+        key = int(account_id)
+        with self._cpa_account_locks_guard:
+            lock = self._cpa_account_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._cpa_account_locks[key] = lock
+            return lock
+
+    def _mark_cpa_expired_if_refresh_unchanged(
+        self,
+        account_id: int,
+        expected_refresh: str,
+        detail: str,
+    ) -> bool:
+        """Mark expired only if another concurrent refresh has not already rotated tokens."""
+        fresh = self.store.get(account_id)
+        if fresh is None:
+            return False
+        current = str(fresh.refresh_token or "").strip()
+        expected = str(expected_refresh or "").strip()
+        if expected and current and current != expected:
+            return False
+        self.store.mark_cpa_expired(account_id, detail)
+        return True
 
     def _wire_adapters(self) -> None:
         self.registration = RegistrationRunner(self.reference, self.python_executable)
@@ -247,6 +276,9 @@ class GrokManager:
                 or registration_config.get("proxy")
                 or ""
             ).strip()
+            self.inspection.inspector.cpa_base_url = str(
+                registration_config.get("cpa_base_url") or ""
+            ).strip().rstrip("/")
             configured_hotload = str(
                 registration_config.get("cpa_hotload_dir") or ""
             ).strip()
@@ -259,6 +291,7 @@ class GrokManager:
                 self.inspection.inspector.cpa_hotload_dir = None
         except Exception:
             self.inspection.inspector.proxy = ""
+            self.inspection.inspector.cpa_base_url = ""
             self.inspection.inspector.cpa_hotload_dir = None
         return self.inspection.inspect_accounts(
             account_ids,
@@ -737,80 +770,86 @@ class GrokManager:
         from grok_register.cpa_xai.schema import build_cpa_xai_auth
         from grok_register.cpa_xai.writer import write_cpa_xai_auth
 
-        refresh_token = str(account.refresh_token or "").strip()
-        if not refresh_token:
-            return CpaRefreshResult(
-                account.id,
-                account.email,
-                False,
-                "缺少 refresh_token",
-            )
-        auth_path: Path | None = None
-        try:
-            token = refresh_access_token(
-                refresh_token,
-                timeout=timeout,
-                proxy=proxy or None,
-            )
-            payload = build_cpa_xai_auth(
-                email=account.email,
-                access_token=token.access_token,
-                refresh_token=token.refresh_token,
-                id_token=token.id_token,
-                expires_in=token.expires_in,
-                base_url=base_url,
-            )
-            auth_path = write_cpa_xai_auth(
-                self.reference.managed_auth_dir,
-                payload,
-            )
-            detail = "CPA 凭据已续期"
-            auth_meta = ""
+        with self._cpa_lock_for(account.id):
+            # Re-read under the account lock so concurrent guardian/manual refresh
+            # always operates on the latest rotating refresh token.
+            fresh = self.store.get(account.id) or account
+            refresh_token = str(fresh.refresh_token or "").strip()
+            if not refresh_token:
+                return CpaRefreshResult(
+                    fresh.id,
+                    fresh.email,
+                    False,
+                    "缺少 refresh_token",
+                )
+            auth_path: Path | None = None
             try:
-                hotload_path = self.reference.sync_cpa_hotload(auth_path)
+                token = refresh_access_token(
+                    refresh_token,
+                    timeout=timeout,
+                    proxy=proxy or None,
+                )
+                payload = build_cpa_xai_auth(
+                    email=fresh.email,
+                    access_token=token.access_token,
+                    refresh_token=token.refresh_token,
+                    id_token=token.id_token,
+                    expires_in=token.expires_in,
+                    base_url=base_url,
+                )
+                auth_path = write_cpa_xai_auth(
+                    self.reference.managed_auth_dir,
+                    payload,
+                )
+                detail = "CPA 凭据已续期"
+                auth_meta = ""
+                try:
+                    hotload_path = self.reference.sync_cpa_hotload(auth_path)
+                except Exception as exc:
+                    note = "CPA hotload 未同步: %s" % exc
+                    detail = "%s；%s" % (detail, note)
+                    log("[%s] %s" % (fresh.email, note))
+                    hotload_path = None
+                else:
+                    if hotload_path is not None:
+                        auth_meta = str(hotload_path)
+                        log("[%s] CPA hotload 已更新: %s" % (fresh.email, hotload_path))
+                # When hotload is disabled, keep any existing auth_file pointer (empty
+                # input preserves it). Inspection falls back to registration cpa_base_url.
+                self.store.apply_cpa_credentials(
+                    fresh.id,
+                    token.access_token,
+                    token.refresh_token,
+                    str(payload.get("expired") or ""),
+                    auth_meta,
+                    detail="CPA 凭据已续期",
+                )
+                log("[%s] CPA silent refresh 成功" % fresh.email)
+                return CpaRefreshResult(
+                    fresh.id,
+                    fresh.email,
+                    True,
+                    detail,
+                )
+            except OAuthDeviceError as exc:
+                return CpaRefreshResult(
+                    fresh.id,
+                    fresh.email,
+                    False,
+                    "CPA 续期失败: %s" % exc,
+                    retryable=bool(getattr(exc, "retryable", False)),
+                )
             except Exception as exc:
-                note = "CPA hotload 未同步: %s" % exc
-                detail = "%s；%s" % (detail, note)
-                log("[%s] %s" % (account.email, note))
-                hotload_path = None
-            else:
-                if hotload_path is not None:
-                    auth_meta = str(hotload_path)
-                    log("[%s] CPA hotload 已更新: %s" % (account.email, hotload_path))
-            self.store.apply_cpa_credentials(
-                account.id,
-                token.access_token,
-                token.refresh_token,
-                str(payload.get("expired") or ""),
-                auth_meta,
-                detail="CPA 凭据已续期",
-            )
-            log("[%s] CPA silent refresh 成功" % account.email)
-            return CpaRefreshResult(
-                account.id,
-                account.email,
-                True,
-                detail,
-            )
-        except OAuthDeviceError as exc:
-            return CpaRefreshResult(
-                account.id,
-                account.email,
-                False,
-                "CPA 续期失败: %s" % exc,
-                retryable=bool(getattr(exc, "retryable", False)),
-            )
-        except Exception as exc:
-            return CpaRefreshResult(
-                account.id,
-                account.email,
-                False,
-                "CPA 续期异常: %s" % exc,
-                retryable=True,
-            )
-        finally:
-            if auth_path is not None:
-                self._remove_managed_auth_file(auth_path)
+                return CpaRefreshResult(
+                    fresh.id,
+                    fresh.email,
+                    False,
+                    "CPA 续期异常: %s" % exc,
+                    retryable=True,
+                )
+            finally:
+                if auth_path is not None:
+                    self._remove_managed_auth_file(auth_path)
 
     def _sync_cpa_hotload_for_result(
         self,
@@ -915,13 +954,23 @@ class GrokManager:
             else:
                 detail = "%s；请改用批量登录" % silent.detail
             result = CpaRefreshResult(account.id, account.email, False, detail)
-            self.store.set_status(
-                [account.id],
-                AccountStatus.NEEDS_LOGIN.value
-                if account.has_login_credentials
-                else AccountStatus.EXPIRED.value,
-                detail,
-            )
+            # Keep cpa_status in sync so guardian stops retrying permanent grant failures.
+            if self._refresh_failure_is_permanent(
+                silent.detail, retryable=bool(getattr(silent, "retryable", False))
+            ):
+                self._mark_cpa_expired_if_refresh_unchanged(
+                    account.id,
+                    str(account.refresh_token or ""),
+                    detail,
+                )
+            else:
+                self.store.set_status(
+                    [account.id],
+                    AccountStatus.NEEDS_LOGIN.value
+                    if account.has_login_credentials
+                    else AccountStatus.EXPIRED.value,
+                    detail,
+                )
             results_by_id[account.id] = result
             completed += 1
             log("[%s] %s" % (account.email, detail))
@@ -1555,7 +1604,20 @@ class GrokManager:
                 silent.detail, retryable=bool(getattr(silent, "retryable", False))
             ):
                 detail = "CPA 凭据已过期: %s" % silent.detail
-                self.store.mark_cpa_expired(fresh.id, detail)
+                # Avoid clobbering a concurrent successful rotation of this account.
+                marked = self._mark_cpa_expired_if_refresh_unchanged(
+                    fresh.id,
+                    str(fresh.refresh_token or ""),
+                    detail,
+                )
+                if not marked:
+                    detail = "CPA 续期失败，但凭据已由并发任务更新，跳过过期标记"
+                    result = CpaRefreshResult(fresh.id, fresh.email, True, detail)
+                    results.append(result)
+                    log("[%s] %s" % (fresh.email, detail))
+                    if progress:
+                        progress(result, index, total)
+                    continue
             else:
                 detail = "CPA 续期暂时失败，将在下一轮重试: %s" % silent.detail
             result = CpaRefreshResult(fresh.id, fresh.email, False, detail)

@@ -341,6 +341,68 @@ class CpaGuardTests(unittest.TestCase):
         self.assertNotIn("eyJhbGciOiJIUzI1NiJ9", poll_message)
         self.assertIn("access_denied", poll_message)
 
+    def test_oauth_error_field_is_redacted_when_it_embeds_token(self) -> None:
+        def fake_post(_url, _form, timeout=30.0, *, proxy=None):
+            return 400, {
+                "error": "refresh_token=LEAKME-SECRET",
+                "error_description": "access_token=OTHER-SECRET",
+            }
+
+        with patch.object(oauth_device, "_post_form", side_effect=fake_post):
+            with self.assertRaises(oauth_device.OAuthDeviceError) as raised:
+                oauth_device.refresh_access_token("any-refresh")
+        message = str(raised.exception)
+        self.assertNotIn("LEAKME-SECRET", message)
+        self.assertNotIn("OTHER-SECRET", message)
+        self.assertIn("***", message)
+
+    def test_guard_does_not_expire_when_refresh_already_rotated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            account = manager.store.upsert(
+                AccountDraft(
+                    email="race@example.com",
+                    access_token="old-access",
+                    refresh_token="old-refresh",
+                    token_expires_at=_future_iso(300),
+                )
+            )
+            _mark_cpa(
+                manager,
+                account.id,
+                cpa_status=AccountStatus.ACTIVE.value,
+                expires_at=_future_iso(300),
+            )
+
+            def fake_refresh(refresh_token, **_kwargs):
+                # Simulate another worker rotating the token first.
+                manager.store.apply_cpa_credentials(
+                    account.id,
+                    "winner-access",
+                    "winner-refresh",
+                    _future_iso(9000),
+                    "",
+                    detail="concurrent refresh won",
+                )
+                raise oauth_device.OAuthDeviceError(
+                    "refresh token failed HTTP 400: invalid_grant",
+                    retryable=False,
+                )
+
+            with patch.object(
+                oauth_device, "refresh_access_token", side_effect=fake_refresh
+            ), patch.object(manager, "inspect_accounts", return_value=[]):
+                results = manager.guard_cpa_tokens(lead_seconds=1800)
+
+            stored = manager.store.get(account.id)
+            self.assertEqual("winner-access", stored.access_token if stored else "")
+            self.assertEqual("winner-refresh", stored.refresh_token if stored else "")
+            self.assertNotEqual(
+                AccountStatus.EXPIRED.value,
+                stored.cpa_status if stored else "",
+            )
+            self.assertTrue(any(item.ok for item in results if item.account_id == account.id))
+
 
 if __name__ == "__main__":
     unittest.main()

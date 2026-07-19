@@ -213,6 +213,7 @@ class AccountStore:
                 refresh_token = ""
             if auth_file == existing.auth_file:
                 auth_file = ""
+        cpa_material = bool(access_token or refresh_token or auth_file or draft.token_expires_at.strip())
         values = (
             email,
             self._encrypt_credential(email, "password", password),
@@ -223,6 +224,7 @@ class AccountStore:
             self._encrypt_credential(email, "auth_file", auth_file),
             draft.source.strip(),
             draft.source_modified_at.strip(),
+            now if cpa_material else "",
             now,
             now,
         )
@@ -232,8 +234,8 @@ class AccountStore:
                 INSERT INTO accounts (
                     email, password, sso_token, access_token, refresh_token,
                     token_expires_at, auth_file, source, source_modified_at,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    cpa_updated_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(email) DO UPDATE SET
                     password = CASE WHEN excluded.password != '' THEN excluded.password ELSE accounts.password END,
                     sso_token = CASE
@@ -310,6 +312,17 @@ class AccountStore:
                             accounts.last_login_at = '' OR excluded.source_modified_at >= accounts.last_login_at
                         ) THEN ''
                         ELSE accounts.cpa_detail
+                    END,
+                    cpa_updated_at = CASE
+                        WHEN (
+                            (excluded.access_token != '' AND excluded.access_token != accounts.access_token)
+                            OR (excluded.refresh_token != '' AND excluded.refresh_token != accounts.refresh_token)
+                            OR (excluded.token_expires_at != '' AND excluded.token_expires_at != accounts.token_expires_at)
+                            OR (excluded.auth_file != '' AND excluded.auth_file != accounts.auth_file)
+                        ) AND (
+                            accounts.last_login_at = '' OR excluded.source_modified_at >= accounts.last_login_at
+                        ) THEN excluded.cpa_updated_at
+                        ELSE accounts.cpa_updated_at
                     END,
                     updated_at = excluded.updated_at
                 """,

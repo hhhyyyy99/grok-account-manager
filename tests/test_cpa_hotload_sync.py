@@ -473,6 +473,50 @@ class CpaHotloadSyncTests(unittest.TestCase):
             self.assertEqual("a2", after.access_token if after else "")
             self.assertTrue(str(after.cpa_updated_at if after else ""))
 
+    def test_import_sets_cpa_updated_at_and_beats_stale_hotload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = make_manager(root)
+            hotload_dir = root / "hotload"
+            self._enable_hotload(manager, hotload_dir)
+            expires = _future_iso(6000)
+            # Stale hotload file with an older last_refresh.
+            older = (
+                datetime.now(timezone.utc) - timedelta(days=3)
+            ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            path = hotload_dir / "xai-import@example.com.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "email": "import@example.com",
+                        "access_token": "stale-hot-access",
+                        "refresh_token": "stale-hot-refresh",
+                        "expired": expires,
+                        "last_refresh": older,
+                        "base_url": "http://127.0.0.1:8317/v1",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            imported = manager.store.upsert(
+                AccountDraft(
+                    email="import@example.com",
+                    access_token="new-import-access",
+                    refresh_token="new-import-refresh",
+                    token_expires_at=expires,
+                    source="import",
+                    source_modified_at=_future_iso(0),
+                )
+            )
+            stored = manager.store.get(imported.id)
+            self.assertTrue(str(stored.cpa_updated_at if stored else ""))
+            result = manager.sync_account_cpa_with_hotload(stored)
+            after = manager.store.get(imported.id)
+            hot = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual("push", result.action)
+            self.assertEqual("new-import-access", after.access_token if after else "")
+            self.assertEqual("new-import-access", hot["access_token"])
+
 
 if __name__ == "__main__":
     unittest.main()
