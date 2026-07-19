@@ -62,18 +62,10 @@ class GrokManager:
             raise VaultLockedError("启动管理端前必须先解锁凭据保险库")
         self.python_executable = python_executable or sys.executable
         self.reference.ensure_registration_config()
-        self._cpa_account_locks: Dict[int, threading.Lock] = {}
-        self._cpa_account_locks_guard = threading.Lock()
         self._wire_adapters()
 
-    def _cpa_lock_for(self, account_id: int) -> threading.Lock:
-        key = int(account_id)
-        with self._cpa_account_locks_guard:
-            lock = self._cpa_account_locks.get(key)
-            if lock is None:
-                lock = threading.Lock()
-                self._cpa_account_locks[key] = lock
-            return lock
+    def _cpa_lock_for(self, account_id: int) -> threading.RLock:
+        return self.store.account_lock(account_id)
 
     def _mark_cpa_expired_if_refresh_unchanged(
         self,
@@ -82,15 +74,11 @@ class GrokManager:
         detail: str,
     ) -> bool:
         """Mark expired only if another concurrent refresh has not already rotated tokens."""
-        fresh = self.store.get(account_id)
-        if fresh is None:
-            return False
-        current = str(fresh.refresh_token or "").strip()
-        expected = str(expected_refresh or "").strip()
-        if expected and current and current != expected:
-            return False
-        self.store.mark_cpa_expired(account_id, detail)
-        return True
+        return self.store.mark_cpa_expired_if_refresh_unchanged(
+            account_id,
+            expected_refresh,
+            detail,
+        )
 
     def _wire_adapters(self) -> None:
         self.registration = RegistrationRunner(self.reference, self.python_executable)

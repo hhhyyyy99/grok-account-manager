@@ -356,6 +356,31 @@ class CpaGuardTests(unittest.TestCase):
         self.assertNotIn("OTHER-SECRET", message)
         self.assertIn("***", message)
 
+    def test_oauth_error_redacts_camel_kebab_and_structured_payloads(self) -> None:
+        cases = [
+            {
+                "error": "refreshToken=CAMEL-LEAK",
+                "error_description": "access-token=KEBAB-LEAK",
+            },
+            {
+                "error": {"refresh_token": "STRUCT-LEAK", "code": "invalid_grant"},
+                "error_description": {"idToken": "ID-LEAK"},
+            },
+        ]
+        for payload in cases:
+            def fake_post(_url, _form, timeout=30.0, *, proxy=None, body=payload):
+                return 400, body
+
+            with patch.object(oauth_device, "_post_form", side_effect=fake_post):
+                with self.assertRaises(oauth_device.OAuthDeviceError) as raised:
+                    oauth_device.refresh_access_token("any-refresh")
+            message = str(raised.exception)
+            self.assertNotIn("CAMEL-LEAK", message)
+            self.assertNotIn("KEBAB-LEAK", message)
+            self.assertNotIn("STRUCT-LEAK", message)
+            self.assertNotIn("ID-LEAK", message)
+            self.assertIn("***", message)
+
     def test_guard_does_not_expire_when_refresh_already_rotated(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = make_manager(Path(directory))

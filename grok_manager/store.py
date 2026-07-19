@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
@@ -74,6 +75,8 @@ class AccountStore:
         if not self.vault.is_unlocked:
             raise VaultLockedError("账号存储需要已解锁的凭据保险库")
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._account_locks: Dict[int, threading.RLock] = {}
+        self._account_locks_guard = threading.Lock()
         with self._connect() as conn:
             conn.execute("PRAGMA secure_delete = ON")
             conn.executescript(SCHEMA)
@@ -96,6 +99,16 @@ class AccountStore:
             self.path.chmod(0o600)
         except OSError:
             pass
+
+    def account_lock(self, account_id: int) -> threading.RLock:
+        """Per-account reentrant lock shared by login, remint, silent refresh, expire marks."""
+        key = int(account_id)
+        with self._account_locks_guard:
+            lock = self._account_locks.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                self._account_locks[key] = lock
+            return lock
 
     def _credential_context(self, email: str, field: str) -> str:
         return "account:%s:%s" % (email.strip().lower(), field)
@@ -214,6 +227,9 @@ class AccountStore:
             if auth_file == existing.auth_file:
                 auth_file = ""
         cpa_material = bool(access_token or refresh_token or auth_file or draft.token_expires_at.strip())
+        # Prefer the artifact's source_modified_at so old imports do not outrank newer hotload.
+        source_modified = draft.source_modified_at.strip()
+        cpa_stamp = source_modified or now if cpa_material else ""
         values = (
             email,
             self._encrypt_credential(email, "password", password),
@@ -223,8 +239,8 @@ class AccountStore:
             draft.token_expires_at.strip(),
             self._encrypt_credential(email, "auth_file", auth_file),
             draft.source.strip(),
-            draft.source_modified_at.strip(),
-            now if cpa_material else "",
+            source_modified,
+            cpa_stamp,
             now,
             now,
         )
@@ -437,6 +453,28 @@ class AccountStore:
 
     def mark_cpa_expired(self, account_id: int, detail: str = "CPA 凭据已过期") -> None:
         """Mark CPA (and overall status) expired without touching SSO fields."""
+        with self.account_lock(account_id):
+            self._mark_cpa_expired_unlocked(account_id, detail)
+
+    def mark_cpa_expired_if_refresh_unchanged(
+        self,
+        account_id: int,
+        expected_refresh: str,
+        detail: str = "CPA 凭据已过期",
+    ) -> bool:
+        """Atomically expire only when refresh_token still matches expected."""
+        with self.account_lock(account_id):
+            account = self.get(account_id)
+            if account is None:
+                return False
+            current = str(account.refresh_token or "").strip()
+            expected = str(expected_refresh or "").strip()
+            if expected and current and current != expected:
+                return False
+            self._mark_cpa_expired_unlocked(account_id, detail)
+            return True
+
+    def _mark_cpa_expired_unlocked(self, account_id: int, detail: str) -> None:
         now = utc_now_iso()
         text = str(detail or "CPA 凭据已过期")[:1000]
         with self._connect() as conn:
@@ -510,44 +548,45 @@ class AccountStore:
         detail: str = "批量登录成功",
         sso_token: str = "",
     ) -> None:
-        now = utc_now_iso()
-        account = self.get(account_id)
-        if account is None:
-            raise ValueError("登录凭据对应的账号不存在")
-        # Login deliberately stores the provided auth_file (often empty after the
-        # transient managed file is deleted). CPA renewals use apply_cpa_credentials
-        # which preserves an existing pointer when the new value is blank.
-        with self._connect() as conn:
-            conn.execute(
-                """
-                UPDATE accounts
-                SET access_token = ?, refresh_token = ?, token_expires_at = ?,
-                    sso_token = CASE WHEN ? != '' THEN ? ELSE sso_token END,
-                    auth_file = ?, status = ?, status_detail = ?,
-                    sso_status = ?, sso_detail = ?, cpa_status = ?, cpa_detail = ?,
-                    cpa_updated_at = ?,
-                    last_login_at = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    self._encrypt_credential(account.email, "access_token", access_token),
-                    self._encrypt_credential(account.email, "refresh_token", refresh_token),
-                    expires_at.strip(),
-                    self._encrypt_credential(account.email, "sso_token", sso_token),
-                    self._encrypt_credential(account.email, "sso_token", sso_token),
-                    self._encrypt_credential(account.email, "auth_file", auth_file),
-                    AccountStatus.UNKNOWN.value,
-                    detail[:1000],
-                    AccountStatus.UNKNOWN.value,
-                    "登录后待巡检",
-                    AccountStatus.UNKNOWN.value,
-                    "登录后待巡检",
-                    now,
-                    now,
-                    now,
-                    int(account_id),
-                ),
-            )
+        with self.account_lock(account_id):
+            now = utc_now_iso()
+            account = self.get(account_id)
+            if account is None:
+                raise ValueError("登录凭据对应的账号不存在")
+            # Login deliberately stores the provided auth_file (often empty after the
+            # transient managed file is deleted). CPA renewals use apply_cpa_credentials
+            # which preserves an existing pointer when the new value is blank.
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE accounts
+                    SET access_token = ?, refresh_token = ?, token_expires_at = ?,
+                        sso_token = CASE WHEN ? != '' THEN ? ELSE sso_token END,
+                        auth_file = ?, status = ?, status_detail = ?,
+                        sso_status = ?, sso_detail = ?, cpa_status = ?, cpa_detail = ?,
+                        cpa_updated_at = ?,
+                        last_login_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        self._encrypt_credential(account.email, "access_token", access_token),
+                        self._encrypt_credential(account.email, "refresh_token", refresh_token),
+                        expires_at.strip(),
+                        self._encrypt_credential(account.email, "sso_token", sso_token),
+                        self._encrypt_credential(account.email, "sso_token", sso_token),
+                        self._encrypt_credential(account.email, "auth_file", auth_file),
+                        AccountStatus.UNKNOWN.value,
+                        detail[:1000],
+                        AccountStatus.UNKNOWN.value,
+                        "登录后待巡检",
+                        AccountStatus.UNKNOWN.value,
+                        "登录后待巡检",
+                        now,
+                        now,
+                        now,
+                        int(account_id),
+                    ),
+                )
 
     def apply_cpa_credentials(
         self,
@@ -566,52 +605,53 @@ class AccountStore:
         the existing pointer so temporary managed files can be deleted without
         wiping inspection metadata.
         """
-        now = utc_now_iso()
-        account = self.get(account_id)
-        if account is None:
-            raise ValueError("CPA 续期对应的账号不存在")
-        access_token = str(access_token or "").strip()
-        refresh_token = str(refresh_token or "").strip()
-        if not access_token or not refresh_token:
-            raise ValueError("CPA 续期需要 access_token 与 refresh_token")
-        auth_file = str(auth_file or "").strip()
-        if preserve_status:
-            status = account.status
-            status_detail = detail[:1000] if detail else account.status_detail
-            cpa_status = account.cpa_status
-            cpa_detail = detail[:1000] if detail else account.cpa_detail
-        else:
-            status = AccountStatus.UNKNOWN.value
-            status_detail = detail[:1000]
-            cpa_status = AccountStatus.UNKNOWN.value
-            cpa_detail = "续期后待巡检"
-        with self._connect() as conn:
-            conn.execute(
-                """
-                UPDATE accounts
-                SET access_token = ?, refresh_token = ?, token_expires_at = ?,
-                    auth_file = CASE WHEN ? != '' THEN ? ELSE auth_file END,
-                    status = ?, status_detail = ?,
-                    cpa_status = ?, cpa_detail = ?,
-                    cpa_updated_at = ?,
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    self._encrypt_credential(account.email, "access_token", access_token),
-                    self._encrypt_credential(account.email, "refresh_token", refresh_token),
-                    expires_at.strip(),
-                    self._encrypt_credential(account.email, "auth_file", auth_file),
-                    self._encrypt_credential(account.email, "auth_file", auth_file),
-                    status,
-                    status_detail,
-                    cpa_status,
-                    cpa_detail,
-                    now,
-                    now,
-                    int(account_id),
-                ),
-            )
+        with self.account_lock(account_id):
+            now = utc_now_iso()
+            account = self.get(account_id)
+            if account is None:
+                raise ValueError("CPA 续期对应的账号不存在")
+            access_token = str(access_token or "").strip()
+            refresh_token = str(refresh_token or "").strip()
+            if not access_token or not refresh_token:
+                raise ValueError("CPA 续期需要 access_token 与 refresh_token")
+            auth_file = str(auth_file or "").strip()
+            if preserve_status:
+                status = account.status
+                status_detail = detail[:1000] if detail else account.status_detail
+                cpa_status = account.cpa_status
+                cpa_detail = detail[:1000] if detail else account.cpa_detail
+            else:
+                status = AccountStatus.UNKNOWN.value
+                status_detail = detail[:1000]
+                cpa_status = AccountStatus.UNKNOWN.value
+                cpa_detail = "续期后待巡检"
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE accounts
+                    SET access_token = ?, refresh_token = ?, token_expires_at = ?,
+                        auth_file = CASE WHEN ? != '' THEN ? ELSE auth_file END,
+                        status = ?, status_detail = ?,
+                        cpa_status = ?, cpa_detail = ?,
+                        cpa_updated_at = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        self._encrypt_credential(account.email, "access_token", access_token),
+                        self._encrypt_credential(account.email, "refresh_token", refresh_token),
+                        expires_at.strip(),
+                        self._encrypt_credential(account.email, "auth_file", auth_file),
+                        self._encrypt_credential(account.email, "auth_file", auth_file),
+                        status,
+                        status_detail,
+                        cpa_status,
+                        cpa_detail,
+                        now,
+                        now,
+                        int(account_id),
+                    ),
+                )
 
     def touch_cpa_auth_file(self, account_id: int, auth_file: str) -> None:
         """Update only the CPA auth_file metadata pointer."""

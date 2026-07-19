@@ -333,7 +333,8 @@ class BatchLoginService:
             self._remove_transient_auth_file(auth_file)
             auth_file = ""
         if not ok and account_id:
-            self.store.set_status([account_id], AccountStatus.EXPIRED.value, detail)
+            # Keep cpa_status in sync so guardian stops retrying revoked accounts.
+            self.store.mark_cpa_expired(account_id, detail)
         return CpaRefreshResult(
             account_id,
             email,

@@ -517,6 +517,52 @@ class CpaHotloadSyncTests(unittest.TestCase):
             self.assertEqual("new-import-access", after.access_token if after else "")
             self.assertEqual("new-import-access", hot["access_token"])
 
+    def test_old_import_artifact_does_not_override_newer_hotload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = make_manager(root)
+            hotload_dir = root / "hotload"
+            self._enable_hotload(manager, hotload_dir)
+            expires = _future_iso(7000)
+            old_source = (
+                datetime.now(timezone.utc) - timedelta(days=5)
+            ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            newer_hot = (
+                datetime.now(timezone.utc) - timedelta(hours=1)
+            ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            path = hotload_dir / "xai-old-import@example.com.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "email": "old-import@example.com",
+                        "access_token": "fresh-hot-access",
+                        "refresh_token": "fresh-hot-refresh",
+                        "expired": expires,
+                        "last_refresh": newer_hot,
+                        "base_url": "http://127.0.0.1:8317/v1",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            imported = manager.store.upsert(
+                AccountDraft(
+                    email="old-import@example.com",
+                    access_token="ancient-import-access",
+                    refresh_token="ancient-import-refresh",
+                    token_expires_at=expires,
+                    source="disk-import",
+                    source_modified_at=old_source,
+                )
+            )
+            stored = manager.store.get(imported.id)
+            self.assertEqual(old_source, stored.cpa_updated_at if stored else "")
+            result = manager.sync_account_cpa_with_hotload(stored)
+            after = manager.store.get(imported.id)
+            hot = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual("pull", result.action)
+            self.assertEqual("fresh-hot-access", after.access_token if after else "")
+            self.assertEqual("fresh-hot-access", hot["access_token"])
+
 
 if __name__ == "__main__":
     unittest.main()

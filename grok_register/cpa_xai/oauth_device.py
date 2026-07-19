@@ -128,13 +128,31 @@ _SENSITIVE_BODY_KEYS = frozenset(
 )
 
 
+def _is_sensitive_oauth_key(key: str) -> bool:
+    lowered = re.sub(r"[\s_\-]+", "", str(key or "").lower())
+    if not lowered:
+        return False
+    if lowered in {
+        "accesstoken",
+        "refreshtoken",
+        "idtoken",
+        "devicecode",
+        "usercode",
+        "clientsecret",
+        "password",
+        "sso",
+        "token",
+    }:
+        return True
+    return "token" in lowered or "secret" in lowered or "password" in lowered
+
+
 def _redact_oauth_value(value: Any) -> Any:
     if isinstance(value, dict):
         redacted: dict[str, Any] = {}
         for key, item in value.items():
             key_text = str(key)
-            lowered = key_text.lower()
-            if lowered in _SENSITIVE_BODY_KEYS or "token" in lowered or "secret" in lowered:
+            if _is_sensitive_oauth_key(key_text):
                 redacted[key_text] = "***"
             else:
                 redacted[key_text] = _redact_oauth_value(item)
@@ -151,19 +169,20 @@ def _redact_oauth_text(text: str) -> str:
     value = str(text or "")
     if not value:
         return value
-    # Common shapes: refresh_token=..., "access_token":"...", Bearer eyJ...
+    # snake_case, camelCase, kebab-case, quoted JSON, Bearer, JWT.
     patterns = (
-        r"(?i)\b(access_token|refresh_token|id_token|device_code|client_secret|password)\s*[:=]\s*([^\s,;]+)",
-        r'(?i)("(?:access_token|refresh_token|id_token|device_code|client_secret|password)"\s*:\s*")([^"]+)(")',
+        r"(?i)\b((?:access|refresh|id)[_-]?token|device[_-]?code|user[_-]?code|client[_-]?secret|password|sso)\s*[:=]\s*([^\s,;]+)",
+        r"(?i)\b((?:access|refresh|id)Token|deviceCode|userCode|clientSecret)\s*[:=]\s*([^\s,;]+)",
+        r'(?i)("(?:access[_-]?token|refresh[_-]?token|id[_-]?token|device[_-]?code|client[_-]?secret|password|accessToken|refreshToken|idToken)"\s*:\s*")([^"]+)(")',
         r"(?i)\b(bearer)\s+([A-Za-z0-9\-._~+/]+=*)",
     )
     redacted = value
     redacted = re.sub(patterns[0], r"\1=***", redacted)
-    redacted = re.sub(patterns[1], r"\1***\3", redacted)
-    redacted = re.sub(patterns[2], r"\1 ***", redacted)
+    redacted = re.sub(patterns[1], r"\1=***", redacted)
+    redacted = re.sub(patterns[2], r"\1***\3", redacted)
+    redacted = re.sub(patterns[3], r"\1 ***", redacted)
     if redacted.count(".") >= 2 and len(redacted) > 40 and " " not in redacted.strip():
         return "***"
-    # JWT-shaped substrings embedded in longer messages.
     redacted = re.sub(
         r"\beyJ[A-Za-z0-9_\-]+=*\.[A-Za-z0-9_\-]+=*\.[A-Za-z0-9_\-+=]*\b",
         "***",
@@ -176,8 +195,11 @@ def _format_oauth_body(body: Any) -> str:
     return repr(_redact_oauth_value(body))
 
 
-def _format_oauth_text(text: str) -> str:
-    return _redact_oauth_text(str(text or ""))
+def _format_oauth_text(value: Any) -> str:
+    """Format any error/error_description payload with recursive redaction."""
+    if isinstance(value, (dict, list)):
+        return _format_oauth_body(value)
+    return _redact_oauth_text(str(value or ""))
 
 
 def request_device_code(
@@ -280,14 +302,13 @@ def poll_device_token(
             return _token_result_from_body(body)
         err = ""
         desc = ""
+        err_display = ""
         if isinstance(body, dict):
-            raw_err = str(body.get("error") or "")
-            # Keep raw codes for control flow; only redacted text leaves this module.
-            err = raw_err
-            desc = _format_oauth_text(str(body.get("error_description") or ""))
+            raw_err = body.get("error")
+            # Keep raw string codes for control flow; only redacted text leaves.
+            err = str(raw_err or "") if not isinstance(raw_err, (dict, list)) else ""
             err_display = _format_oauth_text(raw_err)
-        else:
-            err_display = ""
+            desc = _format_oauth_text(body.get("error_description") or "")
         if err in ("authorization_pending", "slow_down"):
             if err == "slow_down":
                 sleep_for = min(sleep_for + 5, 30)
@@ -296,7 +317,7 @@ def poll_device_token(
             continue
         if err in ("expired_token", "access_denied"):
             raise OAuthDeviceError(f"device auth failed: {err_display}: {desc}")
-        if status == 400 and err:
+        if status == 400 and (err or err_display):
             raise OAuthDeviceError(
                 f"device auth token error: {err_display}: {desc or _format_oauth_body(body)}"
             )
@@ -338,10 +359,11 @@ def refresh_access_token(
     desc = ""
     err_display = ""
     if isinstance(body, dict):
-        err = str(body.get("error") or "")
-        err_display = _format_oauth_text(err)
-        desc = _format_oauth_text(str(body.get("error_description") or ""))
-    if err or status >= 400:
+        raw_err = body.get("error")
+        err = str(raw_err or "") if not isinstance(raw_err, (dict, list)) else ""
+        err_display = _format_oauth_text(raw_err)
+        desc = _format_oauth_text(body.get("error_description") or "")
+    if err or err_display or status >= 400:
         # 5xx and transport-adjacent failures are transient; 4xx grant errors are not.
         retryable = status >= 500 or status == 429
         raise OAuthDeviceError(
