@@ -113,21 +113,6 @@ class OAuthDeviceError(RuntimeError):
         self.retryable = bool(retryable)
 
 
-_SENSITIVE_BODY_KEYS = frozenset(
-    {
-        "access_token",
-        "refresh_token",
-        "id_token",
-        "device_code",
-        "user_code",
-        "client_secret",
-        "password",
-        "sso",
-        "token",
-    }
-)
-
-
 def _is_sensitive_oauth_key(key: str) -> bool:
     lowered = re.sub(r"[\s_\-]+", "", str(key or "").lower())
     if not lowered:
@@ -169,9 +154,9 @@ def _redact_oauth_text(text: str) -> str:
     value = str(text or "")
     if not value:
         return value
-    # snake_case, camelCase, kebab-case, quoted JSON, Bearer, JWT.
+    # snake_case, spaced words, camelCase, kebab-case, quoted JSON, Bearer, JWT.
     patterns = (
-        r"(?i)\b((?:access|refresh|id)[_-]?token|device[_-]?code|user[_-]?code|client[_-]?secret|password|sso)\s*[:=]\s*([^\s,;]+)",
+        r"(?i)\b((?:access|refresh|id)[_\-\s]?token|device[_\-\s]?code|user[_\-\s]?code|client[_\-\s]?secret|password|sso)\s*[:=]\s*([^\s,;]+)",
         r"(?i)\b((?:access|refresh|id)Token|deviceCode|userCode|clientSecret)\s*[:=]\s*([^\s,;]+)",
         r'(?i)("(?:access[_-]?token|refresh[_-]?token|id[_-]?token|device[_-]?code|client[_-]?secret|password|accessToken|refreshToken|idToken)"\s*:\s*")([^"]+)(")',
         r"(?i)\b(bearer)\s+([A-Za-z0-9\-._~+/]+=*)",

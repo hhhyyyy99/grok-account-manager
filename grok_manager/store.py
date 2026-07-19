@@ -263,19 +263,51 @@ class AccountStore:
                     END,
                     access_token = CASE
                         WHEN excluded.access_token != '' AND (
-                            accounts.last_login_at = '' OR excluded.source_modified_at >= accounts.last_login_at
+                            accounts.cpa_updated_at = ''
+                            OR (
+                                excluded.cpa_updated_at != ''
+                                AND excluded.cpa_updated_at >= accounts.cpa_updated_at
+                            )
+                        ) AND (
+                            accounts.last_login_at = ''
+                            OR excluded.source_modified_at = ''
+                            OR excluded.source_modified_at >= accounts.last_login_at
                         ) THEN excluded.access_token ELSE accounts.access_token END,
                     refresh_token = CASE
                         WHEN excluded.refresh_token != '' AND (
-                            accounts.last_login_at = '' OR excluded.source_modified_at >= accounts.last_login_at
+                            accounts.cpa_updated_at = ''
+                            OR (
+                                excluded.cpa_updated_at != ''
+                                AND excluded.cpa_updated_at >= accounts.cpa_updated_at
+                            )
+                        ) AND (
+                            accounts.last_login_at = ''
+                            OR excluded.source_modified_at = ''
+                            OR excluded.source_modified_at >= accounts.last_login_at
                         ) THEN excluded.refresh_token ELSE accounts.refresh_token END,
                     token_expires_at = CASE
                         WHEN excluded.token_expires_at != '' AND (
-                            accounts.last_login_at = '' OR excluded.source_modified_at >= accounts.last_login_at
+                            accounts.cpa_updated_at = ''
+                            OR (
+                                excluded.cpa_updated_at != ''
+                                AND excluded.cpa_updated_at >= accounts.cpa_updated_at
+                            )
+                        ) AND (
+                            accounts.last_login_at = ''
+                            OR excluded.source_modified_at = ''
+                            OR excluded.source_modified_at >= accounts.last_login_at
                         ) THEN excluded.token_expires_at ELSE accounts.token_expires_at END,
                     auth_file = CASE
                         WHEN excluded.auth_file != '' AND (
-                            accounts.last_login_at = '' OR excluded.source_modified_at >= accounts.last_login_at
+                            accounts.cpa_updated_at = ''
+                            OR (
+                                excluded.cpa_updated_at != ''
+                                AND excluded.cpa_updated_at >= accounts.cpa_updated_at
+                            )
+                        ) AND (
+                            accounts.last_login_at = ''
+                            OR excluded.source_modified_at = ''
+                            OR excluded.source_modified_at >= accounts.last_login_at
                         ) THEN excluded.auth_file ELSE accounts.auth_file END,
                     source = CASE WHEN excluded.source != '' THEN excluded.source ELSE accounts.source END,
                     source_modified_at = CASE
@@ -289,7 +321,15 @@ class AccountStore:
                             excluded.source_modified_at >= accounts.last_login_at
                         ) THEN 'unknown'
                         WHEN excluded.access_token != '' AND excluded.access_token != accounts.access_token AND (
-                            accounts.last_login_at = '' OR excluded.source_modified_at >= accounts.last_login_at
+                            accounts.cpa_updated_at = ''
+                            OR (
+                                excluded.cpa_updated_at != ''
+                                AND excluded.cpa_updated_at >= accounts.cpa_updated_at
+                            )
+                        ) AND (
+                            accounts.last_login_at = ''
+                            OR excluded.source_modified_at = ''
+                            OR excluded.source_modified_at >= accounts.last_login_at
                         ) THEN 'unknown'
                         ELSE accounts.status
                     END,
@@ -299,7 +339,15 @@ class AccountStore:
                             excluded.source_modified_at >= accounts.last_login_at
                         ) THEN ''
                         WHEN excluded.access_token != '' AND excluded.access_token != accounts.access_token AND (
-                            accounts.last_login_at = '' OR excluded.source_modified_at >= accounts.last_login_at
+                            accounts.cpa_updated_at = ''
+                            OR (
+                                excluded.cpa_updated_at != ''
+                                AND excluded.cpa_updated_at >= accounts.cpa_updated_at
+                            )
+                        ) AND (
+                            accounts.last_login_at = ''
+                            OR excluded.source_modified_at = ''
+                            OR excluded.source_modified_at >= accounts.last_login_at
                         ) THEN ''
                         ELSE accounts.status_detail
                     END,
@@ -319,13 +367,29 @@ class AccountStore:
                     END,
                     cpa_status = CASE
                         WHEN excluded.access_token != '' AND excluded.access_token != accounts.access_token AND (
-                            accounts.last_login_at = '' OR excluded.source_modified_at >= accounts.last_login_at
+                            accounts.cpa_updated_at = ''
+                            OR (
+                                excluded.cpa_updated_at != ''
+                                AND excluded.cpa_updated_at >= accounts.cpa_updated_at
+                            )
+                        ) AND (
+                            accounts.last_login_at = ''
+                            OR excluded.source_modified_at = ''
+                            OR excluded.source_modified_at >= accounts.last_login_at
                         ) THEN 'unknown'
                         ELSE accounts.cpa_status
                     END,
                     cpa_detail = CASE
                         WHEN excluded.access_token != '' AND excluded.access_token != accounts.access_token AND (
-                            accounts.last_login_at = '' OR excluded.source_modified_at >= accounts.last_login_at
+                            accounts.cpa_updated_at = ''
+                            OR (
+                                excluded.cpa_updated_at != ''
+                                AND excluded.cpa_updated_at >= accounts.cpa_updated_at
+                            )
+                        ) AND (
+                            accounts.last_login_at = ''
+                            OR excluded.source_modified_at = ''
+                            OR excluded.source_modified_at >= accounts.last_login_at
                         ) THEN ''
                         ELSE accounts.cpa_detail
                     END,
@@ -336,7 +400,15 @@ class AccountStore:
                             OR (excluded.token_expires_at != '' AND excluded.token_expires_at != accounts.token_expires_at)
                             OR (excluded.auth_file != '' AND excluded.auth_file != accounts.auth_file)
                         ) AND (
-                            accounts.last_login_at = '' OR excluded.source_modified_at >= accounts.last_login_at
+                            accounts.cpa_updated_at = ''
+                            OR (
+                                excluded.cpa_updated_at != ''
+                                AND excluded.cpa_updated_at >= accounts.cpa_updated_at
+                            )
+                        ) AND (
+                            accounts.last_login_at = ''
+                            OR excluded.source_modified_at = ''
+                            OR excluded.source_modified_at >= accounts.last_login_at
                         ) THEN excluded.cpa_updated_at
                         ELSE accounts.cpa_updated_at
                     END,
@@ -462,14 +534,22 @@ class AccountStore:
         expected_refresh: str,
         detail: str = "CPA 凭据已过期",
     ) -> bool:
-        """Atomically expire only when refresh_token still matches expected."""
+        """Atomically expire only when refresh_token still matches expected.
+
+        An empty expected_refresh only expires accounts that still lack a refresh
+        token, so a concurrent login/remint that wrote a new token is not clobbered.
+        """
         with self.account_lock(account_id):
             account = self.get(account_id)
             if account is None:
                 return False
             current = str(account.refresh_token or "").strip()
             expected = str(expected_refresh or "").strip()
-            if expected and current and current != expected:
+            if expected:
+                if current and current != expected:
+                    return False
+            elif current:
+                # Expected no refresh, but another task already stored one.
                 return False
             self._mark_cpa_expired_unlocked(account_id, detail)
             return True
@@ -510,33 +590,36 @@ class AccountStore:
             )
 
     def apply_inspection(self, result: InspectionResult) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                UPDATE accounts
-                SET status = ?, status_detail = ?, last_checked_at = ?,
-                    token_expires_at = CASE WHEN ? != '' THEN ? ELSE token_expires_at END,
-                    sso_expires_at = CASE WHEN ? != '' THEN ? ELSE sso_expires_at END,
-                    sso_status = ?, sso_detail = ?, cpa_status = ?, cpa_detail = ?,
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    result.status,
-                    result.detail[:1000],
-                    result.checked_at,
-                    result.expires_at,
-                    result.expires_at,
-                    result.sso_expires_at,
-                    result.sso_expires_at,
-                    result.sso_status or AccountStatus.UNKNOWN.value,
-                    result.sso_detail[:1000],
-                    result.cpa_status or AccountStatus.UNKNOWN.value,
-                    result.cpa_detail[:1000],
-                    result.checked_at,
-                    result.account_id,
-                ),
-            )
+        # Hold the account lock so a concurrent refresh cannot be overwritten by a
+        # stale pre-refresh inspection result.
+        with self.account_lock(result.account_id):
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE accounts
+                    SET status = ?, status_detail = ?, last_checked_at = ?,
+                        token_expires_at = CASE WHEN ? != '' THEN ? ELSE token_expires_at END,
+                        sso_expires_at = CASE WHEN ? != '' THEN ? ELSE sso_expires_at END,
+                        sso_status = ?, sso_detail = ?, cpa_status = ?, cpa_detail = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        result.status,
+                        result.detail[:1000],
+                        result.checked_at,
+                        result.expires_at,
+                        result.expires_at,
+                        result.sso_expires_at,
+                        result.sso_expires_at,
+                        result.sso_status or AccountStatus.UNKNOWN.value,
+                        result.sso_detail[:1000],
+                        result.cpa_status or AccountStatus.UNKNOWN.value,
+                        result.cpa_detail[:1000],
+                        result.checked_at,
+                        result.account_id,
+                    ),
+                )
 
     def apply_login_credentials(
         self,

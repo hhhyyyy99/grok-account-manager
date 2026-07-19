@@ -366,6 +366,10 @@ class CpaGuardTests(unittest.TestCase):
                 "error": {"refresh_token": "STRUCT-LEAK", "code": "invalid_grant"},
                 "error_description": {"idToken": "ID-LEAK"},
             },
+            {
+                "error": "refresh token=SPACE-LEAK",
+                "error_description": "access token: SPACE-ACCESS",
+            },
         ]
         for payload in cases:
             def fake_post(_url, _form, timeout=30.0, *, proxy=None, body=payload):
@@ -379,6 +383,8 @@ class CpaGuardTests(unittest.TestCase):
             self.assertNotIn("KEBAB-LEAK", message)
             self.assertNotIn("STRUCT-LEAK", message)
             self.assertNotIn("ID-LEAK", message)
+            self.assertNotIn("SPACE-LEAK", message)
+            self.assertNotIn("SPACE-ACCESS", message)
             self.assertIn("***", message)
 
     def test_guard_does_not_expire_when_refresh_already_rotated(self) -> None:

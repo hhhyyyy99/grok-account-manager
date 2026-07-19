@@ -563,6 +563,82 @@ class CpaHotloadSyncTests(unittest.TestCase):
             self.assertEqual("fresh-hot-access", after.access_token if after else "")
             self.assertEqual("fresh-hot-access", hot["access_token"])
 
+    def test_old_import_does_not_rollback_refreshed_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = make_manager(root)
+            account = manager.store.upsert(
+                AccountDraft(
+                    email="rollback@example.com",
+                    access_token="seed-access",
+                    refresh_token="seed-refresh",
+                    token_expires_at=_future_iso(1000),
+                    source="seed",
+                    source_modified_at=_past_iso(86400),
+                )
+            )
+            # Guardian-style refresh stamps a newer cpa_updated_at.
+            manager.store.apply_cpa_credentials(
+                account.id,
+                "fresh-access",
+                "fresh-refresh",
+                _future_iso(9000),
+                "",
+                detail="refreshed",
+            )
+            old_source = (
+                datetime.now(timezone.utc) - timedelta(days=5)
+            ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            manager.store.upsert(
+                AccountDraft(
+                    email="rollback@example.com",
+                    access_token="ancient-access",
+                    refresh_token="ancient-refresh",
+                    token_expires_at=_future_iso(1000),
+                    source="old-import",
+                    source_modified_at=old_source,
+                )
+            )
+            stored = manager.store.get(account.id)
+            self.assertEqual("fresh-access", stored.access_token if stored else "")
+            self.assertEqual("fresh-refresh", stored.refresh_token if stored else "")
+            self.assertNotEqual(old_source, stored.cpa_updated_at if stored else "")
+
+    def test_empty_expected_refresh_does_not_expire_new_token(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            account = manager.store.upsert(
+                AccountDraft(
+                    email="empty-expected@example.com",
+                    access_token="a",
+                    refresh_token="new-refresh",
+                    token_expires_at=_future_iso(1000),
+                )
+            )
+            manager.store.apply_inspection(
+                InspectionResult(
+                    account_id=account.id,
+                    status=AccountStatus.ACTIVE.value,
+                    detail="active",
+                    checked_at=_future_iso(0),
+                    expires_at=_future_iso(1000),
+                    sso_status=AccountStatus.ACTIVE.value,
+                    cpa_status=AccountStatus.ACTIVE.value,
+                    cpa_detail="active",
+                )
+            )
+            marked = manager.store.mark_cpa_expired_if_refresh_unchanged(
+                account.id,
+                "",
+                "should not expire",
+            )
+            stored = manager.store.get(account.id)
+            self.assertFalse(marked)
+            self.assertEqual(
+                AccountStatus.ACTIVE.value,
+                stored.cpa_status if stored else "",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

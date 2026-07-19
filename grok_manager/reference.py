@@ -718,6 +718,17 @@ class ReferenceProject:
             if email in auth_index:
                 indexed_path, auth = auth_index[email]
                 auth_path = str(indexed_path)
+            # Prefer auth last_refresh over accounts.txt mtime so stale text files
+            # cannot outrank a newer xai credential artifact.
+            auth_freshness = str(auth.get("last_refresh") or "").strip()
+            stamp = (
+                auth_freshness
+                or source_modified_at
+                or datetime.now(tz=timezone.utc)
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
             records.append(
                 AccountDraft(
                     email=email,
@@ -728,13 +739,7 @@ class ReferenceProject:
                     token_expires_at=str(auth.get("expired") or ""),
                     auth_file=auth_path,
                     source=source,
-                    source_modified_at=(
-                        source_modified_at
-                        or datetime.now(tz=timezone.utc)
-                        .replace(microsecond=0)
-                        .isoformat()
-                        .replace("+00:00", "Z")
-                    ),
+                    source_modified_at=stamp,
                 )
             )
         return records

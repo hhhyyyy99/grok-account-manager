@@ -300,6 +300,13 @@ class BatchLoginService:
             value.get("error")
             or ("通过 SSO 重新签发 CPA 凭据" if ok else "SSO 续期失败")
         )
+        expected_refresh = ""
+        if account_id:
+            try:
+                prior = self.store.get(account_id)
+                expected_refresh = str(prior.refresh_token if prior else "")
+            except Exception:
+                expected_refresh = ""
         if ok:
             try:
                 account = self.store.get(account_id)
@@ -333,8 +340,13 @@ class BatchLoginService:
             self._remove_transient_auth_file(auth_file)
             auth_file = ""
         if not ok and account_id:
-            # Keep cpa_status in sync so guardian stops retrying revoked accounts.
-            self.store.mark_cpa_expired(account_id, detail)
+            # Keep cpa_status in sync so guardian stops retrying revoked accounts,
+            # but never clobber a concurrent successful rotation.
+            self.store.mark_cpa_expired_if_refresh_unchanged(
+                account_id,
+                expected_refresh,
+                detail,
+            )
         return CpaRefreshResult(
             account_id,
             email,

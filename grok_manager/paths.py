@@ -6,9 +6,10 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping, Optional
+from typing import Iterator, Mapping, Optional
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -96,6 +97,30 @@ def ensure_data_dirs() -> None:
             path.chmod(0o700)
         except OSError:
             pass
+
+
+@contextmanager
+def interprocess_lock(name: str, data_root: Path | None = None) -> Iterator[None]:
+    """Cross-process exclusive lock using fcntl (Unix) for CPA sync/guardian."""
+    import fcntl
+
+    root = Path(data_root or DATA_DIR).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path = root / (".%s.lock" % str(name or "lock").strip().replace("/", "_"))
+    handle = open(lock_path, "a+", encoding="utf-8")
+    try:
+        try:
+            os.chmod(lock_path, 0o600)
+        except OSError:
+            pass
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        handle.close()
 
 
 def remove_managed_auth_file(

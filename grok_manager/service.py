@@ -1152,7 +1152,25 @@ class GrokManager:
         push_when_manager_newer: bool = True,
     ) -> CpaHotloadSyncResult:
         """Bidirectional newest-wins sync between manager DB and CPA hotload file."""
+        from .paths import interprocess_lock
+
         log = log or (lambda _message: None)
+        with interprocess_lock("cpa-sync", self.reference.data_root):
+            # Re-read under the cross-process lock so CLI/web never act on a stale snapshot.
+            fresh = self.store.get(account.id) or account
+            return self._sync_account_cpa_with_hotload_unlocked(
+                fresh,
+                log=log,
+                push_when_manager_newer=push_when_manager_newer,
+            )
+
+    def _sync_account_cpa_with_hotload_unlocked(
+        self,
+        account: Account,
+        *,
+        log,
+        push_when_manager_newer: bool = True,
+    ) -> CpaHotloadSyncResult:
         if not self.reference.cpa_hotload_enabled():
             return CpaHotloadSyncResult(
                 account.id,
@@ -1397,37 +1415,41 @@ class GrokManager:
         reinspect: bool = False,
     ) -> List[CpaHotloadSyncResult]:
         """Sync manager CPA credentials with deployment hotload files (newest wins)."""
+        from .paths import interprocess_lock
+
         log = log or (lambda _message: None)
-        if account_ids is None:
-            accounts = self.store.list_accounts()
-        else:
-            accounts = self.store.get_many([int(value) for value in account_ids])
-        # Prefer accounts that already have CPA material or hotload files.
-        targets = [
-            account
-            for account in accounts
-            if str(account.access_token or "").strip()
-            or str(account.refresh_token or "").strip()
-            or str(account.auth_file or "").strip()
-            or self.reference.load_hotload_auth(account.email) is not None
-        ]
         results: List[CpaHotloadSyncResult] = []
-        total = len(targets)
-        if not targets:
-            log("CPA hotload 同步：没有可同步账号")
-            return results
-        log("CPA hotload 同步：开始处理 %s 个账号（以新为准）" % total)
-        for index, account in enumerate(targets, start=1):
-            if cancelled and cancelled():
-                break
-            result = self.sync_account_cpa_with_hotload(
-                account,
-                log=log,
-                push_when_manager_newer=push_when_manager_newer,
-            )
-            results.append(result)
-            if progress:
-                progress(result, index, total)
+        # One cross-process lock for the whole batch; re-read each account under it.
+        with interprocess_lock("cpa-sync", self.reference.data_root):
+            if account_ids is None:
+                accounts = self.store.list_accounts()
+            else:
+                accounts = self.store.get_many([int(value) for value in account_ids])
+            targets = [
+                account
+                for account in accounts
+                if str(account.access_token or "").strip()
+                or str(account.refresh_token or "").strip()
+                or str(account.auth_file or "").strip()
+                or self.reference.load_hotload_auth(account.email) is not None
+            ]
+            total = len(targets)
+            if not targets:
+                log("CPA hotload 同步：没有可同步账号")
+                return results
+            log("CPA hotload 同步：开始处理 %s 个账号（以新为准）" % total)
+            for index, account in enumerate(targets, start=1):
+                if cancelled and cancelled():
+                    break
+                fresh = self.store.get(account.id) or account
+                result = self._sync_account_cpa_with_hotload_unlocked(
+                    fresh,
+                    log=log,
+                    push_when_manager_newer=push_when_manager_newer,
+                )
+                results.append(result)
+                if progress:
+                    progress(result, index, total)
 
         changed_ids = [
             result.account_id
