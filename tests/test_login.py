@@ -1043,13 +1043,67 @@ class BatchLoginCredentialTests(unittest.TestCase):
 
             self.assertIn("Grok2API 未同步", note1)
             self.assertIn("Grok2API 未同步", note2)
+            # Generic remote failures do not burn through the whole candidate
+            # chain; only explicit account_not_found advances to pending_new.
             self.assertEqual(
-                [("old-sso", "fresh-sso"), ("old-sso", "newer-sso")],
+                [
+                    ("old-sso", "fresh-sso"),
+                    ("old-sso", "newer-sso"),
+                ],
                 seen,
             )
             self.assertEqual(
-                "old-sso\nfresh-sso",
+                "old-sso\nnewer-sso",
                 manager.vault.get_secret("pending-sso-replace:pending@example.com"),
+            )
+
+    def test_pending_sso_chain_recovers_after_lost_replace_response(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            account = manager.store.upsert(
+                AccountDraft(
+                    email="recover@example.com",
+                    password="password",
+                    sso_token="fresh-sso",
+                    access_token="access",
+                    refresh_token="refresh",
+                )
+            )
+            # First login persisted pending old->fresh after a lost response.
+            manager.vault.put_secret(
+                "pending-sso-replace:recover@example.com", "old-sso\nfresh-sso"
+            )
+            result = LoginResult(
+                account.id,
+                account.email,
+                True,
+                "登录成功",
+                previous_sso_token="fresh-sso",
+                sso_token="newer-sso",
+            )
+            seen = []
+
+            def sync(sso_token, email="", log_callback=None, previous_token=""):
+                seen.append((previous_token, sso_token))
+                if previous_token == "old-sso":
+                    raise RuntimeError(
+                        "grok2api 远端未找到待替换凭据，已拒绝新增: recover@example.com"
+                    )
+                if previous_token == "fresh-sso" and sso_token == "newer-sso":
+                    return None
+                raise RuntimeError("unexpected previous token: %s" % previous_token)
+
+            with patch.object(manager.reference, "sync_grok2api", side_effect=sync):
+                note = manager._sync_relogin_credentials(result)
+
+            self.assertEqual("", note)
+            self.assertEqual(
+                [("old-sso", "newer-sso"), ("fresh-sso", "newer-sso")],
+                seen,
+            )
+            self.assertEqual(
+                "",
+                manager.vault.get_secret("pending-sso-replace:recover@example.com"),
             )
 
 if __name__ == "__main__":

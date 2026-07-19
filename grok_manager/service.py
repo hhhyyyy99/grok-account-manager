@@ -285,22 +285,31 @@ class GrokManager:
         previous = str(previous_token or "").strip()
         fresh = str(new_token or "").strip()
         normalized_email = str(email or "").strip().lower()
-        if (
-            not previous
-            or not normalized_email
-            or self.vault is None
-            or not self.vault.is_unlocked
-        ):
+        if not normalized_email or self.vault is None or not self.vault.is_unlocked:
+            return
+        if not previous and not fresh:
             return
         secret = self._pending_sso_secret_name(normalized_email)
-        # Keep the first unresolved remote token so later retries still match it.
         try:
             existing_raw = self.vault.get_secret(secret)
         except Exception:
             existing_raw = ""
         existing_old, existing_new = self._parse_pending_sso_secret(existing_raw)
+
+        # Preserve the original remote token that still needs to be replaced.
         old = existing_old or previous
-        new = existing_new or fresh
+        # Advance the "already attempted new token" when a later login produces a
+        # newer value. Keep the first intermediate token if the caller only
+        # re-sends the same pending pair.
+        if fresh and fresh not in {old, existing_old}:
+            new = fresh
+        else:
+            new = existing_new or fresh
+        if old and new and old == new:
+            new = ""
+        if not old and new:
+            # No remote previous known; nothing to recover later.
+            return
         payload = old if not new else "%s\n%s" % (old, new)
         if payload == existing_raw:
             return
@@ -329,6 +338,23 @@ class GrokManager:
         except Exception:
             pass
 
+    def _previous_tokens_for_remote(
+        self, email: str, previous_token: str = "", current_token: str = ""
+    ) -> List[str]:
+        pending_old, pending_new = self._resolve_pending_sso_replace(email, previous_token)
+        candidates: List[str] = []
+        for token in (
+            pending_old,
+            previous_token,
+            pending_new,
+        ):
+            value = str(token or "").strip()
+            if not value or value == current_token:
+                continue
+            if value not in candidates:
+                candidates.append(value)
+        return candidates
+
     def _sync_relogin_credentials(self, result: LoginResult, log=None) -> str:
         """Best-effort external sync after credentials are already persisted."""
         notes: List[str] = []
@@ -340,7 +366,7 @@ class GrokManager:
             if not sso_token:
                 account = self.store.get(result.account_id) if result.account_id else None
                 sso_token = str(account.sso_token if account else "").strip()
-            if result.previous_sso_token or sso_token:
+            if result.previous_sso_token or sso_token or previous_for_remote:
                 self._remember_pending_sso_replace(
                     result.email,
                     result.previous_sso_token or previous_for_remote,
@@ -371,20 +397,57 @@ class GrokManager:
             grok_log = None
             if log:
                 grok_log = lambda message: log("[%s] %s" % (result.email, message))
-            try:
-                self.reference.sync_grok2api(
-                    sso_token or pending_new,
-                    email=result.email,
-                    log_callback=grok_log,
-                    previous_token=previous_for_remote,
-                )
-            except Exception as exc:
-                message = "Grok2API 未同步: %s" % exc
+
+            previous_candidates = self._previous_tokens_for_remote(
+                result.email,
+                previous_token=result.previous_sso_token or previous_for_remote,
+                current_token=sso_token,
+            )
+            if not previous_candidates:
+                previous_candidates = [""]
+
+            sync_errors: List[str] = []
+            for index, previous_token in enumerate(previous_candidates):
+                try:
+                    self.reference.sync_grok2api(
+                        sso_token,
+                        email=result.email,
+                        log_callback=grok_log,
+                        previous_token=previous_token,
+                    )
+                except Exception as exc:
+                    sync_errors.append(str(exc))
+                    # If the original old token is gone because a previous attempt
+                    # already replaced it to pending_new, advance and retry with
+                    # that intermediate token as the next previous candidate.
+                    detail = str(exc)
+                    is_missing = "未找到待替换凭据" in detail or "account_not_found" in detail
+                    has_next = index + 1 < len(previous_candidates)
+                    if is_missing and has_next:
+                        advanced_old = previous_candidates[index + 1]
+                        self._remember_pending_sso_replace(
+                            result.email, advanced_old, sso_token
+                        )
+                        if log:
+                            log(
+                                "[%s] 远端旧 token 已不存在，改用中间 token 继续替换"
+                                % result.email
+                            )
+                        continue
+                    message = "Grok2API 未同步: %s" % exc
+                    notes.append(message)
+                    if log:
+                        log("[%s] %s" % (result.email, message))
+                    break
+                else:
+                    self._clear_pending_sso_replace(result.email)
+                    sync_errors = []
+                    break
+            if sync_errors and not any("Grok2API 未同步" in item for item in notes):
+                message = "Grok2API 未同步: %s" % sync_errors[-1]
                 notes.append(message)
                 if log:
                     log("[%s] %s" % (result.email, message))
-            else:
-                self._clear_pending_sso_replace(result.email)
             return "；".join(notes)
         finally:
             self.login._remove_transient_auth_file(result.auth_file)
