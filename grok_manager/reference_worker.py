@@ -82,13 +82,36 @@ def run_password_reset_item(
 def run_login_item(item: Dict[str, Any], settings: Dict[str, Any], mint_and_export) -> Dict[str, Any]:
     account_id = int(item.get("id") or 0)
     email = str(item.get("email") or "").strip()
+    password = str(item.get("password") or "")
+    sso_token = str(item.get("sso_token") or "").strip()
+    allow_passwordless = bool(item.get("allow_passwordless"))
 
     def log(message: str) -> None:
         emit("GM_LOG ", {"id": account_id, "email": email, "message": str(message)})
 
+    cookies = None
+    if sso_token:
+        try:
+            from grok_register.cpa_xai.browser_confirm import cookies_from_sso
+
+            cookies = cookies_from_sso(sso_token)
+            log("injecting stored SSO cookie for device auth (%s clones)" % len(cookies))
+        except Exception as exc:
+            log("SSO cookie build failed: %s" % exc)
+            cookies = None
+            if allow_passwordless and not password:
+                result = {
+                    "ok": False,
+                    "error": "SSO cookie 构建失败: %s" % exc,
+                    "id": account_id,
+                    "email": email,
+                }
+                emit("GM_RESULT ", result)
+                return result
+
     result = mint_and_export(
         email=email,
-        password=str(item.get("password") or ""),
+        password=password,
         auth_dir=str(item.get("auth_dir") or settings["default_auth_dir"]),
         proxy=str(settings.get("proxy") or "") or None,
         headless=bool(settings.get("headless", False)),
@@ -97,16 +120,20 @@ def run_login_item(item: Dict[str, Any], settings: Dict[str, Any], mint_and_expo
         probe_chat=False,
         browser_timeout_sec=float(settings.get("timeout_seconds") or 300),
         force_standalone=True,
+        cookies=cookies,
+        allow_passwordless=allow_passwordless,
         reuse_browser=bool(settings.get("reuse_browser", True)),
         recycle_every=max(1, int(settings.get("recycle_every") or 10)),
         log=log,
     )
     if result.get("ok"):
-        sso_token = current_sso_cookie()
-        result["sso_token"] = sso_token
-        result["sso_refreshed"] = bool(sso_token)
-        if sso_token:
+        fresh_sso = current_sso_cookie()
+        result["sso_token"] = fresh_sso
+        result["sso_refreshed"] = bool(fresh_sso)
+        if fresh_sso:
             log("fresh sso cookie captured")
+        elif allow_passwordless:
+            log("CPA reminted via SSO; browser did not expose a new sso cookie")
         else:
             log("OAuth token refreshed but sso cookie was not found")
     result["id"] = account_id

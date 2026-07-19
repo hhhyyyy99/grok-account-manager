@@ -414,11 +414,28 @@ class PasswordResetTests(unittest.TestCase):
                 password_form_present=False,
             )
         )
-        # Leaving the form without success copy is not enough.
+        # Empty account shell without management copy is not enough.
         self.assertFalse(
             _has_reset_success(
                 "https://accounts.x.ai/account",
                 "",
+                True,
+                password_form_present=False,
+            )
+        )
+        # After submit, xAI may land on the signed-in account management page.
+        self.assertTrue(
+            _has_reset_success(
+                "https://accounts.x.ai/account",
+                "欢迎，Ezra。 管理您的账户。 账户 安全 会话 数据 您的账户 管理您的账户信息。",
+                True,
+                password_form_present=False,
+            )
+        )
+        self.assertTrue(
+            _has_reset_success(
+                "https://accounts.x.ai/account",
+                "Welcome. Manage your account. Account Security Sessions Your account",
                 True,
                 password_form_present=False,
             )

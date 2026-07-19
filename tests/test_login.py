@@ -401,6 +401,242 @@ class BatchLoginCredentialTests(unittest.TestCase):
         self.assertEqual("access", result.access_token)
         self.assertTrue(any("network error" in line for line in logs))
 
+    def test_oauth_refresh_access_token_keeps_or_rotates_refresh(self) -> None:
+        rotated = {
+            "access_token": "new-access",
+            "refresh_token": "rotated-refresh",
+            "token_type": "Bearer",
+            "expires_in": 7200,
+        }
+        reused = {
+            "access_token": "new-access-2",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        }
+        with patch.object(oauth_device, "_post_form", return_value=(200, rotated)):
+            first = oauth_device.refresh_access_token("old-refresh")
+        with patch.object(oauth_device, "_post_form", return_value=(200, reused)):
+            second = oauth_device.refresh_access_token("old-refresh")
+
+        self.assertEqual(
+            ("new-access", "rotated-refresh", "new-access-2", "old-refresh"),
+            (
+                first.access_token,
+                first.refresh_token,
+                second.access_token,
+                second.refresh_token,
+            ),
+        )
+
+    def test_oauth_refresh_access_token_surfaces_invalid_grant(self) -> None:
+        with patch.object(
+            oauth_device,
+            "_post_form",
+            return_value=(400, {"error": "invalid_grant", "error_description": "expired"}),
+        ):
+            with self.assertRaises(oauth_device.OAuthDeviceError) as raised:
+                oauth_device.refresh_access_token("dead-refresh")
+        self.assertIn("invalid_grant", str(raised.exception))
+
+    def test_batch_refresh_cpa_updates_tokens_without_touching_sso(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = make_manager(root)
+            hotload_dir = root / "cpa-hotload"
+            manager.reference.config_file.write_text(
+                json.dumps(
+                    {
+                        "cpa_copy_to_hotload": True,
+                        "cpa_hotload_dir": str(hotload_dir),
+                        "cpa_base_url": "https://cli-chat-proxy.grok.com/v1",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            account = manager.store.upsert(
+                AccountDraft(
+                    email="refresh@example.com",
+                    password="password",
+                    sso_token="keep-sso",
+                    access_token="old-access",
+                    refresh_token="old-refresh",
+                    token_expires_at="2020-01-01T00:00:00Z",
+                )
+            )
+            manager.store.set_status(
+                [account.id], AccountStatus.EXPIRED.value, "CPA access token 已过期"
+            )
+            token = oauth_device.TokenResult(
+                access_token="fresh-access",
+                refresh_token="fresh-refresh",
+                id_token=None,
+                token_type="Bearer",
+                expires_in=21600,
+                raw={},
+            )
+
+            with patch.object(
+                oauth_device,
+                "refresh_access_token",
+                return_value=token,
+            ), patch.object(
+                manager,
+                "inspect_accounts",
+                return_value=[],
+            ):
+                result = manager.batch_refresh_cpa([account.id])[0]
+            stored = manager.store.get(account.id)
+            auth_files = list(manager.reference.managed_auth_dir.glob("xai-*.json"))
+
+            self.assertTrue(result.ok)
+            self.assertEqual("keep-sso", stored.sso_token if stored else "")
+            self.assertEqual("fresh-access", stored.access_token if stored else "")
+            self.assertEqual("fresh-refresh", stored.refresh_token if stored else "")
+            self.assertEqual(1, len(auth_files))
+            payload = json.loads(auth_files[0].read_text(encoding="utf-8"))
+            self.assertEqual("fresh-access", payload["access_token"])
+            self.assertEqual("fresh-refresh", payload["refresh_token"])
+            hotload_files = list(hotload_dir.glob("xai-*.json"))
+            self.assertEqual(1, len(hotload_files))
+
+    def test_batch_refresh_cpa_requires_refresh_token(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            account = manager.store.upsert(
+                AccountDraft(
+                    email="no-refresh@example.com",
+                    password="password",
+                    access_token="old-access",
+                )
+            )
+            result = manager.batch_refresh_cpa([account.id])[0]
+            self.assertFalse(result.ok)
+            self.assertIn("缺少 refresh_token", result.detail)
+            self.assertIn("批量登录", result.detail)
+
+    def test_batch_refresh_cpa_falls_back_to_sso_remint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = make_manager(root)
+            account = manager.store.upsert(
+                AccountDraft(
+                    email="sso-remint@example.com",
+                    password="password",
+                    sso_token="live-sso",
+                    access_token="old-access",
+                    refresh_token="revoked-refresh",
+                    token_expires_at="2020-01-01T00:00:00Z",
+                )
+            )
+            auth_path = manager.reference.managed_auth_dir / "xai-sso-remint@example.com.json"
+            auth_path.parent.mkdir(parents=True, exist_ok=True)
+            auth_path.write_text(
+                json.dumps(
+                    {
+                        "email": "sso-remint@example.com",
+                        "access_token": "reminted-access",
+                        "refresh_token": "reminted-refresh",
+                        "expired": "2099-01-01T00:00:00Z",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            def fake_remint(account_ids, settings, log=None, progress=None):
+                del settings
+                from grok_manager.models import CpaRefreshResult
+
+                ids = list(account_ids)
+                results = []
+                for index, account_id in enumerate(ids, start=1):
+                    stored = manager.store.get(account_id)
+                    manager.store.apply_cpa_credentials(
+                        account_id,
+                        "reminted-access",
+                        "reminted-refresh",
+                        "2099-01-01T00:00:00Z",
+                        str(auth_path),
+                        detail="通过 SSO 重新签发 CPA 凭据",
+                    )
+                    remint_result = CpaRefreshResult(
+                        account_id,
+                        stored.email if stored else "",
+                        True,
+                        "通过 SSO 重新签发 CPA 凭据",
+                        auth_file=str(auth_path),
+                    )
+                    results.append(remint_result)
+                    if progress:
+                        progress(remint_result, index, len(ids))
+                    if log:
+                        log("[%s] reminted" % (stored.email if stored else account_id))
+                return results
+
+            with patch.object(
+                oauth_device,
+                "refresh_access_token",
+                side_effect=oauth_device.OAuthDeviceError(
+                    "refresh token failed HTTP 400: invalid_grant: Refresh token has been revoked"
+                ),
+            ), patch.object(
+                manager.login,
+                "remint_cpa_via_sso",
+                side_effect=fake_remint,
+            ), patch.object(
+                manager,
+                "inspect_accounts",
+                return_value=[],
+            ):
+                result = manager.batch_refresh_cpa([account.id])[0]
+            stored = manager.store.get(account.id)
+
+            self.assertTrue(result.ok)
+            self.assertIn("SSO", result.detail)
+            self.assertEqual("live-sso", stored.sso_token if stored else "")
+            self.assertEqual("reminted-access", stored.access_token if stored else "")
+            self.assertEqual("reminted-refresh", stored.refresh_token if stored else "")
+
+    def test_mint_and_export_allows_passwordless_with_cookies(self) -> None:
+        from grok_register.cpa_xai import mint as mint_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            auth_dir = Path(directory)
+            with patch.object(
+                mint_module,
+                "mint_with_browser",
+                return_value={
+                    "access_token": "cookie-access",
+                    "refresh_token": "cookie-refresh",
+                    "expires_in": 3600,
+                },
+            ) as mint_browser:
+                result = mint_module.mint_and_export(
+                    email="cookie@example.com",
+                    password="",
+                    auth_dir=auth_dir,
+                    cookies=[{"name": "sso", "value": "live"}],
+                    allow_passwordless=True,
+                    probe=False,
+                )
+            self.assertTrue(result["ok"])
+            self.assertTrue(mint_browser.call_args.kwargs["allow_passwordless"])
+            missing = mint_module.mint_and_export(
+                email="cookie@example.com",
+                password="",
+                auth_dir=auth_dir,
+                allow_passwordless=True,
+                probe=False,
+            )
+            self.assertFalse(missing["ok"])
+            self.assertIn("password", missing["error"])
+
+    def test_cookies_from_sso_expands_domains(self) -> None:
+        cookies = browser_confirm.cookies_from_sso("abc123")
+        names = {(item["name"], item["domain"]) for item in cookies}
+        self.assertIn(("sso", "accounts.x.ai"), names)
+        self.assertIn(("sso-rw", ".x.ai"), names)
+        self.assertEqual("abc123", cookies[0]["value"])
+
     def test_login_fallback_uses_packaged_turnstile_extension(self) -> None:
         extensions = []
 

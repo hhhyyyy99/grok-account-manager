@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from grok_manager.models import CpaRefreshResult, LoginResult
 from grok_manager.web import (
     ASSET_DIR,
     GrokWebApplication,
@@ -14,7 +15,9 @@ from grok_manager.web import (
     is_loopback_host,
     is_wildcard_host,
     normalize_bind_host,
+    summarize_account_results,
     task_result_failed,
+    task_result_outcome,
 )
 from tests.support import make_manager
 
@@ -44,7 +47,73 @@ class TaskResultStateTests(unittest.TestCase):
             )
         )
 
-    def test_registry_marks_partial_login_failure_as_failed(self) -> None:
+    def test_task_result_outcome_distinguishes_partial_from_total_failure(self) -> None:
+        self.assertEqual("succeeded", task_result_outcome({"succeeded": 3, "failed": 0}))
+        self.assertEqual("partial", task_result_outcome({"succeeded": 2, "failed": 1}))
+        self.assertEqual("failed", task_result_outcome({"succeeded": 0, "failed": 4}))
+        self.assertEqual(
+            "partial",
+            task_result_outcome(
+                {
+                    "resetCount": 2,
+                    "resetSucceeded": 2,
+                    "loginCount": 2,
+                    "loginSucceeded": 1,
+                }
+            ),
+        )
+        self.assertEqual(
+            "failed",
+            task_result_outcome(
+                {
+                    "resetCount": 1,
+                    "resetSucceeded": 0,
+                    "loginCount": 0,
+                    "loginSucceeded": 0,
+                }
+            ),
+        )
+
+    def test_summarize_account_results_lists_failed_emails(self) -> None:
+        summary = summarize_account_results(
+            [
+                CpaRefreshResult(1, "ok@example.com", True, "done"),
+                CpaRefreshResult(2, "bad@example.com", False, "revoked"),
+                LoginResult(3, "also-bad@example.com", False, "timeout"),
+            ],
+            action_label="CPA 续期",
+        )
+        self.assertEqual(1, summary["succeeded"])
+        self.assertEqual(2, summary["failed"])
+        self.assertEqual(
+            ["bad@example.com", "also-bad@example.com"],
+            [item["email"] for item in summary["failures"]],
+        )
+        self.assertIn("失败账号：bad@example.com", summary["message"])
+
+    def test_registry_marks_partial_login_failure_as_partial(self) -> None:
+        registry = TaskRegistry()
+
+        def worker(_task):
+            return {
+                "count": 2,
+                "succeeded": 1,
+                "failed": 1,
+                "message": "登录完成，成功 1，失败 1",
+            }
+
+        task = registry.start("login", "批量登录", worker)
+        for _ in range(50):
+            if task.state in {"succeeded", "partial", "failed", "cancelled"}:
+                break
+            import time
+
+            time.sleep(0.01)
+
+        self.assertEqual("partial", task.state)
+        self.assertIn("失败 1", task.message)
+
+    def test_registry_marks_total_login_failure_as_failed(self) -> None:
         registry = TaskRegistry()
 
         def worker(_task):
@@ -57,7 +126,7 @@ class TaskResultStateTests(unittest.TestCase):
 
         task = registry.start("login", "批量登录", worker)
         for _ in range(50):
-            if task.state in {"succeeded", "failed", "cancelled"}:
+            if task.state in {"succeeded", "partial", "failed", "cancelled"}:
                 break
             import time
 
@@ -84,6 +153,35 @@ class LanAccessTests(unittest.TestCase):
             application = GrokWebApplication(make_manager(Path(directory)))
             with self.assertRaisesRegex(ValueError, "--lan"):
                 application.serve(host="0.0.0.0", port=0, open_browser=False, allow_lan=False)
+
+    def test_web_app_starts_cpa_guard_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            manager.config.cpa_guard_enabled = True
+            application = GrokWebApplication(manager)
+            started = {"count": 0}
+
+            def fake_loop(**_kwargs):
+                started["count"] += 1
+                while not _kwargs["cancelled"]():
+                    import time
+
+                    time.sleep(0.01)
+
+            with patch.object(manager, "run_cpa_guard_loop", side_effect=fake_loop):
+                self.assertTrue(application.start_cpa_guard())
+                self.assertFalse(application.start_cpa_guard())  # already running
+                application.stop_cpa_guard(timeout=1.0)
+            self.assertEqual(1, started["count"])
+
+    def test_web_app_skips_cpa_guard_when_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            manager.config.cpa_guard_enabled = False
+            application = GrokWebApplication(manager)
+            self.assertFalse(application.start_cpa_guard())
+            self.assertTrue(application.start_cpa_guard(force=True))
+            application.stop_cpa_guard(timeout=1.0)
 
 
 class ManagerTaskConfigTests(unittest.TestCase):
@@ -129,6 +227,12 @@ process.stdout.write(JSON.stringify(orderAccountsById(accounts).map((item) => it
         self.assertIn('id="reset-password-selected"', html)
         self.assertIn('/api/reset-password', script)
         self.assertIn('reset-password', script)
+
+    def test_cpa_refresh_action_is_exposed(self) -> None:
+        html = (ASSET_DIR / "index.html").read_text(encoding="utf-8")
+        script = (ASSET_DIR / "app.js").read_text(encoding="utf-8")
+        self.assertIn('id="refresh-cpa-selected"', html)
+        self.assertIn('/api/refresh-cpa', script)
 
     def test_registration_config_is_split_by_integration(self) -> None:
         html = (ASSET_DIR / "index.html").read_text(encoding="utf-8")

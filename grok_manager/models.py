@@ -133,3 +133,12 @@ class PasswordResetResult:
     email: str
     ok: bool
     detail: str
+
+
+@dataclass(frozen=True)
+class CpaRefreshResult:
+    account_id: int
+    email: str
+    ok: bool
+    detail: str
+    auth_file: str = ""

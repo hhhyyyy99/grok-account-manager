@@ -5,6 +5,7 @@ import type {
   ConfigPayload,
   StatePayload,
   Task,
+  TaskFailure,
   TaskLog,
   ViewName,
 } from "./types";
@@ -28,7 +29,7 @@ const NAV_ITEMS: Array<{ name: ViewName; label: string; glyph: string }> = [
   { name: "settings", label: "设置", glyph: "≡" },
 ];
 
-const TERMINAL_STATES = new Set(["succeeded", "failed", "cancelled"]);
+const TERMINAL_STATES = new Set(["succeeded", "partial", "failed", "cancelled"]);
 
 export function orderAccountsById(accounts: Account[]): Account[] {
   return [...accounts].sort((left, right) => Number(right.id) - Number(left.id));
@@ -47,7 +48,7 @@ function taskPercent(task: Task): number {
   if (task.total > 0) {
     return Math.min(100, Math.max(0, Math.round((task.current / task.total) * 100)));
   }
-  return task.state === "succeeded" ? 100 : 0;
+  return TERMINAL_STATES.has(task.state) && task.state !== "cancelled" ? 100 : 0;
 }
 
 function formatTime(value: string): string {
@@ -83,6 +84,7 @@ function taskKindLabel(kind: string): string {
     import: "导入",
     inspect: "巡检",
     login: "登录",
+    "refresh-cpa": "CPA 续期",
     "reset-password": "重置密码",
     register: "注册",
     diagnostics: "环境检查",
@@ -94,7 +96,8 @@ function taskStateLabel(state: string): string {
     queued: "排队中",
     running: "进行中",
     succeeded: "已完成",
-    failed: "失败",
+    partial: "部分成功",
+    failed: "全部失败",
     cancelled: "已取消",
   } as Record<string, string>)[state] ?? state;
 }
@@ -225,6 +228,11 @@ export function App() {
         if (result.task) {
           setSelectedTaskId(result.task.id);
           setTaskDrawerOpen(true);
+        }
+        // Batch account ops are fire-and-forget once submitted; keep selection only
+        // until the request succeeds so the next action starts from a clean set.
+        if (Array.isArray(body.ids) && body.ids.length > 0) {
+          setSelected(new Set());
         }
         flash(success);
         await manager.refresh();
@@ -508,6 +516,7 @@ function AccountsView(props: AccountsViewProps) {
           <div className="selection-summary"><strong>{selected.size}</strong><span>已选择</span></div>
           <div className="selection-actions">
             <button type="button" disabled={!selected.size || busy} onClick={() => requireSelection("/api/inspect", "巡检任务已创建")}><span aria-hidden="true">↻</span>巡检</button>
+            <button type="button" disabled={!selected.size || busy} onClick={() => requireSelection("/api/refresh-cpa", "CPA 续期任务已创建")}><span aria-hidden="true">⟳</span>CPA 续期</button>
             <button type="button" disabled={!selected.size || busy} onClick={() => requireSelection("/api/login", "登录任务已创建")}><span aria-hidden="true">→</span>批量登录</button>
             <button type="button" disabled={!selected.size || busy} onClick={() => requireSelection("/api/reset-password", "改密任务已创建")}><span aria-hidden="true">↺</span>重置密码</button>
             <span className="export-control">
@@ -702,11 +711,31 @@ function TaskDrawer({ open, tasks, selectedTask, selectedTaskId, onClose, onSele
   );
 }
 
+function taskFailures(task: Task): TaskFailure[] {
+  const raw = task.result?.failures;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((item) => {
+      if (!item || typeof item !== "object") return null;
+      const value = item as Record<string, unknown>;
+      return {
+        id: Number(value.id) || 0,
+        email: String(value.email || ""),
+        detail: String(value.detail || ""),
+      };
+    })
+    .filter((item): item is TaskFailure => item !== null);
+}
+
 function TaskDetail({ task, onCancel }: { task?: Task; onCancel: (id: string) => void }) {
   const logRef = useRef<HTMLDivElement>(null);
   const followLogsRef = useRef(true);
   const previousTaskIdRef = useRef<string>();
   const logs: TaskLog[] = task?.logs ?? [];
+  const failures = task ? taskFailures(task) : [];
+  const failedCount = Number(task?.result?.failed ?? failures.length) || failures.length;
+  const succeededCount = Number(task?.result?.succeeded ?? 0) || 0;
+  const failureTruncated = Boolean(task?.result?.failureTruncated);
 
   useEffect(() => {
     const taskChanged = previousTaskIdRef.current !== task?.id;
@@ -730,6 +759,29 @@ function TaskDetail({ task, onCancel }: { task?: Task; onCancel: (id: string) =>
         <span>启动时间<strong>{formatTime(task.startedAt || task.createdAt)}</strong></span>
         <span>结束时间<strong>{formatTime(task.finishedAt)}</strong></span>
       </div>
+      {TERMINAL_STATES.has(task.state) && (succeededCount > 0 || failedCount > 0) && (
+        <div className="task-result-summary">
+          <span className="ok">成功 <strong>{succeededCount}</strong></span>
+          <span className={failedCount ? "bad" : ""}>失败 <strong>{failedCount}</strong></span>
+        </div>
+      )}
+      {failures.length > 0 && (
+        <div className="task-failure-panel">
+          <div className="task-failure-title">
+            <strong>失败账号</strong>
+            <span>{failures.length}{failureTruncated ? "+" : ""} 个</span>
+          </div>
+          <ul className="task-failure-list">
+            {failures.map((item) => (
+              <li key={`${item.id}-${item.email}`}>
+                <strong title={item.email}>{item.email || `#${item.id}`}</strong>
+                <span title={item.detail}>{item.detail || "失败"}</span>
+              </li>
+            ))}
+          </ul>
+          {failureTruncated && <p className="task-failure-note">列表已截断，完整原因见下方执行日志。</p>}
+        </div>
+      )}
       {!TERMINAL_STATES.has(task.state) && <button className="button danger" type="button" onClick={() => onCancel(task.id)}>取消任务</button>}
       <div className="task-log-terminal">
         <div className="task-log-title">
@@ -1058,6 +1110,7 @@ function ManagerConfigPanel({ values, onChange, saving, onSave }: { values: Conf
     <ConfigGroup title="批量注册"><div className="config-grid three"><ConfigField values={values} name="register_count" label="每批注册数量" type="number" min={1} max={10000} onChange={onChange} /><ConfigField values={values} name="register_threads" label="注册并发" type="number" min={1} max={10} onChange={onChange} /><ConfigField values={values} name="mint_workers" label="CPA Mint 并发" type="number" min={0} max={10} onChange={onChange} /></div></ConfigGroup>
     <ConfigGroup title="重新登录"><div className="config-grid two"><ConfigField values={values} name="login_workers" label="重新登录并发" type="number" min={1} max={10} onChange={onChange} /><ConfigField values={values} name="login_timeout_seconds" label="单账号超时（秒）" type="number" min={60} max={1800} onChange={onChange} /></div></ConfigGroup>
     <ConfigGroup title="巡检与导入"><div className="config-grid two"><ConfigField values={values} name="probe_timeout_seconds" label="巡检请求超时（秒）" type="number" min={3} max={120} onChange={onChange} /><ConfigField values={values} name="inspection_workers" label="巡检并发" type="number" min={1} max={32} onChange={onChange} /></div><div className="toggle-grid"><ConfigToggle values={values} name="live_probe" label="巡检时执行在线探测" onChange={onChange} /><ConfigToggle values={values} name="auto_import_on_start" label="启动时自动导入" onChange={onChange} /></div></ConfigGroup>
+    <ConfigGroup title="CPA 守护"><div className="config-grid two"><ConfigField values={values} name="cpa_guard_interval_seconds" label="守护轮询间隔（秒）" type="number" min={30} max={86400} onChange={onChange} /><ConfigField values={values} name="cpa_guard_lead_seconds" label="提前续期窗口（秒）" type="number" min={60} max={21600} onChange={onChange} /></div><div className="toggle-grid"><ConfigToggle values={values} name="cpa_guard_enabled" label="启动管理端时自动运行 CPA 守护" onChange={onChange} /></div><p className="config-hint">默认随 `run.py` / `ui` 后台启动。也可单独：`uv run --locked python run.py cpa-guard`。只处理 CPA 正常账号；refresh 失效会标记 CPA 过期，不会自动浏览器登录。</p></ConfigGroup>
   </ConfigPanel>;
 }
 

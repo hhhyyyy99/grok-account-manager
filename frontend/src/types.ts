@@ -47,6 +47,12 @@ export interface TaskLog {
   message: string;
 }
 
+export interface TaskFailure {
+  id: number;
+  email: string;
+  detail: string;
+}
+
 export interface Task {
   id: string;
   kind: string;
@@ -59,7 +65,13 @@ export interface Task {
   total: number;
   message: string;
   error: string;
-  result: Record<string, unknown>;
+  result: Record<string, unknown> & {
+    failures?: TaskFailure[];
+    failureTruncated?: boolean;
+    succeeded?: number;
+    failed?: number;
+    count?: number;
+  };
   cancelRequested: boolean;
   logs?: TaskLog[];
 }

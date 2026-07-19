@@ -408,6 +408,41 @@ class AccountStore:
             ).fetchall()
         return [int(row["id"]) for row in rows]
 
+    def ids_for_cpa_statuses(self, statuses: Sequence[str]) -> List[int]:
+        clean = [str(value) for value in statuses if str(value)]
+        if not clean:
+            return []
+        placeholders = ",".join("?" for _ in clean)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM accounts WHERE cpa_status IN (%s) ORDER BY id" % placeholders,
+                clean,
+            ).fetchall()
+        return [int(row["id"]) for row in rows]
+
+    def mark_cpa_expired(self, account_id: int, detail: str = "CPA 凭据已过期") -> None:
+        """Mark CPA (and overall status) expired without touching SSO fields."""
+        now = utc_now_iso()
+        text = str(detail or "CPA 凭据已过期")[:1000]
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE accounts
+                SET cpa_status = ?, cpa_detail = ?,
+                    status = ?, status_detail = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    AccountStatus.EXPIRED.value,
+                    text,
+                    AccountStatus.EXPIRED.value,
+                    text,
+                    now,
+                    int(account_id),
+                ),
+            )
+
     def set_status(self, account_ids: Sequence[int], status: str, detail: str = "") -> None:
         ids = [int(value) for value in account_ids]
         if not ids:
@@ -489,6 +524,50 @@ class AccountStore:
                     AccountStatus.UNKNOWN.value,
                     "登录后待巡检",
                     now,
+                    now,
+                    int(account_id),
+                ),
+            )
+
+    def apply_cpa_credentials(
+        self,
+        account_id: int,
+        access_token: str,
+        refresh_token: str,
+        expires_at: str,
+        auth_file: str = "",
+        detail: str = "CPA 凭据已续期",
+    ) -> None:
+        """Update CPA tokens only; leave SSO fields untouched."""
+        now = utc_now_iso()
+        account = self.get(account_id)
+        if account is None:
+            raise ValueError("CPA 续期对应的账号不存在")
+        access_token = str(access_token or "").strip()
+        refresh_token = str(refresh_token or "").strip()
+        if not access_token or not refresh_token:
+            raise ValueError("CPA 续期需要 access_token 与 refresh_token")
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE accounts
+                SET access_token = ?, refresh_token = ?, token_expires_at = ?,
+                    auth_file = CASE WHEN ? != '' THEN ? ELSE auth_file END,
+                    status = ?, status_detail = ?,
+                    cpa_status = ?, cpa_detail = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    self._encrypt_credential(account.email, "access_token", access_token),
+                    self._encrypt_credential(account.email, "refresh_token", refresh_token),
+                    expires_at.strip(),
+                    self._encrypt_credential(account.email, "auth_file", auth_file),
+                    self._encrypt_credential(account.email, "auth_file", auth_file),
+                    AccountStatus.UNKNOWN.value,
+                    detail[:1000],
+                    AccountStatus.UNKNOWN.value,
+                    "续期后待巡检",
                     now,
                     int(account_id),
                 ),

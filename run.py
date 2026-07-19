@@ -11,7 +11,18 @@ from typing import Iterable, List, Optional
 
 ROOT = Path(__file__).resolve().parent
 COMMANDS = frozenset(
-    ("ui", "list", "import", "inspect", "login", "reset-password", "register", "config", "delete")
+    (
+        "ui",
+        "list",
+        "import",
+        "inspect",
+        "login",
+        "reset-password",
+        "register",
+        "config",
+        "delete",
+        "cpa-guard",
+    )
 )
 REQUIRED_MODULES = ("DrissionPage", "curl_cffi", "requests")
 

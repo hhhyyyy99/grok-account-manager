@@ -483,6 +483,8 @@ button:active:not(:disabled), .button:active:not(:disabled) { transform: transla
 .react-status::before { width: 5px; height: 5px; border-radius: 50%; background: #99a199; content: ""; }
 .react-status.active, .react-status.succeeded { border-color: #cde1cb; background: var(--success-soft); color: var(--success); }
 .react-status.active::before, .react-status.succeeded::before { background: var(--success); }
+.react-status.partial, .react-status.limited, .react-status.checking { border-color: #e8d9b0; background: var(--warning-soft); color: var(--warning); }
+.react-status.partial::before, .react-status.limited::before, .react-status.checking::before { background: var(--warning); }
 .react-status.expired, .react-status.invalid, .react-status.error, .react-status.failed { border-color: #efd2cd; background: var(--danger-soft); color: var(--danger); }
 .react-status.expired::before, .react-status.invalid::before, .react-status.error::before, .react-status.failed::before { background: var(--danger); }
 .react-status.checking, .react-status.running { border-color: #ead9aa; background: var(--warning-soft); color: var(--warning); }
@@ -625,6 +627,65 @@ button:active:not(:disabled), .button:active:not(:disabled) { transform: transla
 .task-meta { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; margin: 25px 0; }
 .task-meta span { display: grid; min-width: 0; gap: 7px; border-left: 2px solid #dce2da; padding-left: 9px; color: #899189; font-size: 9px; }
 .task-meta strong { overflow: hidden; color: #414b43; font: 600 10px/1.3 "Noto Sans Mono", monospace; text-overflow: ellipsis; white-space: nowrap; }
+.task-result-summary {
+  display: flex;
+  gap: 16px;
+  margin: -8px 0 14px;
+  color: #6d766e;
+  font: 10px/1 "Noto Sans Mono", monospace;
+}
+.task-result-summary .ok strong { color: var(--success); }
+.task-result-summary .bad strong { color: var(--danger); }
+.task-failure-panel {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 16px;
+  border: 1px solid #efd2cd;
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: var(--danger-soft);
+}
+.task-failure-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--danger);
+  font-size: 11px;
+}
+.task-failure-title span { font: 10px/1 "Noto Sans Mono", monospace; opacity: .85; }
+.task-failure-list {
+  display: grid;
+  gap: 7px;
+  max-height: 180px;
+  overflow: auto;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.task-failure-list li {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  border-left: 2px solid #e4b7af;
+  padding-left: 8px;
+}
+.task-failure-list strong {
+  overflow: hidden;
+  color: #5b312c;
+  font: 600 11px/1.3 "Noto Sans Mono", monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.task-failure-list span {
+  overflow: hidden;
+  color: #7a4a44;
+  font-size: 10px;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.task-failure-note { margin: 0; color: #8a5a54; font-size: 10px; }
 .react-task-detail > .button { flex: 0 0 auto; align-self: flex-start; }
 .task-log-terminal {
   display: flex;
@@ -921,6 +982,7 @@ button:active:not(:disabled), .button:active:not(:disabled) { transform: transla
 .config-group { border-bottom: 1px solid #e8ece6; padding: 19px 18px 21px; }
 .config-group:last-of-type { border-bottom: 0; }
 .config-group h3 { margin: 0 0 13px; color: #3f4a41; font-size: 12px; font-weight: 710; }
+.config-hint { margin: 10px 0 0; color: #7a857c; font-size: 11px; line-height: 1.5; }
 .config-fields { min-width: 0; }
 .config-grid { display: grid; gap: 13px 12px; }
 .config-grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }

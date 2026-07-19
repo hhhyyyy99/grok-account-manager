@@ -322,6 +322,29 @@ def normalize_cookies(cookies: Any) -> list[dict[str, Any]]:
     return out
 
 
+def cookies_from_sso(sso: str) -> list[dict[str, Any]]:
+    """Build multi-domain sso/sso-rw cookie clones for device-auth inject."""
+    sso_val = str(sso or "").strip()
+    if sso_val.startswith("sso="):
+        sso_val = sso_val[4:].strip()
+    if not sso_val:
+        return []
+    cookies: list[dict[str, Any]] = []
+    for name in ("sso", "sso-rw"):
+        for domain in (".x.ai", "accounts.x.ai", ".accounts.x.ai", "auth.x.ai"):
+            cookies.append(
+                {
+                    "name": name,
+                    "value": sso_val,
+                    "domain": domain,
+                    "path": "/",
+                    "secure": True,
+                    "httpOnly": True,
+                }
+            )
+    return cookies
+
+
 def inject_cookies(page: Any, cookies: Any, log: LogFn | None = None) -> int:
     """Inject cookies into page/browser. Returns count attempted."""
     log = log or _noop_log
@@ -792,18 +815,21 @@ def approve_device_code(
     *,
     verification_uri_complete: str,
     email: str,
-    password: str,
+    password: str = "",
     user_code: str = "",
     timeout_sec: float = 240.0,
     stop_event: threading.Event | None = None,
     log: LogFn | None = None,
+    allow_passwordless: bool = False,
 ) -> None:
     log = log or _noop_log
     if page is None:
         raise BrowserConfirmError("page is None")
     email = (email or "").strip()
     password = password or ""
-    if not email or not password:
+    if not email:
+        raise BrowserConfirmError("email required")
+    if not password and not allow_passwordless:
         raise BrowserConfirmError("email/password required")
 
     if not user_code and "user_code=" in (verification_uri_complete or ""):
@@ -942,6 +968,8 @@ def approve_device_code(
 
         # Sign-in chooser
         if _click_email_login_chooser(page, log, text):
+            if allow_passwordless and not password:
+                raise BrowserConfirmError("SSO 会话不足，设备授权仍要求登录")
             _sleep(1.5)
             phase = "email"
             continue
@@ -950,6 +978,8 @@ def approve_device_code(
         if page.ele("css:input[type='email']", timeout=0.3) and not page.ele(
             PASSWORD_SELECTOR, timeout=0.2
         ):
+            if allow_passwordless and not password:
+                raise BrowserConfirmError("SSO 会话不足，设备授权仍要求登录")
             phase = "email"
             _fill(page, "css:input[type='email']", email, log, "email")
             if _click_exact(page, ["下一步", "Next", "Continue", "继续"], log, real=False):
@@ -958,6 +988,8 @@ def approve_device_code(
 
         # Password login
         if page.ele(PASSWORD_SELECTOR, timeout=0.3):
+            if allow_passwordless and not password:
+                raise BrowserConfirmError("SSO 会话不足，设备授权仍要求登录")
             phase = "password"
             if login_attempts >= 5:
                 # Only auto-reset when the page explicitly reports bad credentials.
@@ -1010,7 +1042,7 @@ def approve_device_code(
 def mint_with_browser(
     *,
     email: str,
-    password: str,
+    password: str = "",
     page: Any | None = None,
     proxy: str | None = None,
     headless: bool = False,
@@ -1021,12 +1053,15 @@ def mint_with_browser(
     cookies: Any | None = None,
     reuse_browser: bool = True,
     recycle_every: int = 15,
+    allow_passwordless: bool = False,
 ) -> dict[str, Any]:
     """Request device code, approve in browser, poll tokens.
 
     force_standalone=True (default): do not reuse the *register* tab.
     Mint workers may still reuse their *own* Chromium via reuse_browser.
     cookies: optional register-browser cookie list to skip re-login.
+    allow_passwordless: when True and cookies are injected, skip password gate;
+    still fails if the browser shows a sign-in form.
     """
     from .oauth_device import OAuthDeviceError, poll_device_token, request_device_code
     from .proxyutil import proxy_log_label, resolve_proxy, set_runtime_proxy
@@ -1123,6 +1158,7 @@ def mint_with_browser(
                 timeout_sec=browser_timeout_sec,
                 stop_event=stop_event,
                 log=log,
+                allow_passwordless=allow_passwordless,
             )
         except BrowserConfirmError as e:
             browser_error = e

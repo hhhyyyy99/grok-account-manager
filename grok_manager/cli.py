@@ -259,16 +259,60 @@ def command_delete(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_cpa_guard(args: argparse.Namespace) -> int:
+    manager = _manager()
+    interval = (
+        int(args.interval)
+        if args.interval is not None
+        else int(manager.config.cpa_guard_interval_seconds)
+    )
+    lead = (
+        int(args.lead)
+        if args.lead is not None
+        else int(manager.config.cpa_guard_lead_seconds)
+    )
+    once = bool(args.once)
+    stop = {"value": False}
+
+    def cancelled() -> bool:
+        return bool(stop["value"])
+
+    def log(message: str) -> None:
+        print("[cpa-guard] %s" % message, flush=True)
+
+    try:
+        manager.run_cpa_guard_loop(
+            interval_seconds=interval,
+            lead_seconds=lead,
+            once=once,
+            log=log,
+            cancelled=cancelled,
+        )
+    except KeyboardInterrupt:
+        stop["value"] = True
+        log("收到中断，正在退出")
+        return 130
+    return 0
+
+
 def command_ui(args: argparse.Namespace) -> int:
     from .web import GrokWebApplication
 
     application = GrokWebApplication(_manager())
+    cpa_guard: Optional[bool]
+    if bool(getattr(args, "no_cpa_guard", False)):
+        cpa_guard = False
+    elif bool(getattr(args, "cpa_guard", False)):
+        cpa_guard = True
+    else:
+        cpa_guard = None
     try:
         application.serve(
             host=getattr(args, "host", "127.0.0.1"),
             port=getattr(args, "port", 8787),
             open_browser=not getattr(args, "no_browser", False),
             allow_lan=bool(getattr(args, "lan", False)),
+            cpa_guard=cpa_guard,
         )
         return 0
     except (OSError, ValueError) as exc:
@@ -293,6 +337,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="允许局域网访问（默认绑定 0.0.0.0，并放宽 Host 校验）",
     )
     ui.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
+    ui.add_argument(
+        "--cpa-guard",
+        action="store_true",
+        help="强制随管理端启动 CPA 守护（覆盖配置关闭）",
+    )
+    ui.add_argument(
+        "--no-cpa-guard",
+        action="store_true",
+        help="不随管理端启动 CPA 守护（覆盖配置开启）",
+    )
     ui.set_defaults(handler=command_ui)
 
     listing = subparsers.add_parser("list", help="列出管理库账号")
@@ -339,6 +393,29 @@ def build_parser() -> argparse.ArgumentParser:
     delete = subparsers.add_parser("delete", help="仅从管理库删除账号")
     delete.add_argument("--ids", required=True)
     delete.set_defaults(handler=command_delete)
+
+    guard = subparsers.add_parser(
+        "cpa-guard",
+        help="CPA access_token 守护进程：临近过期时 silent refresh，refresh 失效则标记 CPA 过期",
+    )
+    guard.add_argument(
+        "--interval",
+        type=int,
+        default=None,
+        help="轮询间隔秒数（默认读取配置 cpa_guard_interval_seconds，通常 300）",
+    )
+    guard.add_argument(
+        "--lead",
+        type=int,
+        default=None,
+        help="提前续期秒数（默认读取配置 cpa_guard_lead_seconds，通常 1800）",
+    )
+    guard.add_argument(
+        "--once",
+        action="store_true",
+        help="只跑一轮后退出（方便 cron / 测试）",
+    )
+    guard.set_defaults(handler=command_cpa_guard)
     return parser
 
 

@@ -4,15 +4,17 @@ import shutil
 import sys
 from dataclasses import replace
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional, Sequence, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .config import ConfigStore, ManagerConfig
-from .inspection import InspectionService, TokenInspector
+from .inspection import InspectionService, TokenInspector, expiration_for
 from .login import BatchLoginService, LoginSettings
 from .password_reset import BatchPasswordResetService, PasswordResetSettings
 from .models import (
     Account,
     AccountStatus,
+    CpaRefreshResult,
     InspectionResult,
     LoginResult,
     PasswordResetResult,
@@ -683,5 +685,454 @@ class GrokManager:
             ]
         )
 
+    @staticmethod
+    def _refresh_failure_allows_sso_remint(detail: str) -> bool:
+        text = str(detail or "").lower()
+        markers = (
+            "invalid_grant",
+            "revoked",
+            "expired",
+            "invalid_token",
+            "缺少 refresh_token",
+        )
+        return any(marker in text for marker in markers)
+
+    def _silent_refresh_cpa_account(
+        self,
+        account: Account,
+        *,
+        proxy: str,
+        base_url: str,
+        timeout: float,
+        log,
+    ) -> CpaRefreshResult:
+        from grok_register.cpa_xai.oauth_device import OAuthDeviceError, refresh_access_token
+        from grok_register.cpa_xai.schema import build_cpa_xai_auth
+        from grok_register.cpa_xai.writer import write_cpa_xai_auth
+
+        refresh_token = str(account.refresh_token or "").strip()
+        if not refresh_token:
+            return CpaRefreshResult(
+                account.id,
+                account.email,
+                False,
+                "缺少 refresh_token",
+            )
+        try:
+            token = refresh_access_token(
+                refresh_token,
+                timeout=timeout,
+                proxy=proxy or None,
+            )
+            payload = build_cpa_xai_auth(
+                email=account.email,
+                access_token=token.access_token,
+                refresh_token=token.refresh_token,
+                id_token=token.id_token,
+                expires_in=token.expires_in,
+                base_url=base_url,
+            )
+            auth_path = write_cpa_xai_auth(
+                self.reference.managed_auth_dir,
+                payload,
+            )
+            self.store.apply_cpa_credentials(
+                account.id,
+                token.access_token,
+                token.refresh_token,
+                str(payload.get("expired") or ""),
+                str(auth_path),
+                detail="CPA 凭据已续期",
+            )
+            detail = "CPA 凭据已续期"
+            try:
+                hotload_path = self.reference.sync_cpa_hotload(auth_path)
+            except Exception as exc:
+                note = "CPA hotload 未同步: %s" % exc
+                detail = "%s；%s" % (detail, note)
+                log("[%s] %s" % (account.email, note))
+            else:
+                if hotload_path is not None:
+                    log("[%s] CPA hotload 已更新: %s" % (account.email, hotload_path))
+            log("[%s] CPA silent refresh 成功" % account.email)
+            return CpaRefreshResult(
+                account.id,
+                account.email,
+                True,
+                detail,
+                auth_file=str(auth_path),
+            )
+        except OAuthDeviceError as exc:
+            return CpaRefreshResult(
+                account.id,
+                account.email,
+                False,
+                "CPA 续期失败: %s" % exc,
+            )
+        except Exception as exc:
+            return CpaRefreshResult(
+                account.id,
+                account.email,
+                False,
+                "CPA 续期异常: %s" % exc,
+            )
+
+    def _sync_cpa_hotload_for_result(
+        self,
+        result: CpaRefreshResult,
+        log,
+    ) -> CpaRefreshResult:
+        if not result.ok or not result.auth_file:
+            return result
+        try:
+            hotload_path = self.reference.sync_cpa_hotload(result.auth_file)
+        except Exception as exc:
+            note = "CPA hotload 未同步: %s" % exc
+            log("[%s] %s" % (result.email, note))
+            return replace(result, detail="%s；%s" % (result.detail, note))
+        if hotload_path is not None:
+            log("[%s] CPA hotload 已更新: %s" % (result.email, hotload_path))
+        return result
+
+    def batch_refresh_cpa(
+        self,
+        account_ids: Iterable[int],
+        log=None,
+        progress=None,
+        cancelled=None,
+    ) -> List[CpaRefreshResult]:
+        """Renew CPA tokens: silent refresh first, then SSO device remint."""
+        from grok_register.cpa_xai.schema import DEFAULT_BASE_URL
+
+        log = log or (lambda _message: None)
+        ids = [int(account_id) for account_id in account_ids]
+        accounts = self.store.get_many(ids)
+        by_id = {account.id: account for account in accounts}
+        registration_config = self.reference.load_registration_config()
+        proxy = str(
+            registration_config.get("cpa_proxy") or registration_config.get("proxy") or ""
+        ).strip()
+        base_url = str(
+            registration_config.get("cpa_base_url") or DEFAULT_BASE_URL
+        ).strip() or DEFAULT_BASE_URL
+        timeout = float(self.config.probe_timeout_seconds or 30)
+        results_by_id: Dict[int, CpaRefreshResult] = {}
+        remint_ids: List[int] = []
+        total = len(ids)
+        completed = 0
+
+        for account_id in ids:
+            if cancelled and cancelled():
+                break
+            account = by_id.get(account_id)
+            if account is None:
+                result = CpaRefreshResult(account_id, "", False, "账号不存在")
+                results_by_id[account_id] = result
+                completed += 1
+                if progress:
+                    progress(result, completed, total)
+                continue
+
+            silent = self._silent_refresh_cpa_account(
+                account,
+                proxy=proxy,
+                base_url=base_url,
+                timeout=timeout,
+                log=log,
+            )
+            if silent.ok:
+                results_by_id[account.id] = silent
+                completed += 1
+                if progress:
+                    progress(silent, completed, total)
+                continue
+
+            sso_token = str(account.sso_token or "").strip()
+            if sso_token and self._refresh_failure_allows_sso_remint(silent.detail):
+                log(
+                    "[%s] silent refresh 不可用（%s），改用 SSO 重新签发 CPA"
+                    % (account.email, silent.detail)
+                )
+                remint_ids.append(account.id)
+                continue
+
+            if not sso_token:
+                detail = "%s；缺少可用 SSO，请改用批量登录" % silent.detail
+            else:
+                detail = "%s；请改用批量登录" % silent.detail
+            result = CpaRefreshResult(account.id, account.email, False, detail)
+            self.store.set_status(
+                [account.id],
+                AccountStatus.NEEDS_LOGIN.value
+                if account.has_login_credentials
+                else AccountStatus.EXPIRED.value,
+                detail,
+            )
+            results_by_id[account.id] = result
+            completed += 1
+            log("[%s] %s" % (account.email, detail))
+            if progress:
+                progress(result, completed, total)
+
+        if remint_ids and not (cancelled and cancelled()):
+            settings = LoginSettings(
+                workers=self.config.login_workers,
+                timeout_seconds=self.config.login_timeout_seconds,
+                proxy=proxy,
+                headless=bool(registration_config.get("cpa_headless", False)),
+                base_url=base_url,
+                probe_after_login=False,
+            )
+            log("开始通过 SSO 重新签发 %s 个账号的 CPA 凭据" % len(remint_ids))
+
+            def remint_progress(result: CpaRefreshResult, _done: int, _total: int):
+                nonlocal completed
+                final = self._sync_cpa_hotload_for_result(result, log)
+                results_by_id[result.account_id] = final
+                completed += 1
+                if progress:
+                    progress(final, completed, total)
+                return final
+
+            remint_results = self.login.remint_cpa_via_sso(
+                remint_ids,
+                settings,
+                log=log,
+                progress=remint_progress,
+            )
+            for result in remint_results:
+                if result.account_id in results_by_id:
+                    continue
+                final = self._sync_cpa_hotload_for_result(result, log)
+                results_by_id[result.account_id] = final
+
+        results = [
+            results_by_id[account_id]
+            for account_id in ids
+            if account_id in results_by_id
+        ]
+        refreshed_ids = [
+            result.account_id for result in results if result.ok and result.account_id
+        ]
+        if refreshed_ids:
+            log("CPA 续期完成，开始复核 %s 个账号" % len(refreshed_ids))
+            reviews = self.inspect_accounts(
+                refreshed_ids,
+                live=self.config.live_probe,
+            )
+            reviews_by_id = {review.account_id: review for review in reviews}
+            reviewed: List[CpaRefreshResult] = []
+            for result in results:
+                review = reviews_by_id.get(result.account_id)
+                if review is None:
+                    reviewed.append(result)
+                    continue
+                summary = "复核 SSO=%s，CPA=%s" % (
+                    status_label(review.sso_status),
+                    status_label(review.cpa_status),
+                )
+                log(
+                    "[%s] 复核完成: SSO=%s，CPA=%s"
+                    % (
+                        result.email,
+                        status_label(review.sso_status),
+                        status_label(review.cpa_status),
+                    )
+                )
+                reviewed.append(
+                    replace(result, detail="%s；%s" % (result.detail, summary))
+                )
+            results = reviewed
+        return results
+
     def diagnostics(self) -> List[Tuple[bool, str]]:
         return self.reference.diagnostics(self.python_executable)
+
+    def active_cpa_account_ids(self) -> List[int]:
+        return self.store.ids_for_cpa_statuses([AccountStatus.ACTIVE.value])
+
+    def cpa_accounts_needing_refresh(
+        self,
+        *,
+        lead_seconds: Optional[int] = None,
+        account_ids: Optional[Iterable[int]] = None,
+    ) -> List[Account]:
+        """CPA-active accounts whose access token is missing or within the lead window."""
+        lead = (
+            int(lead_seconds)
+            if lead_seconds is not None
+            else int(self.config.cpa_guard_lead_seconds)
+        )
+        lead = max(0, lead)
+        now = datetime.now(timezone.utc)
+        deadline = now + timedelta(seconds=lead)
+        if account_ids is None:
+            ids = self.active_cpa_account_ids()
+        else:
+            ids = [int(value) for value in account_ids]
+        accounts = self.store.get_many(ids)
+        selected: List[Account] = []
+        for account in accounts:
+            if account.cpa_status != AccountStatus.ACTIVE.value:
+                continue
+            if not str(account.access_token or "").strip() and not str(
+                account.refresh_token or ""
+            ).strip():
+                continue
+            expires_at = expiration_for(account)
+            if expires_at is None or expires_at <= deadline:
+                selected.append(account)
+        return selected
+
+    def guard_cpa_tokens(
+        self,
+        *,
+        lead_seconds: Optional[int] = None,
+        account_ids: Optional[Iterable[int]] = None,
+        log=None,
+        progress=None,
+        cancelled=None,
+        reinspect: bool = True,
+    ) -> List[CpaRefreshResult]:
+        """Keep CPA-active accounts fresh via silent refresh only (no browser remint).
+
+        - Only accounts with cpa_status=active are considered.
+        - access_token within lead window (or already past / unparseable) → refresh_token.
+        - refresh failure / missing refresh → mark CPA expired.
+        """
+        from grok_register.cpa_xai.schema import DEFAULT_BASE_URL
+
+        log = log or (lambda _message: None)
+        candidates = self.cpa_accounts_needing_refresh(
+            lead_seconds=lead_seconds,
+            account_ids=account_ids,
+        )
+        if not candidates:
+            log("CPA 守护：没有需要续期的 active CPA 账号")
+            return []
+
+        registration_config = self.reference.load_registration_config()
+        proxy = str(
+            registration_config.get("cpa_proxy") or registration_config.get("proxy") or ""
+        ).strip()
+        base_url = str(
+            registration_config.get("cpa_base_url") or DEFAULT_BASE_URL
+        ).strip() or DEFAULT_BASE_URL
+        timeout = float(self.config.probe_timeout_seconds or 30)
+        results: List[CpaRefreshResult] = []
+        total = len(candidates)
+        log(
+            "CPA 守护：%s 个 active CPA 账号进入 silent refresh（提前 %ss）"
+            % (
+                total,
+                int(lead_seconds if lead_seconds is not None else self.config.cpa_guard_lead_seconds),
+            )
+        )
+
+        for index, account in enumerate(candidates, start=1):
+            if cancelled and cancelled():
+                break
+            expires_at = expiration_for(account)
+            log(
+                "[%s] access 到期 %s，开始 silent refresh"
+                % (account.email, expires_at.isoformat() if expires_at else "未知")
+            )
+            silent = self._silent_refresh_cpa_account(
+                account,
+                proxy=proxy,
+                base_url=base_url,
+                timeout=timeout,
+                log=log,
+            )
+            if silent.ok:
+                results.append(silent)
+                if progress:
+                    progress(silent, index, total)
+                continue
+
+            detail = "CPA 凭据已过期: %s" % silent.detail
+            self.store.mark_cpa_expired(account.id, detail)
+            result = CpaRefreshResult(account.id, account.email, False, detail)
+            results.append(result)
+            log("[%s] %s" % (account.email, detail))
+            if progress:
+                progress(result, index, total)
+
+        refreshed_ids = [
+            result.account_id for result in results if result.ok and result.account_id
+        ]
+        if reinspect and refreshed_ids:
+            log("CPA 守护：续期成功 %s 个，开始复核" % len(refreshed_ids))
+            reviews = self.inspect_accounts(
+                refreshed_ids,
+                live=self.config.live_probe,
+            )
+            reviews_by_id = {review.account_id: review for review in reviews}
+            reviewed: List[CpaRefreshResult] = []
+            for result in results:
+                review = reviews_by_id.get(result.account_id)
+                if review is None:
+                    reviewed.append(result)
+                    continue
+                summary = "复核 SSO=%s，CPA=%s" % (
+                    status_label(review.sso_status),
+                    status_label(review.cpa_status),
+                )
+                reviewed.append(
+                    replace(result, detail="%s；%s" % (result.detail, summary))
+                )
+            results = reviewed
+        return results
+
+    def run_cpa_guard_loop(
+        self,
+        *,
+        interval_seconds: Optional[int] = None,
+        lead_seconds: Optional[int] = None,
+        once: bool = False,
+        log=None,
+        cancelled=None,
+    ) -> None:
+        """Daemon loop: periodically silent-refresh soon-to-expire active CPA tokens."""
+        import time
+
+        log = log or (lambda _message: None)
+        interval = (
+            int(interval_seconds)
+            if interval_seconds is not None
+            else int(self.config.cpa_guard_interval_seconds)
+        )
+        interval = max(30, interval)
+        lead = (
+            int(lead_seconds)
+            if lead_seconds is not None
+            else int(self.config.cpa_guard_lead_seconds)
+        )
+        log(
+            "CPA 守护进程启动：interval=%ss lead=%ss once=%s"
+            % (interval, lead, once)
+        )
+        while True:
+            if cancelled and cancelled():
+                log("CPA 守护进程已停止")
+                return
+            try:
+                results = self.guard_cpa_tokens(
+                    lead_seconds=lead,
+                    log=log,
+                    cancelled=cancelled,
+                )
+                ok = sum(1 for item in results if item.ok)
+                failed = len(results) - ok
+                log("CPA 守护本轮完成：处理 %s，成功 %s，标记过期 %s" % (len(results), ok, failed))
+            except Exception as exc:
+                log("CPA 守护本轮异常: %s" % exc)
+            if once:
+                return
+            # Interruptible sleep.
+            deadline = time.time() + interval
+            while time.time() < deadline:
+                if cancelled and cancelled():
+                    log("CPA 守护进程已停止")
+                    return
+                time.sleep(min(1.0, max(0.0, deadline - time.time())))

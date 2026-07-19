@@ -22,39 +22,133 @@ from .service import GrokManager
 
 
 ASSET_DIR = Path(__file__).resolve().parent / "web_assets"
-TERMINAL_STATES = {"succeeded", "failed", "cancelled"}
+TERMINAL_STATES = {"succeeded", "partial", "failed", "cancelled"}
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 WILDCARD_HOSTS = frozenset({"0.0.0.0", "::", "[::]"})
 
 
-def task_result_failed(result: Dict[str, Any]) -> bool:
+def _result_success_failure_counts(result: Dict[str, Any]) -> tuple[Optional[int], Optional[int]]:
+    """Best-effort (succeeded, failed) extraction from a task result payload."""
     if not isinstance(result, dict):
-        return False
+        return None, None
     if result.get("ok") is False:
-        return True
-    failed = result.get("failed")
-    if isinstance(failed, (int, float)) and failed > 0:
-        return True
-    failed_count = result.get("failedCount")
-    if isinstance(failed_count, (int, float)) and failed_count > 0:
-        return True
+        return 0, 1
+
+    succeeded: Optional[int] = None
+    failed: Optional[int] = None
+
+    raw_succeeded = result.get("succeeded")
+    raw_failed = result.get("failed")
+    if isinstance(raw_succeeded, (int, float)):
+        succeeded = max(0, int(raw_succeeded))
+    if isinstance(raw_failed, (int, float)):
+        failed = max(0, int(raw_failed))
+
+    raw_failed_count = result.get("failedCount")
+    if failed is None and isinstance(raw_failed_count, (int, float)):
+        failed = max(0, int(raw_failed_count))
+
     reset_count = result.get("resetCount")
     reset_succeeded = result.get("resetSucceeded")
-    if (
-        isinstance(reset_count, (int, float))
-        and isinstance(reset_succeeded, (int, float))
-        and reset_count > reset_succeeded
-    ):
-        return True
     login_count = result.get("loginCount")
     login_succeeded = result.get("loginSucceeded")
     if (
+        isinstance(reset_count, (int, float))
+        and isinstance(reset_succeeded, (int, float))
+    ):
+        reset_failed = max(0, int(reset_count) - int(reset_succeeded))
+        login_failed = 0
+        login_ok = 0
+        if isinstance(login_count, (int, float)) and isinstance(login_succeeded, (int, float)):
+            login_failed = max(0, int(login_count) - int(login_succeeded))
+            login_ok = max(0, int(login_succeeded))
+        # Treat a fully successful reset+login path as success units.
+        path_succeeded = max(0, int(reset_succeeded) if not login_count else login_ok)
+        path_failed = reset_failed + login_failed
+        succeeded = path_succeeded if succeeded is None else succeeded
+        failed = path_failed if failed is None else failed
+    elif (
         isinstance(login_count, (int, float))
         and isinstance(login_succeeded, (int, float))
-        and login_count > login_succeeded
     ):
-        return True
-    return False
+        login_failed = max(0, int(login_count) - int(login_succeeded))
+        if succeeded is None:
+            succeeded = max(0, int(login_succeeded))
+        if failed is None:
+            failed = login_failed
+
+    return succeeded, failed
+
+
+def task_result_outcome(result: Dict[str, Any]) -> str:
+    """Classify finished batch work: succeeded | partial | failed."""
+    succeeded, failed = _result_success_failure_counts(result)
+    if succeeded is None and failed is None:
+        return "succeeded"
+    success_count = int(succeeded or 0)
+    failure_count = int(failed or 0)
+    if failure_count <= 0:
+        return "succeeded"
+    if success_count > 0:
+        return "partial"
+    return "failed"
+
+
+def task_result_failed(result: Dict[str, Any]) -> bool:
+    """True when the task has any account-level failure (partial or total)."""
+    return task_result_outcome(result) in {"partial", "failed"}
+
+
+def summarize_account_results(
+    results: List[Any],
+    *,
+    action_label: str,
+    max_failures: int = 200,
+) -> Dict[str, Any]:
+    """Build a task result payload with explicit failure account details."""
+    items = list(results or [])
+    succeeded_items = [item for item in items if bool(getattr(item, "ok", False))]
+    failed_items = [item for item in items if not bool(getattr(item, "ok", False))]
+    failures: List[Dict[str, Any]] = []
+    for item in failed_items[: max(0, int(max_failures))]:
+        failures.append(
+            {
+                "id": int(getattr(item, "account_id", 0) or 0),
+                "email": safe_visible(getattr(item, "email", "")),
+                "detail": safe_visible(getattr(item, "detail", ""))[:400],
+            }
+        )
+    succeeded = len(succeeded_items)
+    failed = len(failed_items)
+    message = "%s完成，成功 %s，失败 %s" % (action_label, succeeded, failed)
+    if failures:
+        preview = "、".join(
+            item["email"] or ("#%s" % item["id"]) for item in failures[:3]
+        )
+        if preview:
+            extra = "等 %s 个" % failed if failed > 3 else ""
+            message = "%s；失败账号：%s%s" % (message, preview, extra)
+    return {
+        "count": len(items),
+        "succeeded": succeeded,
+        "failed": failed,
+        "failures": failures,
+        "failureTruncated": failed > len(failures),
+        "message": message,
+    }
+
+
+def log_account_failures(task: "TaskRecord", failures: List[Dict[str, Any]], *, truncated: bool = False) -> None:
+    if not failures:
+        return
+    task.log("失败账号明细（%s）:" % len(failures))
+    for item in failures:
+        account_id = item.get("id") or "?"
+        email = item.get("email") or ("#%s" % account_id)
+        detail = item.get("detail") or "失败"
+        task.log("  - %s: %s" % (email, detail))
+    if truncated:
+        task.log("  … 失败列表已截断，仅展示前 %s 条" % len(failures))
 
 
 def now_iso() -> str:
@@ -211,12 +305,21 @@ class TaskRegistry:
                 if task.cancel_requested:
                     task.state = "cancelled"
                     task.message = "任务已取消"
-                elif task_result_failed(result):
-                    task.state = "failed"
-                    task.message = safe_visible(result.get("message") or "任务完成但存在失败")
                 else:
-                    task.state = "succeeded"
-                    task.message = safe_visible(result.get("message") or "任务完成")
+                    outcome = task_result_outcome(result)
+                    task.state = outcome
+                    if outcome == "partial":
+                        task.message = safe_visible(
+                            result.get("message") or "任务完成，部分账号失败"
+                        )
+                    elif outcome == "failed":
+                        task.message = safe_visible(
+                            result.get("message") or "任务失败"
+                        )
+                    else:
+                        task.message = safe_visible(
+                            result.get("message") or "任务完成"
+                        )
             except Exception as exc:
                 if task.cancel_requested:
                     task.state = "cancelled"
@@ -254,11 +357,51 @@ class GrokWebApplication:
         self.tasks = TaskRegistry()
         self.csrf_token = secrets.token_urlsafe(32)
         self._server: Optional[ThreadingHTTPServer] = None
+        self._cpa_guard_stop = threading.Event()
+        self._cpa_guard_thread: Optional[threading.Thread] = None
         if self.manager.config.auto_import_on_start:
             try:
                 self.start_import({})
             except RuntimeError:
                 pass
+
+    def start_cpa_guard(self, *, force: bool = False) -> bool:
+        """Start background CPA silent-refresh loop. Returns True if started."""
+        if self._cpa_guard_thread is not None and self._cpa_guard_thread.is_alive():
+            return False
+        if not force and not bool(self.manager.config.cpa_guard_enabled):
+            return False
+        self._cpa_guard_stop.clear()
+
+        def worker() -> None:
+            def log(message: str) -> None:
+                print("[cpa-guard] %s" % message, flush=True)
+
+            try:
+                self.manager.run_cpa_guard_loop(
+                    interval_seconds=int(self.manager.config.cpa_guard_interval_seconds),
+                    lead_seconds=int(self.manager.config.cpa_guard_lead_seconds),
+                    once=False,
+                    log=log,
+                    cancelled=self._cpa_guard_stop.is_set,
+                )
+            except Exception as exc:
+                print("[cpa-guard] 守护线程异常退出: %s" % exc, flush=True)
+
+        self._cpa_guard_thread = threading.Thread(
+            target=worker,
+            name="cpa-guard",
+            daemon=True,
+        )
+        self._cpa_guard_thread.start()
+        return True
+
+    def stop_cpa_guard(self, timeout: float = 5.0) -> None:
+        self._cpa_guard_stop.set()
+        thread = self._cpa_guard_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=max(0.1, float(timeout)))
+        self._cpa_guard_thread = None
 
     @staticmethod
     def account_json(account: Account) -> Dict[str, Any]:
@@ -471,16 +614,48 @@ class GrokWebApplication:
                 task.progress(completed, total, "%s: %s" % (result.email, result.detail))
 
             results = self.manager.batch_login(ids, log=task.log, progress=progress)
-            succeeded = sum(1 for result in results if result.ok)
-            failed = len(results) - succeeded
-            return {
-                "count": len(results),
-                "succeeded": succeeded,
-                "failed": failed,
-                "message": "登录完成，成功 %s，失败 %s" % (succeeded, failed),
-            }
+            summary = summarize_account_results(results, action_label="登录")
+            log_account_failures(
+                task,
+                summary["failures"],
+                truncated=bool(summary.get("failureTruncated")),
+            )
+            return summary
 
         return self.tasks.start("login", "批量登录", worker, exclusive_group="browser-automation")
+
+    def start_cpa_refresh(self, payload: Dict[str, Any]) -> TaskRecord:
+        ids = self._ids(payload)
+        if not ids:
+            raise ValueError("没有待续期的 CPA 账号")
+
+        def worker(task: TaskRecord) -> Dict[str, Any]:
+            task.log("开始 CPA 续期 %s 个账号" % len(ids))
+
+            def progress(result, completed, total):
+                task.progress(completed, total, "%s: %s" % (result.email, result.detail))
+                task.log("#%s %s: %s" % (result.account_id, result.email, result.detail))
+
+            results = self.manager.batch_refresh_cpa(
+                ids,
+                log=task.log,
+                progress=progress,
+                cancelled=lambda: task.cancel_requested,
+            )
+            summary = summarize_account_results(results, action_label="CPA 续期")
+            log_account_failures(
+                task,
+                summary["failures"],
+                truncated=bool(summary.get("failureTruncated")),
+            )
+            return summary
+
+        return self.tasks.start(
+            "refresh-cpa",
+            "CPA 续期",
+            worker,
+            exclusive_group="cpa-refresh",
+        )
 
     def start_password_reset(self, payload: Dict[str, Any]) -> TaskRecord:
         ids = self._ids(payload)
@@ -519,13 +694,46 @@ class GrokWebApplication:
                 )
             reset_succeeded = sum(1 for result in reset_results if result.ok)
             login_succeeded = sum(1 for result in login_results if result.ok)
+            reset_failures = [
+                {
+                    "id": int(result.account_id),
+                    "email": safe_visible(result.email),
+                    "detail": safe_visible("重置失败: %s" % result.detail)[:400],
+                }
+                for result in reset_results
+                if not result.ok
+            ]
+            login_failures = [
+                {
+                    "id": int(result.account_id),
+                    "email": safe_visible(result.email),
+                    "detail": safe_visible("重置后登录失败: %s" % result.detail)[:400],
+                }
+                for result in login_results
+                if not result.ok
+            ]
+            failures = (reset_failures + login_failures)[:200]
+            message = "密码重置 %s 个，自动登录成功 %s 个" % (
+                reset_succeeded,
+                login_succeeded,
+            )
+            if failures:
+                preview = "、".join(
+                    item["email"] or ("#%s" % item["id"]) for item in failures[:3]
+                )
+                if preview:
+                    extra = "等 %s 个" % len(failures) if len(failures) > 3 else ""
+                    message = "%s；失败账号：%s%s" % (message, preview, extra)
+            log_account_failures(task, failures, truncated=len(reset_failures) + len(login_failures) > len(failures))
             return {
                 "resetCount": len(reset_results),
                 "resetSucceeded": reset_succeeded,
                 "loginCount": len(login_results),
                 "loginSucceeded": login_succeeded,
-                "message": "密码重置 %s 个，自动登录成功 %s 个"
-                % (reset_succeeded, login_succeeded),
+                "failed": len(failures),
+                "failures": failures,
+                "failureTruncated": (len(reset_failures) + len(login_failures)) > len(failures),
+                "message": message,
             }
 
         return self.tasks.start("reset-password", "重置密码并重新登录", worker, exclusive_group="browser-automation")
@@ -576,7 +784,7 @@ class GrokWebApplication:
             raise KeyError("任务不存在")
         if task.state in TERMINAL_STATES:
             return task
-        if task.kind not in ("register", "login", "reset-password", "inspect"):
+        if task.kind not in ("register", "login", "reset-password", "inspect", "refresh-cpa"):
             raise RuntimeError("该任务不支持中途取消")
         task.cancel_requested = True
         if task.kind == "register":
@@ -588,6 +796,10 @@ class GrokWebApplication:
             self.manager.password_reset.cancel()
         elif task.kind == "inspect":
             task.message = "正在停止巡检"
+        elif task.kind == "refresh-cpa":
+            # May fall back to browser SSO remint via the login worker.
+            self.manager.login.cancel()
+            task.message = "正在停止 CPA 续期"
         task.log("已请求取消任务")
         return task
 
@@ -613,6 +825,7 @@ class GrokWebApplication:
         port: int = 8787,
         open_browser: bool = True,
         allow_lan: bool = False,
+        cpa_guard: Optional[bool] = None,
     ) -> None:
         bind_host = normalize_bind_host(host)
         if not allow_lan and not is_loopback_host(bind_host):
@@ -622,6 +835,11 @@ class GrokWebApplication:
         if allow_lan and is_loopback_host(bind_host):
             bind_host = "0.0.0.0"
         application = self
+        enable_guard = (
+            bool(self.manager.config.cpa_guard_enabled)
+            if cpa_guard is None
+            else bool(cpa_guard)
+        )
 
         class Handler(BaseHTTPRequestHandler):
             server_version = "GrokManager/0.1"
@@ -793,6 +1011,11 @@ class GrokWebApplication:
                         self._json({"task": application.start_password_reset(payload).serialize(False)}, 202)
                     elif parsed.path == "/api/login":
                         self._json({"task": application.start_login(payload).serialize(False)}, 202)
+                    elif parsed.path == "/api/refresh-cpa":
+                        self._json(
+                            {"task": application.start_cpa_refresh(payload).serialize(False)},
+                            202,
+                        )
                     elif parsed.path == "/api/register":
                         self._json({"task": application.start_registration(payload).serialize(False)}, 202)
                     elif parsed.path == "/api/diagnostics":
@@ -855,9 +1078,24 @@ class GrokWebApplication:
             print("Grok Account Manager: %s" % browser_url, flush=True)
         if open_browser:
             threading.Timer(0.4, lambda: webbrowser.open(browser_url)).start()
+        if enable_guard:
+            if self.start_cpa_guard(force=True):
+                print(
+                    "CPA 守护已随管理端启动（interval=%ss lead=%ss）"
+                    % (
+                        self.manager.config.cpa_guard_interval_seconds,
+                        self.manager.config.cpa_guard_lead_seconds,
+                    ),
+                    flush=True,
+                )
+            else:
+                print("CPA 守护未能启动（可能已在运行）", flush=True)
+        else:
+            print("CPA 守护未启用（配置关闭或传入 --no-cpa-guard）", flush=True)
         try:
             server.serve_forever(poll_interval=0.25)
         except KeyboardInterrupt:
             pass
         finally:
+            self.stop_cpa_guard()
             server.server_close()

@@ -140,6 +140,27 @@ def request_device_code(
     )
 
 
+def _token_result_from_body(
+    body: dict[str, Any],
+    *,
+    fallback_refresh_token: str = "",
+) -> TokenResult:
+    access = str(body.get("access_token") or "").strip()
+    if not access:
+        raise OAuthDeviceError(f"token response missing access_token: {body}")
+    refresh = str(body.get("refresh_token") or fallback_refresh_token or "").strip()
+    if not refresh:
+        raise OAuthDeviceError("token response missing refresh_token")
+    return TokenResult(
+        access_token=access,
+        refresh_token=refresh,
+        id_token=(str(body["id_token"]).strip() if body.get("id_token") else None),
+        token_type=str(body.get("token_type") or "Bearer"),
+        expires_in=int(body.get("expires_in") or 21600),
+        raw=body,
+    )
+
+
 def poll_device_token(
     device_code: str,
     *,
@@ -174,18 +195,7 @@ def poll_device_token(
             time.sleep(sleep_for)
             continue
         if status == 200 and isinstance(body, dict) and body.get("access_token"):
-            access = str(body["access_token"]).strip()
-            refresh = str(body.get("refresh_token") or "").strip()
-            if not refresh:
-                raise OAuthDeviceError("token response missing refresh_token")
-            return TokenResult(
-                access_token=access,
-                refresh_token=refresh,
-                id_token=(str(body["id_token"]).strip() if body.get("id_token") else None),
-                token_type=str(body.get("token_type") or "Bearer"),
-                expires_in=int(body.get("expires_in") or 21600),
-                raw=body,
-            )
+            return _token_result_from_body(body)
         err = ""
         desc = ""
         if isinstance(body, dict):
@@ -204,3 +214,42 @@ def poll_device_token(
         log(f"oauth poll unexpected HTTP {status}: {body!r}")
         time.sleep(sleep_for)
     raise OAuthDeviceError("device auth timed out waiting for user approval")
+
+
+def refresh_access_token(
+    refresh_token: str,
+    *,
+    client_id: str = CLIENT_ID,
+    timeout: float = 30.0,
+    proxy: str | None = None,
+) -> TokenResult:
+    """Exchange a refresh_token for a new access_token (and possibly rotated refresh)."""
+    refresh_token = (refresh_token or "").strip()
+    if not refresh_token:
+        raise OAuthDeviceError("refresh_token is required")
+    try:
+        status, body = _post_form(
+            TOKEN_URL,
+            {
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": client_id,
+            },
+            timeout=timeout,
+            proxy=proxy,
+        )
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise OAuthDeviceError(f"refresh token network error: {type(e).__name__}: {e}") from e
+    if status == 200 and isinstance(body, dict):
+        return _token_result_from_body(body, fallback_refresh_token=refresh_token)
+    err = ""
+    desc = ""
+    if isinstance(body, dict):
+        err = str(body.get("error") or "")
+        desc = str(body.get("error_description") or "")
+    if err or status >= 400:
+        raise OAuthDeviceError(
+            f"refresh token failed HTTP {status}: {err or body}"
+            + (f": {desc}" if desc else "")
+        )
+    raise OAuthDeviceError(f"refresh token unexpected response HTTP {status}: {body!r}")

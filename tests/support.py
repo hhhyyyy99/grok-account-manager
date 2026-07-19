@@ -42,6 +42,7 @@ def make_manager(root: Path) -> GrokManager:
         config_example_file=registration_config_example,
         output_dir=root / "registration-output",
         data_root=root,
+        managed_auth_dir=root / "auths",
     )
     return GrokManager(
         config_store=config_store,
