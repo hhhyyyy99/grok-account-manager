@@ -62,7 +62,18 @@ cd grok-account-manager
 uv run --locked python run.py
 ```
 
-首次启动会要求创建至少 12 个字符的主密码，后续每次启动需要先解锁凭据保险库。主密码不会落盘；忘记主密码后无法恢复已加密凭据。
+账号密码和 token 存放在本地凭据保险库中，需要主密码解锁。推荐把主密码写到环境变量，避免每次启动交互输入：
+
+```bash
+# 方式一：导出到当前 shell
+export GROK_MANAGER_VAULT_PASSWORD='your-vault-password'
+
+# 方式二：项目根目录 .env（已 gitignore，勿提交）
+cp .env.example .env
+# 编辑 .env，填入 GROK_MANAGER_VAULT_PASSWORD=...
+```
+
+未设置 `GROK_MANAGER_VAULT_PASSWORD` 时仍会交互询问。首次启动若没有环境变量，会要求创建至少 12 个字符的主密码；若已设置环境变量，则直接用它初始化或解锁。主密码本身不会写入保险库文件；忘记主密码后无法恢复已加密凭据。
 
 启动后会打开 `http://127.0.0.1:8787`。不自动打开浏览器、更换端口或开放局域网访问时直接传参数，不需要再写 `ui`：
 

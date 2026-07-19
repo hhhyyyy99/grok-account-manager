@@ -3,32 +3,71 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import os
 import sys
 from dataclasses import asdict
 from pathlib import Path
 from typing import Iterable, List, Optional
 
 from .models import Account, STATUS_LABELS
-from .paths import VAULT_FILE
+from .paths import PROJECT_ROOT, VAULT_FILE
 from .reference import RegistrationRequest
 from .service import GrokManager
 from .vault import CredentialVault, VaultError
 
 
 _CURRENT_VAULT: Optional[CredentialVault] = None
+VAULT_PASSWORD_ENV = "GROK_MANAGER_VAULT_PASSWORD"
+
+
+def load_project_dotenv(path: Optional[Path] = None) -> Path:
+    """Load KEY=VALUE pairs from a local .env without overriding existing env."""
+    env_path = Path(path) if path is not None else PROJECT_ROOT / ".env"
+    if not env_path.is_file():
+        return env_path
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return env_path
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        os.environ[key] = value
+    return env_path
+
+
+def vault_password_from_env() -> str:
+    return str(os.environ.get(VAULT_PASSWORD_ENV) or "").strip()
 
 
 def unlock_vault() -> CredentialVault:
+    load_project_dotenv()
     vault = CredentialVault(VAULT_FILE)
+    password = vault_password_from_env()
     if not vault.is_initialized:
-        print("首次启动需要创建凭据保险库主密码（至少 12 个字符）。", file=sys.stderr)
-        password = getpass.getpass("创建主密码: ")
-        confirmation = getpass.getpass("再次输入主密码: ")
-        if password != confirmation:
-            raise VaultError("两次输入的主密码不一致")
+        if not password:
+            print(
+                "首次启动需要创建凭据保险库主密码（至少 12 个字符）。\n"
+                "也可写入环境变量 %s 或项目根目录 .env 后重启。"
+                % VAULT_PASSWORD_ENV,
+                file=sys.stderr,
+            )
+            password = getpass.getpass("创建主密码: ")
+            confirmation = getpass.getpass("再次输入主密码: ")
+            if password != confirmation:
+                raise VaultError("两次输入的主密码不一致")
         vault.initialize(password)
         return vault
-    password = getpass.getpass("请输入凭据保险库主密码: ")
+    if not password:
+        password = getpass.getpass("请输入凭据保险库主密码: ")
     vault.unlock(password)
     return vault
 

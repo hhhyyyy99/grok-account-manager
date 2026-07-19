@@ -17,3 +17,5 @@ registration-config.json
 registration-output/
 registration-crash.log
 registration-token.json
+.env
+.env.local
