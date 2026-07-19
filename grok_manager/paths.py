@@ -101,9 +101,7 @@ def ensure_data_dirs() -> None:
 
 @contextmanager
 def interprocess_lock(name: str, data_root: Path | None = None) -> Iterator[None]:
-    """Cross-process exclusive lock using fcntl (Unix) for CPA sync/guardian."""
-    import fcntl
-
+    """Cross-process exclusive lock for CPA sync/guardian (Unix fcntl / Windows msvcrt)."""
     root = Path(data_root or DATA_DIR).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     lock_path = root / (".%s.lock" % str(name or "lock").strip().replace("/", "_"))
@@ -113,11 +111,32 @@ def interprocess_lock(name: str, data_root: Path | None = None) -> Iterator[None
             os.chmod(lock_path, 0o600)
         except OSError:
             pass
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        if sys.platform == "win32":
+            import msvcrt
+
+            # Lock one byte at the start of the file.
+            handle.seek(0)
+            if handle.read(1) == "":
+                handle.write("0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         yield
     finally:
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            if sys.platform == "win32":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         except OSError:
             pass
         handle.close()

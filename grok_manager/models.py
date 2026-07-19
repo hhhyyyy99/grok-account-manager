@@ -50,6 +50,8 @@ class AccountDraft:
     auth_file: str = ""
     source: str = ""
     source_modified_at: str = ""
+    # CPA-only freshness (auth last_refresh). Must not drive SSO upsert decisions.
+    cpa_source_modified_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -122,6 +124,9 @@ class InspectionResult:
     cpa_status: str = ""
     cpa_detail: str = ""
     sso_expires_at: str = ""
+    # Snapshot of CPA material used for this probe; apply is skipped if rotated.
+    observed_access_token: str = ""
+    observed_cpa_updated_at: str = ""
 
 
 @dataclass(frozen=True)

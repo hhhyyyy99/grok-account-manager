@@ -35,6 +35,7 @@ class BatchLoginService:
         self.store = store
         self.project = project
         self.python_executable = python_executable
+        self._remint_expected_refresh: Dict[int, str] = {}
         self._worker = BatchWorkerProcess(
             project,
             python_executable,
@@ -154,6 +155,13 @@ class BatchLoginService:
         if not ready:
             return results
 
+        # Capture refresh versions before the long-running remint worker so failure
+        # marking cannot treat a concurrent rotation as the pre-remint baseline.
+        expected_refresh_by_id = {
+            account.id: str(account.refresh_token or "").strip() for account in ready
+        }
+        self._remint_expected_refresh = expected_refresh_by_id
+
         self.project.validate()
         document = {
             "settings": {
@@ -169,18 +177,21 @@ class BatchLoginService:
             },
             "accounts": [self._worker_remint_account(account) for account in ready],
         }
-        worker_results, parsed_ids, completed = self._worker.run(
-            "batch-login",
-            document,
-            log=log,
-            parse_result=self._handle_remint_result,
-            progress=progress,
-            completed=completed,
-            total=total,
-            stdin_missing_message="CPA SSO 续期 worker 未创建输入管道",
-            start_failed_message="CPA SSO 续期进程无法启动: %s",
-            exit_failed_message="CPA SSO 续期工作进程异常退出: %s",
-        )
+        try:
+            worker_results, parsed_ids, completed = self._worker.run(
+                "batch-login",
+                document,
+                log=log,
+                parse_result=self._handle_remint_result,
+                progress=progress,
+                completed=completed,
+                total=total,
+                stdin_missing_message="CPA SSO 续期 worker 未创建输入管道",
+                start_failed_message="CPA SSO 续期进程无法启动: %s",
+                exit_failed_message="CPA SSO 续期工作进程异常退出: %s",
+            )
+        finally:
+            self._remint_expected_refresh = {}
         results.extend(worker_results)
         for account in ready:
             if account.id in parsed_ids:
@@ -300,13 +311,9 @@ class BatchLoginService:
             value.get("error")
             or ("通过 SSO 重新签发 CPA 凭据" if ok else "SSO 续期失败")
         )
-        expected_refresh = ""
-        if account_id:
-            try:
-                prior = self.store.get(account_id)
-                expected_refresh = str(prior.refresh_token if prior else "")
-            except Exception:
-                expected_refresh = ""
+        expected_refresh = str(
+            (getattr(self, "_remint_expected_refresh", {}) or {}).get(account_id, "")
+        )
         if ok:
             try:
                 account = self.store.get(account_id)

@@ -791,27 +791,33 @@ class GrokManager:
                 )
                 detail = "CPA 凭据已续期"
                 auth_meta = ""
-                try:
-                    hotload_path = self.reference.sync_cpa_hotload(auth_path)
-                except Exception as exc:
-                    note = "CPA hotload 未同步: %s" % exc
-                    detail = "%s；%s" % (detail, note)
-                    log("[%s] %s" % (fresh.email, note))
-                    hotload_path = None
-                else:
-                    if hotload_path is not None:
-                        auth_meta = str(hotload_path)
-                        log("[%s] CPA hotload 已更新: %s" % (fresh.email, hotload_path))
-                # When hotload is disabled, keep any existing auth_file pointer (empty
-                # input preserves it). Inspection falls back to registration cpa_base_url.
-                self.store.apply_cpa_credentials(
-                    fresh.id,
-                    token.access_token,
-                    token.refresh_token,
-                    str(payload.get("expired") or ""),
-                    auth_meta,
-                    detail="CPA 凭据已续期",
-                )
+                from .paths import interprocess_lock
+
+                # Share the same cross-process lock as cpa-sync so CLI/web cannot
+                # race the hotload file while guardian rotates tokens.
+                with interprocess_lock("cpa-sync", self.reference.data_root):
+                    try:
+                        hotload_path = self.reference.sync_cpa_hotload(auth_path)
+                    except Exception as exc:
+                        note = "CPA hotload 未同步: %s" % exc
+                        detail = "%s；%s" % (detail, note)
+                        log("[%s] %s" % (fresh.email, note))
+                        hotload_path = None
+                    else:
+                        if hotload_path is not None:
+                            auth_meta = str(hotload_path)
+                            log("[%s] CPA hotload 已更新: %s" % (fresh.email, hotload_path))
+                    # When hotload is disabled, keep any existing auth_file pointer
+                    # (empty input preserves it). Inspection falls back to registration
+                    # cpa_base_url.
+                    self.store.apply_cpa_credentials(
+                        fresh.id,
+                        token.access_token,
+                        token.refresh_token,
+                        str(payload.get("expired") or ""),
+                        auth_meta,
+                        detail="CPA 凭据已续期",
+                    )
                 log("[%s] CPA silent refresh 成功" % fresh.email)
                 return CpaRefreshResult(
                     fresh.id,

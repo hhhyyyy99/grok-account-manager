@@ -639,6 +639,87 @@ class CpaHotloadSyncTests(unittest.TestCase):
                 stored.cpa_status if stored else "",
             )
 
+    def test_cpa_auth_last_refresh_does_not_drive_sso_upsert(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = make_manager(root)
+            # Existing login-fresh SSO.
+            account = manager.store.upsert(
+                AccountDraft(
+                    email="sso-cpa@example.com",
+                    password="password",
+                    sso_token="login-sso",
+                    access_token="old-access",
+                    refresh_token="old-refresh",
+                    token_expires_at=_past_iso(100),
+                    source="login",
+                    source_modified_at=_past_iso(10),
+                )
+            )
+            with manager.store._connect() as conn:
+                conn.execute(
+                    "UPDATE accounts SET last_login_at = ?, cpa_updated_at = ? WHERE id = ?",
+                    (_future_iso(0), _future_iso(0), account.id),
+                )
+            # Import carries old SSO text but very new CPA last_refresh.
+            manager.store.upsert(
+                AccountDraft(
+                    email="sso-cpa@example.com",
+                    password="password",
+                    sso_token="stale-import-sso",
+                    access_token="new-cpa-access",
+                    refresh_token="new-cpa-refresh",
+                    token_expires_at=_future_iso(5000),
+                    source="import",
+                    source_modified_at=_past_iso(86400),
+                    cpa_source_modified_at=_future_iso(100),
+                )
+            )
+            stored = manager.store.get(account.id)
+            self.assertEqual("login-sso", stored.sso_token if stored else "")
+            self.assertEqual("new-cpa-access", stored.access_token if stored else "")
+
+    def test_stale_inspection_does_not_overwrite_refreshed_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            account = manager.store.upsert(
+                AccountDraft(
+                    email="stale-inspect@example.com",
+                    access_token="old-access",
+                    refresh_token="old-refresh",
+                    token_expires_at=_past_iso(10),
+                )
+            )
+            manager.store.apply_cpa_credentials(
+                account.id,
+                "fresh-access",
+                "fresh-refresh",
+                _future_iso(9000),
+                "",
+                detail="refreshed",
+            )
+            # Inspection snapshot still observed pre-refresh tokens.
+            manager.store.apply_inspection(
+                InspectionResult(
+                    account_id=account.id,
+                    status=AccountStatus.EXPIRED.value,
+                    detail="stale probe",
+                    checked_at=_future_iso(0),
+                    expires_at=_past_iso(10),
+                    sso_status=AccountStatus.ACTIVE.value,
+                    cpa_status=AccountStatus.EXPIRED.value,
+                    cpa_detail="expired",
+                    observed_access_token="old-access",
+                    observed_cpa_updated_at=_past_iso(100),
+                )
+            )
+            stored = manager.store.get(account.id)
+            self.assertEqual("fresh-access", stored.access_token if stored else "")
+            self.assertNotEqual(
+                AccountStatus.EXPIRED.value,
+                stored.cpa_status if stored else AccountStatus.EXPIRED.value,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

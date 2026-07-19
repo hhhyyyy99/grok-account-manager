@@ -227,9 +227,14 @@ class AccountStore:
             if auth_file == existing.auth_file:
                 auth_file = ""
         cpa_material = bool(access_token or refresh_token or auth_file or draft.token_expires_at.strip())
-        # Prefer the artifact's source_modified_at so old imports do not outrank newer hotload.
+        # SSO and CPA use independent clocks. source_modified_at is accounts.txt/SSO age;
+        # cpa_source_modified_at is auth last_refresh (or file mtime fallback).
         source_modified = draft.source_modified_at.strip()
-        cpa_stamp = source_modified or now if cpa_material else ""
+        cpa_source_modified = (
+            str(getattr(draft, "cpa_source_modified_at", "") or "").strip()
+            or source_modified
+        )
+        cpa_stamp = cpa_source_modified or now if cpa_material else ""
         values = (
             email,
             self._encrypt_credential(email, "password", password),
@@ -268,10 +273,6 @@ class AccountStore:
                                 excluded.cpa_updated_at != ''
                                 AND excluded.cpa_updated_at >= accounts.cpa_updated_at
                             )
-                        ) AND (
-                            accounts.last_login_at = ''
-                            OR excluded.source_modified_at = ''
-                            OR excluded.source_modified_at >= accounts.last_login_at
                         ) THEN excluded.access_token ELSE accounts.access_token END,
                     refresh_token = CASE
                         WHEN excluded.refresh_token != '' AND (
@@ -280,10 +281,6 @@ class AccountStore:
                                 excluded.cpa_updated_at != ''
                                 AND excluded.cpa_updated_at >= accounts.cpa_updated_at
                             )
-                        ) AND (
-                            accounts.last_login_at = ''
-                            OR excluded.source_modified_at = ''
-                            OR excluded.source_modified_at >= accounts.last_login_at
                         ) THEN excluded.refresh_token ELSE accounts.refresh_token END,
                     token_expires_at = CASE
                         WHEN excluded.token_expires_at != '' AND (
@@ -292,10 +289,6 @@ class AccountStore:
                                 excluded.cpa_updated_at != ''
                                 AND excluded.cpa_updated_at >= accounts.cpa_updated_at
                             )
-                        ) AND (
-                            accounts.last_login_at = ''
-                            OR excluded.source_modified_at = ''
-                            OR excluded.source_modified_at >= accounts.last_login_at
                         ) THEN excluded.token_expires_at ELSE accounts.token_expires_at END,
                     auth_file = CASE
                         WHEN excluded.auth_file != '' AND (
@@ -304,10 +297,6 @@ class AccountStore:
                                 excluded.cpa_updated_at != ''
                                 AND excluded.cpa_updated_at >= accounts.cpa_updated_at
                             )
-                        ) AND (
-                            accounts.last_login_at = ''
-                            OR excluded.source_modified_at = ''
-                            OR excluded.source_modified_at >= accounts.last_login_at
                         ) THEN excluded.auth_file ELSE accounts.auth_file END,
                     source = CASE WHEN excluded.source != '' THEN excluded.source ELSE accounts.source END,
                     source_modified_at = CASE
@@ -326,10 +315,6 @@ class AccountStore:
                                 excluded.cpa_updated_at != ''
                                 AND excluded.cpa_updated_at >= accounts.cpa_updated_at
                             )
-                        ) AND (
-                            accounts.last_login_at = ''
-                            OR excluded.source_modified_at = ''
-                            OR excluded.source_modified_at >= accounts.last_login_at
                         ) THEN 'unknown'
                         ELSE accounts.status
                     END,
@@ -344,10 +329,6 @@ class AccountStore:
                                 excluded.cpa_updated_at != ''
                                 AND excluded.cpa_updated_at >= accounts.cpa_updated_at
                             )
-                        ) AND (
-                            accounts.last_login_at = ''
-                            OR excluded.source_modified_at = ''
-                            OR excluded.source_modified_at >= accounts.last_login_at
                         ) THEN ''
                         ELSE accounts.status_detail
                     END,
@@ -372,10 +353,6 @@ class AccountStore:
                                 excluded.cpa_updated_at != ''
                                 AND excluded.cpa_updated_at >= accounts.cpa_updated_at
                             )
-                        ) AND (
-                            accounts.last_login_at = ''
-                            OR excluded.source_modified_at = ''
-                            OR excluded.source_modified_at >= accounts.last_login_at
                         ) THEN 'unknown'
                         ELSE accounts.cpa_status
                     END,
@@ -386,10 +363,6 @@ class AccountStore:
                                 excluded.cpa_updated_at != ''
                                 AND excluded.cpa_updated_at >= accounts.cpa_updated_at
                             )
-                        ) AND (
-                            accounts.last_login_at = ''
-                            OR excluded.source_modified_at = ''
-                            OR excluded.source_modified_at >= accounts.last_login_at
                         ) THEN ''
                         ELSE accounts.cpa_detail
                     END,
@@ -405,10 +378,6 @@ class AccountStore:
                                 excluded.cpa_updated_at != ''
                                 AND excluded.cpa_updated_at >= accounts.cpa_updated_at
                             )
-                        ) AND (
-                            accounts.last_login_at = ''
-                            OR excluded.source_modified_at = ''
-                            OR excluded.source_modified_at >= accounts.last_login_at
                         ) THEN excluded.cpa_updated_at
                         ELSE accounts.cpa_updated_at
                     END,
@@ -590,9 +559,23 @@ class AccountStore:
             )
 
     def apply_inspection(self, result: InspectionResult) -> None:
-        # Hold the account lock so a concurrent refresh cannot be overwritten by a
-        # stale pre-refresh inspection result.
+        # Hold the account lock and refuse stale snapshots that predate a CPA rotation.
         with self.account_lock(result.account_id):
+            current = self.get(result.account_id)
+            if current is None:
+                return
+            observed_access = str(getattr(result, "observed_access_token", "") or "").strip()
+            observed_cpa_updated = str(
+                getattr(result, "observed_cpa_updated_at", "") or ""
+            ).strip()
+            if observed_access and observed_access != str(current.access_token or "").strip():
+                return
+            if (
+                observed_cpa_updated
+                and str(current.cpa_updated_at or "").strip()
+                and observed_cpa_updated != str(current.cpa_updated_at or "").strip()
+            ):
+                return
             with self._connect() as conn:
                 conn.execute(
                     """

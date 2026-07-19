@@ -139,6 +139,8 @@ class TokenInspector:
             cpa_status=cpa.status,
             cpa_detail=cpa.detail,
             sso_expires_at=sso.expires_at,
+            observed_access_token=str(account.access_token or "").strip(),
+            observed_cpa_updated_at=str(getattr(account, "cpa_updated_at", "") or "").strip(),
         )
 
     def _inspect_sso(self, account: Account, live: bool) -> CredentialCheck:
