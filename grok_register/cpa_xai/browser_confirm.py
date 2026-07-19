@@ -643,15 +643,35 @@ def _click_email_login_chooser(
     return _click_exact(page, labels, log, real=False) is not None
 
 
-def _raise_for_login_error(visible_text: str) -> None:
-    low = (visible_text or "").lower()
-    messages = (
+def _looks_like_wrong_password(visible_text: str) -> bool:
+    text = str(visible_text or "")
+    low = text.casefold()
+    exact_markers = (
         "wrong email address or password",
         "incorrect email or password",
         "invalid email or password",
+        "email or password is incorrect",
+        "email or password you entered is incorrect",
+        "the password you entered is incorrect",
+        "incorrect password",
+        "invalid credentials",
         "邮箱或密码错误",
+        "邮箱地址或密码错误",
+        "错误的邮箱地址或密码",
+        "错误的邮箱或密码",
+        "电子邮箱或密码不正确",
+        "邮箱或密码不正确",
+        "你输入的邮箱或密码不正确",
+        "密码不正确",
+        "密码错误",
     )
-    if any(message in low for message in messages):
+    # Only explicit credential-error copy may trigger auto password reset.
+    # Do not use co-occurrence heuristics such as "password" + "invalid".
+    return any(marker in low or marker in text for marker in exact_markers)
+
+
+def _raise_for_login_error(visible_text: str) -> None:
+    if _looks_like_wrong_password(visible_text):
         raise BrowserConfirmError("邮箱或密码错误")
 
 
@@ -940,8 +960,11 @@ def approve_device_code(
         if page.ele(PASSWORD_SELECTOR, timeout=0.3):
             phase = "password"
             if login_attempts >= 5:
-                _sleep(1.0)
-                continue
+                # Only auto-reset when the page explicitly reports bad credentials.
+                _raise_for_login_error(_visible_text(page))
+                raise BrowserConfirmError(
+                    "密码页多次提交仍未通过（未检测到明确的邮箱或密码错误）"
+                )
             login_attempts += 1
             log(f"login attempt {login_attempts}")
             if not _prepare_password_login(page, email, password, log):
@@ -958,12 +981,13 @@ def approve_device_code(
                         log("clicked login submit real")
                 except Exception as e:
                     log(f"login submit fail: {e}")
-            # wait navigation
-            for _ in range(24):
+            # wait navigation / credential error
+            for _ in range(30):
                 if stop_event is not None and stop_event.is_set():
                     return
                 _sleep(0.5)
-                _raise_for_login_error(_visible_text(page))
+                current_text = _visible_text(page)
+                _raise_for_login_error(current_text)
                 if not page.ele(PASSWORD_SELECTOR, timeout=0.2):
                     break
                 if "sign-in" not in _page_url(page):
@@ -976,6 +1000,11 @@ def approve_device_code(
         log("browser finished via stop_event")
         return
     log(f"browser loop ended phase={phase} login_attempts={login_attempts}")
+    # Never invent a wrong-password error for timeouts/stuck pages.
+    _raise_for_login_error(_visible_text(page))
+    raise BrowserConfirmError(
+        "浏览器登录未完成: phase=%s login_attempts=%s" % (phase, login_attempts)
+    )
 
 
 def mint_with_browser(

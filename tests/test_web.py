@@ -6,8 +6,84 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from grok_manager.web import ASSET_DIR, GrokWebApplication
+from grok_manager.web import (
+    ASSET_DIR,
+    GrokWebApplication,
+    TaskRegistry,
+    host_header_hostname,
+    is_loopback_host,
+    is_wildcard_host,
+    normalize_bind_host,
+    task_result_failed,
+)
 from tests.support import make_manager
+
+
+class TaskResultStateTests(unittest.TestCase):
+    def test_task_result_failed_detects_partial_failures(self) -> None:
+        self.assertFalse(task_result_failed({"message": "ok", "failed": 0}))
+        self.assertTrue(task_result_failed({"message": "partial", "failed": 1}))
+        self.assertTrue(
+            task_result_failed(
+                {
+                    "resetCount": 2,
+                    "resetSucceeded": 1,
+                    "loginCount": 1,
+                    "loginSucceeded": 1,
+                }
+            )
+        )
+        self.assertTrue(
+            task_result_failed(
+                {
+                    "resetCount": 1,
+                    "resetSucceeded": 1,
+                    "loginCount": 1,
+                    "loginSucceeded": 0,
+                }
+            )
+        )
+
+    def test_registry_marks_partial_login_failure_as_failed(self) -> None:
+        registry = TaskRegistry()
+
+        def worker(_task):
+            return {
+                "count": 1,
+                "succeeded": 0,
+                "failed": 1,
+                "message": "登录完成，成功 0，失败 1",
+            }
+
+        task = registry.start("login", "批量登录", worker)
+        for _ in range(50):
+            if task.state in {"succeeded", "failed", "cancelled"}:
+                break
+            import time
+
+            time.sleep(0.01)
+
+        self.assertEqual("failed", task.state)
+        self.assertIn("失败 1", task.message)
+
+
+class LanAccessTests(unittest.TestCase):
+    def test_host_helpers(self) -> None:
+        self.assertEqual("0.0.0.0", normalize_bind_host("0.0.0.0"))
+        self.assertEqual("::", normalize_bind_host("[::]"))
+        self.assertTrue(is_loopback_host("127.0.0.1"))
+        self.assertTrue(is_loopback_host("::1"))
+        self.assertFalse(is_loopback_host("0.0.0.0"))
+        self.assertTrue(is_wildcard_host("0.0.0.0"))
+        self.assertEqual("192.168.1.10", host_header_hostname("192.168.1.10:8787"))
+        self.assertEqual("::1", host_header_hostname("[::1]:8787"))
+        self.assertIsNone(host_header_hostname(""))
+
+    def test_serve_rejects_non_loopback_without_lan_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            application = GrokWebApplication(make_manager(Path(directory)))
+            with self.assertRaisesRegex(ValueError, "--lan"):
+                application.serve(host="0.0.0.0", port=0, open_browser=False, allow_lan=False)
 
 
 class ManagerTaskConfigTests(unittest.TestCase):
@@ -173,6 +249,39 @@ process.stdout.write(JSON.stringify(orderAccountsById(accounts).map((item) => it
 
             request_type.assert_called_once_with(count=40, threads=3, mint_workers=2)
 
+
+    def test_registration_config_masks_secrets_and_merges_partial_updates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            manager.reference.save_registration_config(
+                {
+                    "proxy": "http://user:pass@example.test:8080",
+                    "cloudflare_api_key": "cloudflare-secret",
+                    "email_provider": "cloudflare",
+                    "cpa_base_url": "https://cpa.example.test/v1",
+                }
+            )
+            application = GrokWebApplication(manager)
+            response = application.config_json()
+            self.assertEqual("", response["registration"]["proxy"])
+            self.assertEqual("", response["registration"]["cloudflare_api_key"])
+            self.assertTrue(response["registrationSecrets"]["proxy"])
+            self.assertTrue(response["registrationSecrets"]["cloudflare_api_key"])
+
+            application.save_reference_config(
+                {
+                    "email_provider": "duckmail",
+                    "cpa_base_url": "https://cpa.example.test/v2",
+                }
+            )
+            loaded = manager.reference.load_registration_config()
+            self.assertEqual("http://user:pass@example.test:8080", loaded["proxy"])
+            self.assertEqual("cloudflare-secret", loaded["cloudflare_api_key"])
+            self.assertEqual("duckmail", loaded["email_provider"])
+            self.assertEqual("https://cpa.example.test/v2", loaded["cpa_base_url"])
+
+            application.save_reference_config({"proxy": None})
+            self.assertEqual("", manager.reference.load_registration_config()["proxy"])
 
 if __name__ == "__main__":
     unittest.main()

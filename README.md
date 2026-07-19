@@ -34,7 +34,7 @@ Grok Account Manager
 └── 批量登录 worker ────→ grok_register.cpa_xai.mint
 ```
 
-注册运行时代码和 Turnstile 扩展随本项目一起安装。浏览器自动化仍在独立子进程中运行，避免阻塞管理端。本地 HTTP 服务仅绑定回环地址并校验 `Host`，账号、配置、任务详情与全部写操作都要求页面内的随机请求令牌。
+注册运行时代码和 Turnstile 扩展随本项目一起安装。浏览器自动化仍在独立子进程中运行，避免阻塞管理端。本地 HTTP 服务默认仅绑定回环地址并校验 `Host`；需要局域网访问时显式加 `--lan`。账号、配置、任务详情与全部写操作都要求页面内的随机请求令牌。
 
 ## 环境要求
 
@@ -62,12 +62,31 @@ cd grok-account-manager
 uv run --locked python run.py
 ```
 
-启动后会打开 `http://127.0.0.1:8787`。不自动打开浏览器或更换端口时直接传参数，不需要再写 `ui`：
+账号密码和 token 存放在本地凭据保险库中，需要主密码解锁。推荐把主密码写到环境变量，避免每次启动交互输入：
+
+```bash
+# 方式一：导出到当前 shell
+export GROK_MANAGER_VAULT_PASSWORD='your-vault-password'
+
+# 方式二：项目根目录 .env（已 gitignore，勿提交）
+cp .env.example .env
+# 编辑 .env，填入 GROK_MANAGER_VAULT_PASSWORD=...
+```
+
+未设置 `GROK_MANAGER_VAULT_PASSWORD` 时仍会交互询问。首次启动若没有环境变量，会要求创建至少 12 个字符的主密码；若已设置环境变量，则直接用它初始化或解锁。主密码本身不会写入保险库文件；忘记主密码后无法恢复已加密凭据。
+
+启动后会打开 `http://127.0.0.1:8787`。不自动打开浏览器、更换端口或开放局域网访问时直接传参数，不需要再写 `ui`：
 
 ```bash
 uv run --locked python run.py --no-browser
 uv run --locked python run.py --port 9000
+# 局域网访问：默认绑定 0.0.0.0，然后用本机局域网 IP 访问，例如 http://192.168.1.10:8787
+uv run --locked python run.py --lan --no-browser
+# 也可在开启 --lan 后指定具体网卡地址
+uv run --locked python run.py --lan --host 192.168.1.10
 ```
+
+默认只监听本机。只有显式传入 `--lan` 后才会开放局域网访问；请确保网络可信。
 
 Linux/macOS 也可以这样运行：
 
@@ -91,14 +110,17 @@ uv run --locked python run.py reset-password --ids 4461
 ```text
 data/
 ├── manager-config.json       # 管理端配置
-├── registration-config.json  # 注册、邮箱、代理和 CPA 配置
-├── accounts.sqlite3          # 账号管理库
-├── registration-output/      # 注册账号与 CPA 产物
-├── auths/                    # 批量登录生成的新凭据
-└── jobs/                     # 临时任务；登录输入会在任务结束后删除
+├── credentials.vault.json    # Argon2id + AES-GCM 保险库元数据与加密 secret
+├── registration-config.json  # 非敏感配置与敏感字段密文
+├── accounts.sqlite3          # 账号索引、状态与加密凭据
+├── registration-output/      # 注册临时产物；导入后清理明文凭据（含 sub2api_exports）
+├── auths/                    # 登录 worker 临时输出；回写后立即删除
+└── jobs/                     # 任务目录；密码通过匿名管道传递
 ```
 
-`data/` 已被 `.gitignore` 排除。目录权限会尽量设置为 `0700`，数据库和含敏感信息的配置会尽量设置为 `0600`。
+`data/` 已被 `.gitignore` 排除。敏感字段使用 Argon2id 派生密钥和 AES-256-GCM 认证加密；`0700`/`0600` 权限继续作为第二层保护。旧版明文数据库首次解锁后会原子迁移，并生成仅能由同一保险库解密的 SQL 备份。
+
+保险库用于防止磁盘、备份和应用关闭后的离线读取。应用解锁期间，同一用户权限的恶意程序仍可能读取进程内存、输入或本地接口；这类威胁需要操作系统隔离、全盘加密和独立运行环境共同防护。
 
 通过 wheel 安装时，可变数据不会写进 `site-packages`：macOS 默认使用 `~/Library/Application Support/grok-account-manager`，Linux 使用 `$XDG_DATA_HOME/grok-account-manager`（未设置时为 `~/.local/share/grok-account-manager`），Windows 使用本地 AppData。可用 `GROK_MANAGER_DATA_DIR` 覆盖。
 
@@ -107,6 +129,8 @@ data/
 ## 推荐工作流
 
 1. 在“注册常用配置”填写临时邮箱、域名、代理和 CPA 配置。
+
+“配置与环境”完整保留任务参数、注册基础、重新登录、临时邮箱（Cloudflare / DuckMail / YYDS）、CPA、Sub2API、Grok2API、完整 JSON 和环境检查分类。敏感字段在浏览器中只显示“已配置”状态；留空保持原密文，点击清除或在完整 JSON 中写入 `null` 才会清除。
 2. 运行“环境检查”，所有项目通过后再注册。
 3. 在“批量注册”设置数量和并发，启动任务。
 4. 注册结束后账号会自动进入“账号与巡检”。历史产物可点“导入产物”。
@@ -142,6 +166,8 @@ uv run --locked python run.py register --count 10 --threads 2 --mint-workers 2
 测试通过公开服务接口运行，并用临时目录隔离数据库、任务输入和凭据文件：
 
 ```bash
+npm run typecheck
+npm run build
 uv run --locked python -m unittest discover -v
 ```
 
@@ -159,14 +185,14 @@ uv run --locked python -m unittest discover -v
 
 ## 数据边界
 
-- “删除”只删除管理库索引，不修改注册账号和 CPA 产物文件。
+- “删除”只删除管理库索引；注册导入流程会在凭据成功进入保险库后主动清理本应用数据目录中的明文凭据产物。
 - 导入同一邮箱时，非空的新密码、SSO、access token 会更新旧记录；空字段不会擦除已有凭据。
-- 批量登录后的 SSO 优先于更旧的 `accounts.txt`，启动自动导入不会把新凭据覆盖回旧值。
+- 批量登录后的 SSO 优先于更旧的导入来源，重复导入不会把新凭据覆盖回旧值。
 - CLI 和界面列表不会显示密码、SSO、access token 或 refresh token。
 - SSO 在线巡检只把 SSO cookie 发往 `accounts.x.ai/account`，使用 GET 且不修改账号。
 - CPA 在线巡检只把 access token 发往 CPA `base_url` 的 `/models`；若凭据文件指定了 `base_url`，优先使用该地址。
-- 批量登录会将密码写入权限收紧的临时 JSON，子进程退出后立即删除。
-- 密码重置会使用对应批次的 `mail_credentials.txt` 获取验证码，生成的新密码同步写入管理库和账号产物，然后自动重新登录；找不到邮箱访问凭据的账号会跳过。
+- 批量登录和密码重置通过匿名管道把凭据传给 worker，不生成明文 `input.json`。
+- 导入后，应用数据目录中的 `accounts.txt`、`mail_credentials.txt`、`xai-*.json` 以及同批次 `sub2api_exports/` 明文产物会被清理；邮箱凭据和重置后的密码只写入保险库，然后自动重新登录。
 - Cloudflare 邮箱 JWT 过期时，会优先从旧 JWT 的 `address_id` 调用管理员 `show_password` 续期；续期失败才回退到管理员邮件列表接口。
 - Grok 密码重置路径为 `accounts.x.ai/sign-in` → “使用邮箱登录” → 邮箱“下一步” → 密码页“忘记密码？”；临时邮箱只用于接收验证码，不会重置邮箱密码。
 

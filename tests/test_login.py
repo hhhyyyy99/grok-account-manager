@@ -249,8 +249,136 @@ class BatchLoginCredentialTests(unittest.TestCase):
         self.assertEqual("123456", password_element.value)
 
     def test_login_rejects_invalid_credentials_message(self) -> None:
-        with self.assertRaisesRegex(browser_confirm.BrowserConfirmError, "邮箱或密码错误"):
-            browser_confirm._raise_for_login_error("Wrong email address or password.")
+        samples = (
+            "Wrong email address or password.",
+            "The email or password you entered is incorrect.",
+            "Incorrect password",
+            "邮箱地址或密码错误",
+            "错误的邮箱地址或密码",
+            "错误的邮箱或密码",
+            "密码不正确",
+        )
+        for sample in samples:
+            with self.subTest(sample=sample):
+                with self.assertRaisesRegex(
+                    browser_confirm.BrowserConfirmError, "邮箱或密码错误"
+                ):
+                    browser_confirm._raise_for_login_error(sample)
+
+        # Co-occurrence of password + invalid must not invent a credential error.
+        browser_confirm._raise_for_login_error("Password\nInvalid request")
+        browser_confirm._raise_for_login_error("Invalid action")
+
+    def test_password_page_stuck_does_not_invent_wrong_password_error(self) -> None:
+        class FakeElement:
+            def clear(self):
+                return None
+
+            def input(self, _value):
+                return None
+
+            def click(self, by_js=False):
+                return None
+
+        class FakePage:
+            def ele(self, selector, timeout=0):
+                text = str(selector)
+                if "user_code" in text or "continue-with-email" in text:
+                    return None
+                if "type='email'" in text or "type=\"email\"" in text:
+                    return FakeElement()
+                if "password" in text:
+                    return FakeElement()
+                if "submit" in text or "sign-in-submit" in text:
+                    return FakeElement()
+                return None
+
+            def eles(self, _selector):
+                return []
+
+            def get(self, _url, timeout=None):
+                return None
+
+            def run_js(self, script):
+                if "innerText" in str(script):
+                    # Stuck password page without an explicit credential error.
+                    return "Sign in"
+                return ""
+
+        page = FakePage()
+        logs = []
+
+        with patch.object(browser_confirm, "_wait_turnstile", return_value=True), patch.object(
+            browser_confirm, "_click_exact", return_value=True
+        ), patch.object(browser_confirm, "_sleep", return_value=None), patch.object(
+            browser_confirm, "_page_url", return_value="https://accounts.x.ai/sign-in"
+        ), patch.object(browser_confirm, "_click_email_login_chooser", return_value=False):
+            with self.assertRaisesRegex(
+                browser_confirm.BrowserConfirmError,
+                r"未检测到明确的邮箱或密码错误|浏览器登录未完成",
+            ):
+                browser_confirm.approve_device_code(
+                    page,
+                    verification_uri_complete="https://accounts.x.ai/oauth2/device?user_code=ABCD",
+                    email="target@example.com",
+                    password="wrong-password",
+                    user_code="ABCD",
+                    timeout_sec=30,
+                    log=logs.append,
+                )
+
+        self.assertTrue(any("login attempt" in line for line in logs))
+
+    def test_password_page_surfaces_explicit_wrong_password_error(self) -> None:
+        class FakeElement:
+            def clear(self):
+                return None
+
+            def input(self, _value):
+                return None
+
+            def click(self, by_js=False):
+                return None
+
+        class FakePage:
+            def ele(self, selector, timeout=0):
+                text = str(selector)
+                if "user_code" in text or "continue-with-email" in text:
+                    return None
+                if "type='email'" in text or "type=\"email\"" in text:
+                    return FakeElement()
+                if "password" in text:
+                    return FakeElement()
+                if "submit" in text or "sign-in-submit" in text:
+                    return FakeElement()
+                return None
+
+            def eles(self, _selector):
+                return []
+
+            def get(self, _url, timeout=None):
+                return None
+
+            def run_js(self, script):
+                if "innerText" in str(script):
+                    return "Wrong email address or password."
+                return ""
+
+        with patch.object(browser_confirm, "_wait_turnstile", return_value=True), patch.object(
+            browser_confirm, "_click_exact", return_value=True
+        ), patch.object(browser_confirm, "_sleep", return_value=None), patch.object(
+            browser_confirm, "_page_url", return_value="https://accounts.x.ai/sign-in"
+        ), patch.object(browser_confirm, "_click_email_login_chooser", return_value=False):
+            with self.assertRaisesRegex(browser_confirm.BrowserConfirmError, r"^邮箱或密码错误$"):
+                browser_confirm.approve_device_code(
+                    FakePage(),
+                    verification_uri_complete="https://accounts.x.ai/oauth2/device?user_code=ABCD",
+                    email="target@example.com",
+                    password="wrong-password",
+                    user_code="ABCD",
+                    timeout_sec=30,
+                    log=lambda _message: None,
+                )
 
     def test_oauth_poll_retries_transient_network_error(self) -> None:
         response = {
@@ -352,7 +480,7 @@ class BatchLoginCredentialTests(unittest.TestCase):
                     return 0
 
             with patch(
-                "grok_manager.login.subprocess.Popen", return_value=FakeProcess()
+                "grok_manager.worker_runtime.subprocess.Popen", return_value=FakeProcess()
             ):
                 manager.login.login_accounts([account.id], LoginSettings())
 
@@ -478,6 +606,128 @@ class BatchLoginCredentialTests(unittest.TestCase):
             self.assertTrue(any("CPA hotload 已更新" in line for line in logs))
             self.assertTrue(any("复核完成: SSO=正常，CPA=正常" in line for line in logs))
 
+    def test_relogin_passes_previous_sso_to_grok2api_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            account = manager.store.upsert(
+                AccountDraft(
+                    email="first@example.com",
+                    password="password",
+                    sso_token="fresh-sso",
+                    access_token="access",
+                    refresh_token="refresh",
+                )
+            )
+            result = LoginResult(
+                account.id,
+                account.email,
+                True,
+                "登录成功",
+                previous_sso_token="old-sso",
+                sso_token="fresh-sso",
+            )
+
+            with patch.object(manager.reference, "sync_grok2api") as sync:
+                note = manager._sync_relogin_credentials(result)
+
+            self.assertEqual("", note)
+            sync.assert_called_once_with(
+                "fresh-sso",
+                email="first@example.com",
+                log_callback=None,
+                previous_token="old-sso",
+            )
+            stored = manager.store.get(account.id)
+            self.assertEqual("fresh-sso", stored.sso_token if stored else "")
+
+    def test_login_persists_credentials_before_external_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = make_manager(root)
+            install_fake_login_modules(manager.reference.root, "target@example.com")
+            account = manager.store.upsert(
+                AccountDraft(
+                    email="target@example.com",
+                    password="password",
+                    sso_token="old-sso",
+                )
+            )
+            observed = []
+
+            def observe_sync(sso_token, email="", log_callback=None, previous_token=""):
+                stored = manager.store.get(account.id)
+                observed.append(
+                    (
+                        sso_token,
+                        previous_token,
+                        stored.sso_token if stored else "",
+                        stored.access_token if stored else "",
+                    )
+                )
+
+            with patch.object(manager.reference, "sync_grok2api", side_effect=observe_sync):
+                result = manager.batch_login([account.id])[0]
+            stored = manager.store.get(account.id)
+
+            self.assertTrue(result.ok)
+            self.assertEqual(
+                [("fresh-sso", "old-sso", "fresh-sso", "fresh-access")],
+                observed,
+            )
+            self.assertEqual("fresh-sso", stored.sso_token if stored else "")
+            self.assertEqual("fresh-access", stored.access_token if stored else "")
+
+    def test_login_deletes_managed_auth_file_after_successful_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = make_manager(root)
+            install_fake_login_modules(manager.reference.root, "target@example.com")
+            account = manager.store.upsert(
+                AccountDraft(email="target@example.com", password="password")
+            )
+
+            result = manager.batch_login([account.id])[0]
+            auth_file = manager.reference.managed_auth_dir / "xai-target@example.com.json"
+
+            self.assertTrue(result.ok)
+            self.assertEqual("", result.auth_file)
+            self.assertFalse(auth_file.exists())
+
+    def test_login_keeps_success_when_grok2api_sync_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = make_manager(root)
+            install_fake_login_modules(manager.reference.root, "target@example.com")
+            account = manager.store.upsert(
+                AccountDraft(
+                    email="target@example.com",
+                    password="password",
+                    sso_token="old-sso",
+                )
+            )
+            auth_file = manager.reference.managed_auth_dir / "xai-target@example.com.json"
+            logs = []
+
+            with patch.object(
+                manager.reference,
+                "sync_grok2api",
+                side_effect=RuntimeError("remote pool missing previous credential"),
+            ):
+                result = manager.batch_login([account.id], log=logs.append)[0]
+            stored = manager.store.get(account.id)
+
+            # Login itself still succeeds; remote sync is only annotated.
+            self.assertTrue(result.ok)
+            self.assertIn("Grok2API 未同步", result.detail)
+            self.assertNotEqual(AccountStatus.ERROR.value, stored.status if stored else "")
+            self.assertEqual("fresh-sso", stored.sso_token if stored else "")
+            self.assertEqual("old-sso", result.previous_sso_token)
+            self.assertEqual("fresh-sso", result.sso_token)
+            self.assertEqual("fresh-access", stored.access_token if stored else "")
+            self.assertFalse(auth_file.exists())
+            self.assertTrue(any("Grok2API 未同步" in line for line in logs))
+            self.assertTrue(any("部分同步未完成" in line for line in logs))
+
     def test_login_syncs_cpa_and_grok2api_before_next_result(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -512,7 +762,11 @@ class BatchLoginCredentialTests(unittest.TestCase):
                 encoding="utf-8",
             )
             account = manager.store.upsert(
-                AccountDraft(email="first@example.com", password="password")
+                AccountDraft(
+                    email="first@example.com",
+                    password="password",
+                    sso_token="old-sso",
+                )
             )
             auth_file = root / "xai-first@example.com.json"
             auth_file.write_text(
@@ -562,11 +816,86 @@ class BatchLoginCredentialTests(unittest.TestCase):
                     return 0
 
             with patch(
-                "grok_manager.login.subprocess.Popen", return_value=FakeProcess()
+                "grok_manager.worker_runtime.subprocess.Popen", return_value=FakeProcess()
             ):
-                manager.batch_login([account.id])
+                results = manager.batch_login([account.id])
 
             self.assertEqual([(True, ["fresh-sso"])], observed)
+            self.assertEqual("old-sso", results[0].previous_sso_token)
+            self.assertEqual("fresh-sso", results[0].sso_token)
+            stored = manager.store.get(account.id)
+            self.assertEqual("fresh-sso", stored.sso_token if stored else "")
+
+    def test_worker_runtime_reaps_process_when_parser_raises(self) -> None:
+        from grok_manager.worker_runtime import BatchWorkerProcess
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            waited = []
+            terminated = []
+            closed = []
+
+            class FakePipe:
+                def write(self, _payload):
+                    return None
+
+                def close(self):
+                    closed.append("stdin")
+
+            class FakeStdout:
+                def __iter__(self):
+                    yield "GM_RESULT " + json.dumps({"id": 1})
+
+                def close(self):
+                    closed.append("stdout")
+
+            class FakeProcess:
+                pid = 4242
+                stdin = FakePipe()
+                stdout = FakeStdout()
+
+                def poll(self):
+                    return None if not waited else 1
+
+                def terminate(self):
+                    terminated.append("terminate")
+
+                def kill(self):
+                    terminated.append("kill")
+
+                def wait(self, timeout=None):
+                    waited.append(timeout)
+                    return 1
+
+            process = FakeProcess()
+            worker = BatchWorkerProcess(
+                manager.reference,
+                sys.executable,
+                job_glob="login-*/input.json",
+                busy_error="busy",
+            )
+
+            def boom(_payload):
+                raise ValueError("parser exploded")
+
+            with patch(
+                "grok_manager.worker_runtime.subprocess.Popen", return_value=process
+            ), patch("grok_manager.worker_runtime.os.killpg", side_effect=ProcessLookupError):
+                with self.assertRaisesRegex(ValueError, "parser exploded"):
+                    worker.run(
+                        "batch-login",
+                        {"settings": {}, "accounts": []},
+                        log=lambda _message: None,
+                        parse_result=boom,
+                        stdin_missing_message="stdin missing",
+                        start_failed_message="start failed: %s",
+                        exit_failed_message="exit failed: %s",
+                    )
+
+            self.assertTrue(waited)
+            self.assertIn("terminate", terminated)
+            self.assertIn("stdout", closed)
+            self.assertIsNone(worker._process)
 
     def test_login_updates_sso_and_cpa_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -594,7 +923,7 @@ class BatchLoginCredentialTests(unittest.TestCase):
                     "fresh-access",
                     "fresh-refresh",
                     True,
-                    MANAGED_AUTH_DIR.resolve(),
+                    Path(),
                 ),
                 (
                     result.ok,
@@ -649,6 +978,212 @@ class BatchLoginCredentialTests(unittest.TestCase):
             self.assertEqual(True, results[0].ok)
             self.assertIn("自动重置密码后", results[0].detail)
             self.assertTrue(any("邮箱或密码错误" in line for line in logs))
+
+    def test_batch_login_ignores_non_canonical_password_error_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            account = manager.store.upsert(
+                AccountDraft(email="variant@example.com", password="old-password")
+            )
+            # Only the canonical browser signal may trigger auto-reset.
+            first = LoginResult(
+                account.id,
+                account.email,
+                False,
+                "The email or password you entered is incorrect.",
+            )
+            logs = []
+            with patch.object(manager.login, "login_accounts", return_value=[first]):
+                with patch.object(manager, "reset_passwords") as reset_passwords:
+                    with patch.object(manager, "inspect_accounts", return_value=[]):
+                        results = manager.batch_login([account.id], log=logs.append)
+
+            reset_passwords.assert_not_called()
+            self.assertFalse(results[0].ok)
+            self.assertEqual(first.detail, results[0].detail)
+            self.assertFalse(any("自动重置密码" in line for line in logs))
+
+    def test_pending_sso_replace_is_remembered_across_sync_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            account = manager.store.upsert(
+                AccountDraft(
+                    email="pending@example.com",
+                    password="password",
+                    sso_token="fresh-sso",
+                    access_token="access",
+                    refresh_token="refresh",
+                )
+            )
+            first = LoginResult(
+                account.id,
+                account.email,
+                True,
+                "登录成功",
+                previous_sso_token="old-sso",
+                sso_token="fresh-sso",
+            )
+            second = LoginResult(
+                account.id,
+                account.email,
+                True,
+                "登录成功",
+                previous_sso_token="fresh-sso",
+                sso_token="newer-sso",
+            )
+            seen = []
+
+            def fail_sync(sso_token, email="", log_callback=None, previous_token=""):
+                seen.append((previous_token, sso_token))
+                raise RuntimeError("remote unavailable")
+
+            with patch.object(manager.reference, "sync_grok2api", side_effect=fail_sync):
+                note1 = manager._sync_relogin_credentials(first)
+                note2 = manager._sync_relogin_credentials(second)
+
+            self.assertIn("Grok2API 未同步", note1)
+            self.assertIn("Grok2API 未同步", note2)
+            # Generic remote failures do not burn through the whole candidate
+            # chain; only explicit account_not_found advances to pending_new.
+            self.assertEqual(
+                [
+                    ("old-sso", "fresh-sso"),
+                    ("old-sso", "newer-sso"),
+                ],
+                seen,
+            )
+            self.assertEqual(
+                "old-sso\nnewer-sso",
+                manager.vault.get_secret("pending-sso-replace:pending@example.com"),
+            )
+
+    def test_pending_sso_chain_recovers_after_lost_replace_response(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            account = manager.store.upsert(
+                AccountDraft(
+                    email="recover@example.com",
+                    password="password",
+                    sso_token="fresh-sso",
+                    access_token="access",
+                    refresh_token="refresh",
+                )
+            )
+            # First login persisted pending old->fresh after a lost response.
+            manager.vault.put_secret(
+                "pending-sso-replace:recover@example.com", "old-sso\nfresh-sso"
+            )
+            result = LoginResult(
+                account.id,
+                account.email,
+                True,
+                "登录成功",
+                previous_sso_token="fresh-sso",
+                sso_token="newer-sso",
+            )
+            seen = []
+
+            def sync(sso_token, email="", log_callback=None, previous_token=""):
+                seen.append((previous_token, sso_token))
+                if previous_token == "old-sso":
+                    raise RuntimeError(
+                        "grok2api 远端未找到待替换凭据，已拒绝新增: recover@example.com"
+                    )
+                if previous_token == "fresh-sso" and sso_token == "newer-sso":
+                    return None
+                raise RuntimeError("unexpected previous token: %s" % previous_token)
+
+            with patch.object(manager.reference, "sync_grok2api", side_effect=sync):
+                note = manager._sync_relogin_credentials(result)
+
+            self.assertEqual("", note)
+            self.assertEqual(
+                [("old-sso", "newer-sso"), ("fresh-sso", "newer-sso")],
+                seen,
+            )
+            self.assertEqual(
+                "",
+                manager.vault.get_secret("pending-sso-replace:recover@example.com"),
+            )
+
+    def test_same_token_relogin_keeps_previous_token_for_remote_check(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            account = manager.store.upsert(
+                AccountDraft(
+                    email="same@example.com",
+                    password="password",
+                    sso_token="same-sso",
+                    access_token="access",
+                    refresh_token="refresh",
+                )
+            )
+            result = LoginResult(
+                account.id,
+                account.email,
+                True,
+                "登录成功",
+                previous_sso_token="same-sso",
+                sso_token="same-sso",
+            )
+            seen = []
+
+            def sync(sso_token, email="", log_callback=None, previous_token=""):
+                seen.append((previous_token, sso_token))
+                return None
+
+            with patch.object(manager.reference, "sync_grok2api", side_effect=sync):
+                note = manager._sync_relogin_credentials(result)
+
+            self.assertEqual("", note)
+            self.assertEqual([("same-sso", "same-sso")], seen)
+
+    def test_pending_chain_persists_after_failed_intermediate_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            account = manager.store.upsert(
+                AccountDraft(
+                    email="chain@example.com",
+                    password="password",
+                    sso_token="fresh-sso",
+                    access_token="access",
+                    refresh_token="refresh",
+                )
+            )
+            manager.vault.put_secret(
+                "pending-sso-replace:chain@example.com", "old-sso\nfresh-sso"
+            )
+            result = LoginResult(
+                account.id,
+                account.email,
+                True,
+                "登录成功",
+                previous_sso_token="fresh-sso",
+                sso_token="newer-sso",
+            )
+            seen = []
+
+            def sync(sso_token, email="", log_callback=None, previous_token=""):
+                seen.append((previous_token, sso_token))
+                if previous_token == "old-sso":
+                    raise RuntimeError(
+                        "grok2api 远端未找到待替换凭据，已拒绝新增: chain@example.com"
+                    )
+                raise RuntimeError("remote unavailable after advance")
+
+            with patch.object(manager.reference, "sync_grok2api", side_effect=sync):
+                note = manager._sync_relogin_credentials(result)
+
+            self.assertIn("Grok2API 未同步", note)
+            self.assertEqual(
+                [("old-sso", "newer-sso"), ("fresh-sso", "newer-sso")],
+                seen,
+            )
+            # Intermediate token must remain as the next previous candidate.
+            self.assertEqual(
+                "fresh-sso\nnewer-sso",
+                manager.vault.get_secret("pending-sso-replace:chain@example.com"),
+            )
 
 if __name__ == "__main__":
     unittest.main()

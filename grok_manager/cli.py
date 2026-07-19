@@ -1,16 +1,81 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
+import os
 import sys
 from dataclasses import asdict
 from pathlib import Path
 from typing import Iterable, List, Optional
 
 from .models import Account, STATUS_LABELS
+from .paths import PROJECT_ROOT, VAULT_FILE
 from .reference import RegistrationRequest
 from .service import GrokManager
+from .vault import CredentialVault, VaultError
 
+
+_CURRENT_VAULT: Optional[CredentialVault] = None
+VAULT_PASSWORD_ENV = "GROK_MANAGER_VAULT_PASSWORD"
+
+
+def load_project_dotenv(path: Optional[Path] = None) -> Path:
+    """Load KEY=VALUE pairs from a local .env without overriding existing env."""
+    env_path = Path(path) if path is not None else PROJECT_ROOT / ".env"
+    if not env_path.is_file():
+        return env_path
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return env_path
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        os.environ[key] = value
+    return env_path
+
+
+def vault_password_from_env() -> str:
+    return str(os.environ.get(VAULT_PASSWORD_ENV) or "").strip()
+
+
+def unlock_vault() -> CredentialVault:
+    load_project_dotenv()
+    vault = CredentialVault(VAULT_FILE)
+    password = vault_password_from_env()
+    if not vault.is_initialized:
+        if not password:
+            print(
+                "首次启动需要创建凭据保险库主密码（至少 12 个字符）。\n"
+                "也可写入环境变量 %s 或项目根目录 .env 后重启。"
+                % VAULT_PASSWORD_ENV,
+                file=sys.stderr,
+            )
+            password = getpass.getpass("创建主密码: ")
+            confirmation = getpass.getpass("再次输入主密码: ")
+            if password != confirmation:
+                raise VaultError("两次输入的主密码不一致")
+        vault.initialize(password)
+        return vault
+    if not password:
+        password = getpass.getpass("请输入凭据保险库主密码: ")
+    vault.unlock(password)
+    return vault
+
+
+def _manager() -> GrokManager:
+    if _CURRENT_VAULT is None:
+        raise VaultError("应用尚未解锁凭据保险库")
+    return GrokManager(vault=_CURRENT_VAULT)
 
 def _parse_ids(raw: str) -> List[int]:
     values = []
@@ -58,7 +123,7 @@ def _account_summary(account: Account) -> dict:
 
 
 def command_list(args: argparse.Namespace) -> int:
-    manager = GrokManager()
+    manager = _manager()
     accounts = manager.store.list_accounts(search=args.search, status=args.status, limit=args.limit)
     if args.json:
         print(json.dumps([_account_summary(account) for account in accounts], ensure_ascii=False, indent=2))
@@ -83,7 +148,7 @@ def command_list(args: argparse.Namespace) -> int:
 
 
 def command_import(args: argparse.Namespace) -> int:
-    manager = GrokManager()
+    manager = _manager()
     files = [Path(value).expanduser().resolve() for value in args.file] if args.file else None
     accounts = manager.import_reference_accounts(files)
     print("已导入/更新 %s 个账号" % len(accounts))
@@ -91,7 +156,7 @@ def command_import(args: argparse.Namespace) -> int:
 
 
 def command_inspect(args: argparse.Namespace) -> int:
-    manager = GrokManager()
+    manager = _manager()
     ids = _selected_ids(manager, args.ids, args.all)
     if not ids:
         print("没有待巡检账号，请指定 --ids 或 --all", file=sys.stderr)
@@ -107,7 +172,7 @@ def command_inspect(args: argparse.Namespace) -> int:
 
 
 def command_login(args: argparse.Namespace) -> int:
-    manager = GrokManager()
+    manager = _manager()
     if args.expired:
         ids = manager.relogin_candidate_ids()
     else:
@@ -127,7 +192,7 @@ def command_login(args: argparse.Namespace) -> int:
 
 
 def command_reset_password(args: argparse.Namespace) -> int:
-    manager = GrokManager()
+    manager = _manager()
     ids = _selected_ids(manager, args.ids, args.all)
     if not ids:
         print("没有待重置密码账号，请指定 --ids 或 --all", file=sys.stderr)
@@ -157,7 +222,7 @@ def command_reset_password(args: argparse.Namespace) -> int:
     return 0 if success == len(reset_ids) else 1
 
 def command_register(args: argparse.Namespace) -> int:
-    manager = GrokManager()
+    manager = _manager()
     request = RegistrationRequest(args.count, args.threads, args.mint_workers)
     result = manager.run_registration(request, log=lambda line: print(line, flush=True))
     print(
@@ -170,7 +235,7 @@ def command_register(args: argparse.Namespace) -> int:
 
 
 def command_config_check(args: argparse.Namespace) -> int:
-    manager = GrokManager()
+    manager = _manager()
     checks = manager.diagnostics()
     for ok, message in checks:
         print("%s %s" % ("✓" if ok else "✗", message))
@@ -178,13 +243,13 @@ def command_config_check(args: argparse.Namespace) -> int:
 
 
 def command_config_show(args: argparse.Namespace) -> int:
-    manager = GrokManager()
+    manager = _manager()
     print(json.dumps(asdict(manager.config), ensure_ascii=False, indent=2))
     return 0
 
 
 def command_delete(args: argparse.Namespace) -> int:
-    manager = GrokManager()
+    manager = _manager()
     ids = _parse_ids(args.ids)
     if not ids:
         print("请通过 --ids 指定账号", file=sys.stderr)
@@ -197,12 +262,13 @@ def command_delete(args: argparse.Namespace) -> int:
 def command_ui(args: argparse.Namespace) -> int:
     from .web import GrokWebApplication
 
-    application = GrokWebApplication()
+    application = GrokWebApplication(_manager())
     try:
         application.serve(
             host=getattr(args, "host", "127.0.0.1"),
             port=getattr(args, "port", 8787),
             open_browser=not getattr(args, "no_browser", False),
+            allow_lan=bool(getattr(args, "lan", False)),
         )
         return 0
     except (OSError, ValueError) as exc:
@@ -215,8 +281,17 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
 
     ui = subparsers.add_parser("ui", help="启动本地 Web 管理端")
-    ui.add_argument("--host", default="127.0.0.1")
+    ui.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="绑定地址；默认 127.0.0.1。配合 --lan 可指定网卡地址",
+    )
     ui.add_argument("--port", type=int, default=8787)
+    ui.add_argument(
+        "--lan",
+        action="store_true",
+        help="允许局域网访问（默认绑定 0.0.0.0，并放宽 Host 校验）",
+    )
     ui.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
     ui.set_defaults(handler=command_ui)
 
@@ -268,8 +343,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
+    global _CURRENT_VAULT
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
-    if not args.command:
-        return command_ui(args)
-    return int(args.handler(args))
+    try:
+        _CURRENT_VAULT = unlock_vault()
+    except (VaultError, EOFError, KeyboardInterrupt) as exc:
+        print("凭据保险库解锁失败: %s" % exc, file=sys.stderr)
+        return 2
+    try:
+        if not args.command:
+            return command_ui(args)
+        return int(args.handler(args))
+    finally:
+        if _CURRENT_VAULT is not None:
+            _CURRENT_VAULT.lock()
+        _CURRENT_VAULT = None

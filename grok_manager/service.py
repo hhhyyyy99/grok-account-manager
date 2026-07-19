@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -25,6 +26,7 @@ from .reference import (
 )
 from .store import AccountStore
 from .paths import migrate_legacy_install_data
+from .vault import CredentialVault, VaultLockedError
 
 
 class GrokManager:
@@ -36,14 +38,25 @@ class GrokManager:
         store: Optional[AccountStore] = None,
         reference: Optional[ReferenceProject] = None,
         python_executable: str = "",
+        vault: Optional[CredentialVault] = None,
     ):
         migrate_legacy_install_data()
         self.config_store = config_store or ConfigStore()
         self.config = self.config_store.load()
-        self.store = store or AccountStore()
         self.reference = reference or ReferenceProject()
-        self.python_executable = python_executable or sys.executable
+        migration_vault = store.vault if store is not None else vault
+        if migration_vault is not None:
+            self.reference.credential_vault = migration_vault
         self.reference.migrate_legacy_data()
+        if store is not None:
+            self.store = store
+            self.vault = store.vault
+        elif vault is not None:
+            self.vault = vault
+            self.store = AccountStore(vault=vault)
+        else:
+            raise VaultLockedError("启动管理端前必须先解锁凭据保险库")
+        self.python_executable = python_executable or sys.executable
         self.reference.ensure_registration_config()
         self._wire_adapters()
 
@@ -67,8 +80,130 @@ class GrokManager:
         account_files: Optional[Sequence[Path]] = None,
         extra_auth_dirs: Sequence[Path] = (),
     ) -> List[Account]:
-        drafts = self.reference.import_records(account_files, extra_auth_dirs)
-        return self.store.upsert_many(drafts)
+        files = (
+            [Path(path) for path in account_files]
+            if account_files is not None
+            else self.reference.discover_account_files()
+        )
+        drafts = self.reference.import_records(files, extra_auth_dirs)
+        imported_emails = set()
+        used_auth_files: set[str] = set()
+        batch_dirs: set[Path] = set()
+        for draft in drafts:
+            imported_emails.add(str(draft.email or "").strip().lower())
+            if draft.auth_file:
+                try:
+                    used_auth_files.add(str(Path(draft.auth_file).expanduser().resolve()))
+                except OSError:
+                    pass
+            self.reference.find_mail_credential(draft.email, draft.source)
+        accounts = self.store.upsert_many(
+            replace(draft, auth_file="") for draft in drafts
+        )
+        data_root = self.reference.data_root.resolve()
+        output_root = self.reference.output_dir.resolve()
+        for artifact in files:
+            resolved = self._resolved_data_root_path(artifact, data_root)
+            if resolved is not None:
+                batch_dir = self._batch_dir_for_artifact(resolved, output_root)
+                if batch_dir is not None:
+                    batch_dirs.add(batch_dir)
+            self._delete_data_root_artifact(artifact, data_root)
+        for auth_path in used_auth_files:
+            resolved = self._resolved_data_root_path(auth_path, data_root)
+            if resolved is not None:
+                batch_dir = self._batch_dir_for_artifact(resolved, output_root)
+                if batch_dir is not None:
+                    batch_dirs.add(batch_dir)
+            self._delete_data_root_artifact(auth_path, data_root)
+        self._prune_imported_mail_credentials(imported_emails, data_root)
+        for batch_dir in batch_dirs:
+            self._delete_data_root_tree(batch_dir / "sub2api_exports", data_root)
+        return accounts
+
+    @staticmethod
+    def _resolved_data_root_path(path: Path | str, data_root: Path) -> Optional[Path]:
+        try:
+            resolved = Path(path).expanduser().resolve()
+            resolved.relative_to(data_root)
+            return resolved
+        except (OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _batch_dir_for_artifact(path: Path, output_root: Path) -> Optional[Path]:
+        """Return registration-output batch dir only; never climb to data root."""
+        try:
+            resolved = path.expanduser().resolve()
+            relative = resolved.relative_to(output_root)
+        except (OSError, ValueError):
+            return None
+        if not relative.parts:
+            return None
+        # registration-output/<batch>/...
+        return (output_root / relative.parts[0]).resolve()
+
+    @staticmethod
+    def _delete_data_root_artifact(path: Path | str, data_root: Path) -> None:
+        resolved = GrokManager._resolved_data_root_path(path, data_root)
+        if resolved is None:
+            return
+        try:
+            resolved.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _delete_data_root_tree(path: Path | str, data_root: Path) -> None:
+        resolved = GrokManager._resolved_data_root_path(path, data_root)
+        if resolved is None or not resolved.exists():
+            return
+        try:
+            if resolved.is_dir():
+                shutil.rmtree(resolved)
+            else:
+                resolved.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _prune_imported_mail_credentials(
+        self, imported_emails: set[str], data_root: Path
+    ) -> None:
+        if not imported_emails:
+            return
+        for path in self.reference.discover_mail_credential_files():
+            try:
+                resolved = Path(path).expanduser().resolve()
+                resolved.relative_to(data_root)
+            except (OSError, ValueError):
+                continue
+            try:
+                lines = resolved.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            remaining: List[str] = []
+            changed = False
+            for line in lines:
+                address, separator, _credential = line.partition("\t")
+                if separator and address.strip().casefold() in imported_emails:
+                    changed = True
+                    continue
+                remaining.append(line)
+            if not changed:
+                continue
+            if remaining:
+                try:
+                    resolved.write_text(
+                        "\n".join(remaining) + ("\n" if remaining else ""),
+                        encoding="utf-8",
+                    )
+                except OSError:
+                    pass
+            else:
+                try:
+                    resolved.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def import_account_text(self, text: str, source: str = "manual-import") -> List[Account]:
         auth_index = self.reference.build_auth_index()
@@ -129,48 +264,222 @@ class GrokManager:
             cancelled=cancelled,
         )
 
-    def _sync_relogin_credentials(self, result: LoginResult, log=None) -> None:
-        try:
-            hotload_path = self.reference.sync_cpa_hotload(result.auth_file)
-        except Exception as exc:
-            if log:
-                log("[%s] CPA hotload 更新失败: %s" % (result.email, exc))
-        else:
-            if hotload_path is not None and log:
-                log("[%s] CPA hotload 已更新: %s" % (result.email, hotload_path))
+    @staticmethod
+    def _pending_sso_secret_name(email: str) -> str:
+        return "pending-sso-replace:%s" % str(email or "").strip().lower()
 
-        account = self.store.get(result.account_id)
-        if account is None or not account.sso_token:
-            if log:
-                log("[%s] Grok2API 更新失败: 管理库没有新的 SSO token" % result.email)
+    @staticmethod
+    def _parse_pending_sso_secret(raw: str) -> tuple[str, str]:
+        text = str(raw or "").strip()
+        if not text:
+            return "", ""
+        if "\n" in text:
+            old, _, new = text.partition("\n")
+            return old.strip(), new.strip()
+        # Legacy format stored only the old remote token.
+        return text, ""
+
+    def _remember_pending_sso_replace(
+        self,
+        email: str,
+        previous_token: str,
+        new_token: str = "",
+        *,
+        advance_old: bool = False,
+    ) -> None:
+        previous = str(previous_token or "").strip()
+        fresh = str(new_token or "").strip()
+        normalized_email = str(email or "").strip().lower()
+        if not normalized_email or self.vault is None or not self.vault.is_unlocked:
             return
-        grok_log = None
-        if log:
-            grok_log = lambda message: log("[%s] %s" % (result.email, message))
+        if not previous and not fresh:
+            return
+        secret = self._pending_sso_secret_name(normalized_email)
         try:
-            self.reference.sync_grok2api(
-                account.sso_token,
-                email=result.email,
-                log_callback=grok_log,
+            existing_raw = self.vault.get_secret(secret)
+        except Exception:
+            existing_raw = ""
+        existing_old, existing_new = self._parse_pending_sso_secret(existing_raw)
+
+        if advance_old and previous:
+            # Explicit chain progress after the remote reports the previous old
+            # token is already gone.
+            old = previous
+        else:
+            # Preserve the original remote token that still needs to be replaced.
+            old = existing_old or previous
+        # Advance the "already attempted new token" when a later login produces a
+        # newer value. Keep the first intermediate token if the caller only
+        # re-sends the same pending pair.
+        if fresh and fresh not in {old, existing_old}:
+            new = fresh
+        else:
+            new = existing_new or fresh
+        if old and new and old == new:
+            new = ""
+        if not old and new:
+            # No remote previous known; nothing to recover later.
+            return
+        payload = old if not new else "%s\n%s" % (old, new)
+        if payload == existing_raw:
+            return
+        self.vault.put_secret(secret, payload)
+
+    def _resolve_pending_sso_replace(
+        self, email: str, fallback: str = ""
+    ) -> tuple[str, str]:
+        normalized_email = str(email or "").strip().lower()
+        if normalized_email and self.vault is not None and self.vault.is_unlocked:
+            try:
+                stored = self.vault.get_secret(self._pending_sso_secret_name(normalized_email))
+            except Exception:
+                stored = ""
+            old, new = self._parse_pending_sso_secret(stored)
+            if old or new:
+                return old, new
+        return str(fallback or "").strip(), ""
+
+    def _clear_pending_sso_replace(self, email: str) -> None:
+        normalized_email = str(email or "").strip().lower()
+        if not normalized_email or self.vault is None or not self.vault.is_unlocked:
+            return
+        try:
+            self.vault.delete_secret(self._pending_sso_secret_name(normalized_email))
+        except Exception:
+            pass
+
+    def _previous_tokens_for_remote(
+        self, email: str, previous_token: str = "", current_token: str = ""
+    ) -> List[str]:
+        pending_old, pending_new = self._resolve_pending_sso_replace(email, previous_token)
+        current = str(current_token or "").strip()
+        candidates: List[str] = []
+        for token in (
+            pending_old,
+            previous_token,
+            pending_new,
+        ):
+            value = str(token or "").strip()
+            if not value:
+                continue
+            # Keep same-token candidates so the remote layer can verify presence
+            # when previous == current.
+            if value not in candidates:
+                candidates.append(value)
+        if not candidates and current:
+            # Explicit same-token relogin with no pending state still needs the
+            # remote existence check path.
+            candidates.append(current)
+        return candidates
+
+    def _sync_relogin_credentials(self, result: LoginResult, log=None) -> str:
+        """Best-effort external sync after credentials are already persisted."""
+        notes: List[str] = []
+        try:
+            previous_for_remote, pending_new = self._resolve_pending_sso_replace(
+                result.email, result.previous_sso_token
             )
-        except Exception as exc:
+            sso_token = str(result.sso_token or "").strip()
+            if not sso_token:
+                account = self.store.get(result.account_id) if result.account_id else None
+                sso_token = str(account.sso_token if account else "").strip()
+            seed_previous = result.previous_sso_token or previous_for_remote
+            if seed_previous and seed_previous != sso_token:
+                self._remember_pending_sso_replace(
+                    result.email,
+                    seed_previous,
+                    sso_token or pending_new,
+                )
+                previous_for_remote, pending_new = self._resolve_pending_sso_replace(
+                    result.email, previous_for_remote
+                )
+
+            try:
+                hotload_path = self.reference.sync_cpa_hotload(result.auth_file)
+            except Exception as exc:
+                message = "CPA hotload 未同步: %s" % exc
+                notes.append(message)
+                if log:
+                    log("[%s] %s" % (result.email, message))
+            else:
+                if hotload_path is not None and log:
+                    log("[%s] CPA hotload 已更新: %s" % (result.email, hotload_path))
+
+            if not sso_token:
+                message = "Grok2API 未同步: 没有可用的 SSO token"
+                notes.append(message)
+                if log:
+                    log("[%s] %s" % (result.email, message))
+                return "；".join(notes)
+
+            grok_log = None
             if log:
-                log("[%s] Grok2API 更新失败: %s" % (result.email, exc))
+                grok_log = lambda message: log("[%s] %s" % (result.email, message))
+
+            previous_candidates = self._previous_tokens_for_remote(
+                result.email,
+                previous_token=result.previous_sso_token or previous_for_remote,
+                current_token=sso_token,
+            )
+            if not previous_candidates:
+                previous_candidates = [sso_token or ""]
+
+            sync_errors: List[str] = []
+            for index, previous_token in enumerate(previous_candidates):
+                try:
+                    self.reference.sync_grok2api(
+                        sso_token,
+                        email=result.email,
+                        log_callback=grok_log,
+                        previous_token=previous_token,
+                    )
+                except Exception as exc:
+                    sync_errors.append(str(exc))
+                    # If the original old token is gone because a previous attempt
+                    # already replaced it to pending_new, advance and retry with
+                    # that intermediate token as the next previous candidate.
+                    detail = str(exc)
+                    is_missing = "未找到待替换凭据" in detail or "account_not_found" in detail
+                    has_next = index + 1 < len(previous_candidates)
+                    if is_missing and has_next:
+                        advanced_old = previous_candidates[index + 1]
+                        self._remember_pending_sso_replace(
+                            result.email,
+                            advanced_old,
+                            sso_token,
+                            advance_old=True,
+                        )
+                        if log:
+                            log(
+                                "[%s] 远端旧 token 已不存在，改用中间 token 继续替换"
+                                % result.email
+                            )
+                        continue
+                    message = "Grok2API 未同步: %s" % exc
+                    notes.append(message)
+                    if log:
+                        log("[%s] %s" % (result.email, message))
+                    break
+                else:
+                    self._clear_pending_sso_replace(result.email)
+                    sync_errors = []
+                    break
+            if sync_errors and not any("Grok2API 未同步" in item for item in notes):
+                message = "Grok2API 未同步: %s" % sync_errors[-1]
+                notes.append(message)
+                if log:
+                    log("[%s] %s" % (result.email, message))
+            return "；".join(notes)
+        finally:
+            self.login._remove_transient_auth_file(result.auth_file)
 
     @staticmethod
     def _is_wrong_password_login(result: LoginResult) -> bool:
         if result.ok:
             return False
-        detail = str(result.detail or "").casefold()
-        return any(
-            marker in detail
-            for marker in (
-                "邮箱或密码错误",
-                "wrong email address or password",
-                "incorrect email or password",
-                "invalid email or password",
-            )
-        )
+        # Only the canonical browser signal may trigger auto password reset.
+        detail = str(result.detail or "").strip()
+        return detail == "邮箱或密码错误" or detail.endswith("邮箱或密码错误")
 
     def _auto_reset_login_failures(self, results: List[LoginResult], log=None, progress=None) -> List[LoginResult]:
         candidates = [
@@ -274,11 +583,32 @@ class GrokManager:
             probe_after_login=False,
         )
 
-        def handle_result(result: LoginResult, completed: int, total: int) -> None:
+        def handle_result(result: LoginResult, completed: int, total: int):
+            final = result
             if result.ok and result.account_id:
-                self._sync_relogin_credentials(result, log=log)
+                try:
+                    sync_note = self._sync_relogin_credentials(result, log=log)
+                    detail = result.detail or "批量登录成功"
+                    if sync_note:
+                        detail = "%s；%s" % (detail, sync_note)
+                        if log:
+                            log("[%s] 登录成功，但部分同步未完成: %s" % (result.email, sync_note))
+                    final = replace(result, auth_file="", detail=detail)
+                except Exception as exc:
+                    # Unexpected failures still keep login success; only annotate.
+                    detail = "%s；凭据同步异常: %s" % (
+                        result.detail or "批量登录成功",
+                        exc,
+                    )
+                    final = replace(result, auth_file="", detail=detail)
+                    if log:
+                        log("[%s] %s" % (result.email, detail))
+            elif result.auth_file:
+                self.login._remove_transient_auth_file(result.auth_file)
+                final = replace(result, auth_file="")
             if progress:
-                progress(result, completed, total)
+                progress(final, completed, total)
+            return final
 
         results = self.login.login_accounts(
             account_ids,

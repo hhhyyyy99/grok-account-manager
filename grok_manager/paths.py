@@ -68,6 +68,7 @@ DEFAULT_LEGACY_REFERENCE_ROOT = (
 )
 LEGACY_INSTALLED_DATA_DIR = None if IS_SOURCE_CHECKOUT else PROJECT_ROOT / "data"
 DATABASE_FILE = DATA_DIR / "accounts.sqlite3"
+VAULT_FILE = DATA_DIR / "credentials.vault.json"
 JOBS_DIR = DATA_DIR / "jobs"
 MANAGED_AUTH_DIR = DATA_DIR / "auths"
 REGISTRATION_CONFIG_FILE = DATA_DIR / "registration-config.json"

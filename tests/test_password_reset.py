@@ -173,9 +173,9 @@ class PasswordResetTests(unittest.TestCase):
                 "target@example.com", "New-password-123!", str(source)
             )
 
-            self.assertEqual(source, path)
+            self.assertEqual(manager.vault.path, path)
             self.assertEqual(
-                "target@example.com----New-password-123!----old-sso\n",
+                "target@example.com----old-password----old-sso\n",
                 source.read_text(encoding="utf-8"),
             )
 
@@ -210,7 +210,7 @@ class PasswordResetTests(unittest.TestCase):
             )
             stored = manager.store.get(account.id)
 
-            self.assertEqual((True, "密码已重置，已写入 accounts.txt"), (result.ok, result.detail))
+            self.assertEqual((True, "密码已重置，已写入 credentials.vault.json"), (result.ok, result.detail))
             self.assertEqual(
                 ("New-password-123!", AccountStatus.NEEDS_LOGIN.value),
                 (stored.password if stored else "", stored.status if stored else ""),
@@ -394,8 +394,79 @@ class PasswordResetTests(unittest.TestCase):
         self.assertRegex(password, r"[!@#$%^&*]")
 
     def test_reset_success_detection_accepts_xai_confirmation(self) -> None:
-        self.assertTrue(_has_reset_success("https://accounts.x.ai/sign-in", "Password updated", True))
-        self.assertFalse(_has_reset_success("https://accounts.x.ai/sign-in", "Sign in", False))
+        self.assertTrue(
+            _has_reset_success(
+                "https://accounts.x.ai/sign-in", "Password updated", True
+            )
+        )
+        self.assertTrue(
+            _has_reset_success(
+                "https://accounts.x.ai/sign-in",
+                "You can now sign in with your new password",
+                True,
+            )
+        )
+        self.assertTrue(
+            _has_reset_success(
+                "https://accounts.x.ai/sign-in?email=true",
+                "使用邮箱登录 Email Password",
+                True,
+                password_form_present=False,
+            )
+        )
+        # Leaving the form without success copy is not enough.
+        self.assertFalse(
+            _has_reset_success(
+                "https://accounts.x.ai/account",
+                "",
+                True,
+                password_form_present=False,
+            )
+        )
+        self.assertFalse(
+            _has_reset_success(
+                "https://accounts.x.ai/sign-in",
+                "Too many requests",
+                True,
+                password_form_present=False,
+            )
+        )
+        # Failure phrases that contain "password reset" must not count as success.
+        self.assertFalse(
+            _has_reset_success(
+                "https://accounts.x.ai/reset-password",
+                "Password reset failed",
+                True,
+                password_form_present=False,
+            )
+        )
+        self.assertFalse(
+            _has_reset_success(
+                "https://accounts.x.ai/reset-password",
+                "Password reset error",
+                True,
+                password_form_present=False,
+            )
+        )
+        self.assertFalse(
+            _has_reset_success(
+                "https://accounts.x.ai/reset-password",
+                "密码已重置失败",
+                True,
+                password_form_present=False,
+            )
+        )
+        self.assertFalse(
+            _has_reset_success("https://accounts.x.ai/sign-in", "Sign in", False)
+        )
+        self.assertFalse(
+            _has_reset_success(
+                "https://accounts.x.ai/reset-password",
+                "设置新密码 确认密码 重置密码",
+                True,
+                password_form_present=True,
+            )
+        )
 
 
 if __name__ == "__main__":

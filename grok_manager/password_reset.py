@@ -1,24 +1,16 @@
 from __future__ import annotations
 
 import json
-import os
-import signal
-import subprocess
-import threading
-import time
-import uuid
 from dataclasses import dataclass
-from datetime import datetime
-from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Callable, Iterable, List, Optional
 
 from .models import Account, AccountStatus, PasswordResetResult
-from .paths import JOBS_DIR, ensure_data_dirs, write_private_text_atomic
 from .reference import ReferenceProject
 from .store import AccountStore
+from .worker_runtime import BatchWorkerProcess, LogCallback
 
-LogCallback = Callable[[str], None]
-ProgressCallback = Callable[[PasswordResetResult, int, int], None]
+
+ProgressCallback = Callable[[PasswordResetResult, int, int], Optional[PasswordResetResult]]
 
 
 @dataclass(frozen=True)
@@ -39,39 +31,19 @@ class BatchPasswordResetService:
         self.store = store
         self.project = project
         self.python_executable = python_executable
-        self._lock = threading.Lock()
-        self._process: Optional[subprocess.Popen] = None
-        self._cleanup_stale_inputs()
-
-    @staticmethod
-    def _cleanup_stale_inputs() -> None:
-        ensure_data_dirs()
-        stale_before = time.time() - 24 * 60 * 60
-        for path in JOBS_DIR.glob("password-reset-*/input.json"):
-            try:
-                if path.stat().st_mtime < stale_before:
-                    path.unlink()
-            except OSError:
-                pass
+        self._worker = BatchWorkerProcess(
+            project,
+            python_executable,
+            job_glob="password-reset-*/input.json",
+            busy_error="已有密码重置任务正在运行",
+        )
 
     @property
     def running(self) -> bool:
-        with self._lock:
-            return self._process is not None and self._process.poll() is None
+        return self._worker.running
 
     def cancel(self) -> bool:
-        with self._lock:
-            process = self._process
-        if process is None or process.poll() is not None:
-            return False
-        if os.name != "nt":
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except (OSError, ProcessLookupError):
-                process.terminate()
-        else:
-            process.terminate()
-        return True
+        return self._worker.cancel()
 
     def reset_accounts(
         self,
@@ -108,13 +80,6 @@ class BatchPasswordResetService:
             return results
 
         self.project.validate()
-        ensure_data_dirs()
-        run_dir = JOBS_DIR / (
-            "password-reset-%s-%s"
-            % (datetime.now().strftime("%Y%m%d-%H%M%S"), uuid.uuid4().hex[:6])
-        )
-        run_dir.mkdir(parents=True, exist_ok=False)
-        input_file = run_dir / "input.json"
         document = {
             "settings": {
                 "workers": max(1, min(int(settings.workers), 10)),
@@ -131,65 +96,19 @@ class BatchPasswordResetService:
                 for account, credential in ready
             ],
         }
-        write_private_text_atomic(input_file, json.dumps(document, ensure_ascii=False))
-        process: Optional[subprocess.Popen] = None
-        worker_script = Path(__file__).with_name("reference_worker.py")
-        command = [
-            self.python_executable,
-            str(worker_script),
+        worker_results, parsed_ids, completed = self._worker.run(
             "reset-password",
-            "--input",
-            str(input_file),
-        ]
-        env = self.project.environment()
-        env["PYTHONUNBUFFERED"] = "1"
-        parsed_ids = set()
-        try:
-            with self._lock:
-                if self._process is not None and self._process.poll() is None:
-                    raise RuntimeError("已有密码重置任务正在运行")
-                self._process = subprocess.Popen(
-                    command,
-                    cwd=str(self.project.work_dir),
-                    env=env,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    start_new_session=(os.name != "nt"),
-                )
-                process = self._process
-            if process.stdout is not None:
-                for line in process.stdout:
-                    text = line.rstrip("\r\n")
-                    if text.startswith("GM_LOG "):
-                        self._handle_log(text[7:], log)
-                    elif text.startswith("GM_RESULT "):
-                        result = self._handle_result(text[10:])
-                        results.append(result)
-                        parsed_ids.add(result.account_id)
-                        completed += 1
-                        if progress:
-                            progress(result, completed, total)
-                    elif text.startswith("GM_FATAL "):
-                        self._handle_log(text[9:], log)
-                    elif text:
-                        log(text)
-            return_code = process.wait()
-            if return_code not in (0, 2):
-                log("密码重置工作进程异常退出: %s" % return_code)
-        except OSError as exc:
-            log("密码重置进程无法启动: %s" % exc)
-        finally:
-            if process is not None and process.stdout is not None:
-                process.stdout.close()
-            with self._lock:
-                if self._process is process:
-                    self._process = None
-            try:
-                input_file.unlink()
-            except OSError:
-                pass
+            document,
+            log=log,
+            parse_result=self._handle_result,
+            progress=progress,
+            completed=completed,
+            total=total,
+            stdin_missing_message="密码重置 worker 未创建输入管道",
+            start_failed_message="密码重置进程无法启动: %s",
+            exit_failed_message="密码重置工作进程异常退出: %s",
+        )
+        results.extend(worker_results)
 
         for account, _credential in ready:
             if account.id in parsed_ids:
@@ -238,13 +157,3 @@ class BatchPasswordResetService:
         if not ok and account_id:
             self.store.set_status([account_id], AccountStatus.ERROR.value, detail)
         return PasswordResetResult(account_id, email, ok, detail)
-
-    @staticmethod
-    def _handle_log(payload: str, log: LogCallback) -> None:
-        try:
-            value = json.loads(payload)
-            email = str(value.get("email") or "")
-            message = str(value.get("message") or value.get("error") or value)
-            log("[%s] %s" % (email, message) if email else message)
-        except (json.JSONDecodeError, AttributeError):
-            log(payload)

@@ -5,9 +5,18 @@ from grok_manager.config import ConfigStore, ManagerConfig
 from grok_manager.reference import ReferenceProject
 from grok_manager.service import GrokManager
 from grok_manager.store import AccountStore
+from grok_manager.vault import CredentialVault, KdfParameters
+
+
+TEST_VAULT_KDF = KdfParameters(memory_cost=8 * 1024, iterations=1, lanes=1)
 
 
 def make_manager(root: Path) -> GrokManager:
+    vault = CredentialVault(
+        root / "credentials.vault.json",
+        kdf_parameters=TEST_VAULT_KDF,
+    )
+    vault.initialize("test vault password 123")
     reference_root = root / "reference"
     package = reference_root / "grok_register"
     (package / "turnstilePatch").mkdir(parents=True)
@@ -36,7 +45,7 @@ def make_manager(root: Path) -> GrokManager:
     )
     return GrokManager(
         config_store=config_store,
-        store=AccountStore(root / "accounts.sqlite3"),
+        store=AccountStore(root / "accounts.sqlite3", vault=vault),
         reference=reference,
         python_executable=sys.executable,
     )

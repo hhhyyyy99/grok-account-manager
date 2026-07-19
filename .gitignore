@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .venv/
+node_modules/
 build/
 dist/
 *.egg-info/
@@ -16,3 +17,5 @@ registration-config.json
 registration-output/
 registration-crash.log
 registration-token.json
+.env
+.env.local
