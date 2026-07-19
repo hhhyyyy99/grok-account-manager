@@ -572,13 +572,14 @@ class Grok2ApiRemoteSyncTests(unittest.TestCase):
                 return None
 
         def put(_url, **_kwargs):
-            class Missing:
-                status_code = 404
+            class MissingRoute:
+                status_code = 405
+                text = "Method Not Allowed"
 
                 def raise_for_status(self):
-                    raise RuntimeError("not found")
+                    raise RuntimeError("method not allowed")
 
-            return Missing()
+            return MissingRoute()
 
         def post(url, **kwargs):
             self.assertFalse(url.endswith("/tokens/add"))
@@ -606,45 +607,56 @@ class Grok2ApiRemoteSyncTests(unittest.TestCase):
             saved[0]["basic"],
         )
 
-    def test_relogin_refuses_to_add_when_previous_credential_is_missing(self) -> None:
+    def test_relogin_adds_when_previous_credential_is_missing(self) -> None:
         from grok_register.app import add_token_to_grok2api_remote_pool
 
-        class ReadResponse:
-            status_code = 200
-
-            @staticmethod
-            def json():
-                return {
-                    "tokens": [
-                        {
-                            "token": "another-sso",
-                            "pool": "basic",
-                            "note": "other@example.com",
-                        }
-                    ]
-                }
+        calls = []
 
         class MissingEdit:
             status_code = 404
+            text = '{"detail":"Account not found","code":"account_not_found"}'
 
             def raise_for_status(self):
                 raise RuntimeError("not found")
 
+        class AddResponse:
+            status_code = 200
+
+            @staticmethod
+            def raise_for_status():
+                return None
+
+        def post(url, **kwargs):
+            calls.append((url, kwargs.get("json")))
+            return AddResponse()
+
         with patch(
             "grok_register.app.http_put", return_value=MissingEdit()
-        ), patch(
-            "grok_register.app.http_get", return_value=ReadResponse()
-        ), patch("grok_register.app.http_post") as post:
-            with self.assertRaisesRegex(RuntimeError, "未找到待替换"):
-                add_token_to_grok2api_remote_pool(
-                    "fresh-sso",
-                    email="same@example.com",
-                    settings=self._settings(),
-                    replace_email=True,
-                    previous_token="old-sso",
-                )
+        ), patch("grok_register.app.http_get") as get, patch(
+            "grok_register.app.http_post", side_effect=post
+        ):
+            add_token_to_grok2api_remote_pool(
+                "fresh-sso",
+                email="same@example.com",
+                settings=self._settings(),
+                replace_email=True,
+                previous_token="old-sso",
+            )
 
-        post.assert_not_called()
+        self.assertEqual(
+            [
+                (
+                    "https://grok2api.example/admin/api/tokens/add",
+                    {
+                        "tokens": ["fresh-sso"],
+                        "pool": "basic",
+                        "tags": ["auto-relogin"],
+                    },
+                )
+            ],
+            calls,
+        )
+        get.assert_not_called()
 
     def test_registration_still_uses_remote_add_endpoint(self) -> None:
         from grok_register.app import add_token_to_grok2api_remote_pool

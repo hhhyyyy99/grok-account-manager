@@ -775,6 +775,35 @@ def add_token_to_grok2api_remote_pool(
     api_bases = get_grok2api_remote_api_bases(base)
     old_token = _normalize_sso_token(previous_token)
 
+    def _add_remote_token(tag):
+        add_errors = []
+        add_payload = {
+            "tokens": [token],
+            "pool": remote_pool,
+            "tags": [tag],
+        }
+        for api_base in api_bases:
+            endpoint = f"{api_base}/tokens/add"
+            try:
+                resp_add = http_post(
+                    endpoint,
+                    headers=headers,
+                    params=query,
+                    json=add_payload,
+                    timeout=30,
+                    proxies={},
+                )
+                resp_add.raise_for_status()
+                if log_callback:
+                    action = "已更新" if replace_email else "已写入"
+                    log_callback(
+                        f"[+] {action} grok2api 远端池: {pool_name} ({endpoint})"
+                    )
+                return True
+            except Exception as add_exc:
+                add_errors.append(f"{endpoint}: {add_exc}")
+        return add_errors
+
     # Modern grok2api exposes PUT /tokens/edit for single-token replace.
     # Prefer it on relogin so we do not rewrite multi-thousand token pools.
     if replace_email and old_token:
@@ -783,6 +812,7 @@ def add_token_to_grok2api_remote_pool(
                 log_callback(f"[*] grok2api 远端池 token 未变化: {pool_name}")
             return True
         edit_errors = []
+        old_missing = False
         for api_base in api_bases:
             endpoint = f"{api_base}/tokens/edit"
             try:
@@ -798,6 +828,21 @@ def add_token_to_grok2api_remote_pool(
                     timeout=30,
                     proxies={},
                 )
+                body_text = ""
+                try:
+                    body_text = str(getattr(resp_edit, "text", "") or "")
+                except Exception:
+                    body_text = ""
+                # 404 here usually means the previous token is absent, not that
+                # the edit route is missing. Fall back to add in that case.
+                if resp_edit.status_code == 404 and (
+                    "not found" in body_text.lower()
+                    or "account_not_found" in body_text.lower()
+                    or not body_text
+                ):
+                    old_missing = True
+                    edit_errors.append(f"{endpoint}: HTTP 404 (旧 token 不存在)")
+                    continue
                 if resp_edit.status_code in (404, 405):
                     edit_errors.append(f"{endpoint}: HTTP {resp_edit.status_code}")
                     continue
@@ -809,6 +854,17 @@ def add_token_to_grok2api_remote_pool(
                 return True
             except Exception as edit_exc:
                 edit_errors.append(f"{endpoint}: {edit_exc}")
+        if old_missing:
+            if log_callback:
+                log_callback(
+                    "[Debug] 远端未找到旧 SSO，改为新增: " + "; ".join(edit_errors)
+                )
+            add_errors = _add_remote_token("auto-relogin")
+            if add_errors is True:
+                return True
+            raise RuntimeError(
+                "grok2api 远端未找到旧凭据，且新增失败: " + "; ".join(add_errors)
+            )
         if log_callback:
             log_callback(
                 "[Debug] /tokens/edit 替换失败，尝试 /tokens 全量模式: "
@@ -816,31 +872,9 @@ def add_token_to_grok2api_remote_pool(
             )
 
     if not replace_email:
-        add_errors = []
-        add_payload = {
-            "tokens": [token],
-            "pool": remote_pool,
-            "tags": ["auto-register"],
-        }
-        for api_base in api_bases:
-            endpoint = f"{api_base}/tokens/add"
-            try:
-                resp_add = http_post(
-                    endpoint,
-                    headers=headers,
-                    params=query,
-                    json=add_payload,
-                    timeout=30,
-                    proxies={},
-                )
-                resp_add.raise_for_status()
-                if log_callback:
-                    log_callback(
-                        f"[+] 已写入 grok2api 远端池: {pool_name} ({endpoint})"
-                    )
-                return True
-            except Exception as add_exc:
-                add_errors.append(f"{endpoint}: {add_exc}")
+        add_errors = _add_remote_token("auto-register")
+        if add_errors is True:
+            return True
         if log_callback:
             log_callback(
                 "[Debug] /tokens/add 写入失败，尝试 /tokens 全量模式: "
@@ -878,6 +912,15 @@ def add_token_to_grok2api_remote_pool(
             read_errors.append(f"{endpoint}: {read_exc}")
             continue
     if current is None:
+        # Avoid downloading/rewriting huge pools when possible: last resort add.
+        if replace_email:
+            add_errors = _add_remote_token("auto-relogin")
+            if add_errors is True:
+                return True
+            raise RuntimeError(
+                "grok2api 远端池读取失败，且新增失败: "
+                + "; ".join(read_errors + list(add_errors or []))
+            )
         raise RuntimeError(
             "grok2api 远端池读取失败，已拒绝写入: " + "; ".join(read_errors)
         )
@@ -890,9 +933,18 @@ def add_token_to_grok2api_remote_pool(
             previous_token=previous_token,
         )
         if not changed:
+            if log_callback:
+                log_callback(
+                    "[Debug] 全量池未找到旧 SSO，改为新增"
+                    + (f": {email}" if email else "")
+                )
+            add_errors = _add_remote_token("auto-relogin")
+            if add_errors is True:
+                return True
             raise RuntimeError(
-                "grok2api 远端池未找到待替换凭据，已拒绝新增"
+                "grok2api 远端未找到待替换凭据，且新增失败"
                 + (f": {email}" if email else "")
+                + (("；" + "; ".join(add_errors)) if add_errors else "")
             )
     else:
         pool, changed = _upsert_grok2api_pool(

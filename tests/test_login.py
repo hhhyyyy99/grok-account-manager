@@ -594,7 +594,7 @@ class BatchLoginCredentialTests(unittest.TestCase):
             self.assertEqual("", result.auth_file)
             self.assertFalse(auth_file.exists())
 
-    def test_login_marks_error_when_grok2api_sync_fails(self) -> None:
+    def test_login_keeps_success_when_grok2api_sync_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manager = make_manager(root)
@@ -617,16 +617,17 @@ class BatchLoginCredentialTests(unittest.TestCase):
                 result = manager.batch_login([account.id], log=logs.append)[0]
             stored = manager.store.get(account.id)
 
-            self.assertFalse(result.ok)
-            self.assertIn("凭据同步失败", result.detail)
-            self.assertEqual(AccountStatus.ERROR.value, stored.status if stored else "")
-            # Keep the previous SSO so the next relogin can still match remote.
-            self.assertEqual("old-sso", stored.sso_token if stored else "")
+            # Login itself still succeeds; remote sync is only annotated.
+            self.assertTrue(result.ok)
+            self.assertIn("Grok2API 未同步", result.detail)
+            self.assertNotEqual(AccountStatus.ERROR.value, stored.status if stored else "")
+            self.assertEqual("fresh-sso", stored.sso_token if stored else "")
             self.assertEqual("old-sso", result.previous_sso_token)
             self.assertEqual("fresh-sso", result.sso_token)
             self.assertEqual("fresh-access", stored.access_token if stored else "")
             self.assertFalse(auth_file.exists())
-            self.assertTrue(any("Grok2API 更新失败" in line for line in logs))
+            self.assertTrue(any("Grok2API 未同步" in line for line in logs))
+            self.assertTrue(any("部分同步未完成" in line for line in logs))
 
     def test_login_syncs_cpa_and_grok2api_before_next_result(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -264,38 +264,47 @@ class GrokManager:
             sso_token=sso_token,
         )
 
-    def _sync_relogin_credentials(self, result: LoginResult, log=None) -> None:
+    def _sync_relogin_credentials(self, result: LoginResult, log=None) -> str:
+        """Sync hotload/Grok2API after login. Returns a non-fatal note, if any."""
+        notes: List[str] = []
         try:
             try:
                 hotload_path = self.reference.sync_cpa_hotload(result.auth_file)
             except Exception as exc:
+                message = "CPA hotload 未同步: %s" % exc
+                notes.append(message)
                 if log:
-                    log("[%s] CPA hotload 更新失败: %s" % (result.email, exc))
-                raise
-            if hotload_path is not None and log:
-                log("[%s] CPA hotload 已更新: %s" % (result.email, hotload_path))
+                    log("[%s] %s" % (result.email, message))
+            else:
+                if hotload_path is not None and log:
+                    log("[%s] CPA hotload 已更新: %s" % (result.email, hotload_path))
 
             sso_token = str(result.sso_token or "").strip()
             if not sso_token:
-                message = "Grok2API 更新失败: 登录结果没有新的 SSO token"
+                message = "Grok2API 未同步: 登录结果没有新的 SSO token"
+                notes.append(message)
                 if log:
                     log("[%s] %s" % (result.email, message))
-                raise RuntimeError(message)
-            grok_log = None
-            if log:
-                grok_log = lambda message: log("[%s] %s" % (result.email, message))
-            try:
-                self.reference.sync_grok2api(
-                    sso_token,
-                    email=result.email,
-                    log_callback=grok_log,
-                    previous_token=result.previous_sso_token,
-                )
-            except Exception as exc:
+            else:
+                grok_log = None
                 if log:
-                    log("[%s] Grok2API 更新失败: %s" % (result.email, exc))
-                raise
-            self._commit_relogin_sso(result)
+                    grok_log = lambda message: log("[%s] %s" % (result.email, message))
+                try:
+                    self.reference.sync_grok2api(
+                        sso_token,
+                        email=result.email,
+                        log_callback=grok_log,
+                        previous_token=result.previous_sso_token,
+                    )
+                except Exception as exc:
+                    message = "Grok2API 未同步: %s" % exc
+                    notes.append(message)
+                    if log:
+                        log("[%s] %s" % (result.email, message))
+                # Commit the fresh SSO even when remote/local pool sync fails so
+                # the managed account still holds the successful login result.
+                self._commit_relogin_sso(result)
+            return "；".join(notes)
         finally:
             self.login._remove_transient_auth_file(result.auth_file)
 
@@ -433,22 +442,22 @@ class GrokManager:
             final = result
             if result.ok and result.account_id:
                 try:
-                    self._sync_relogin_credentials(result, log=log)
-                    final = replace(result, auth_file="")
+                    sync_note = self._sync_relogin_credentials(result, log=log)
+                    detail = result.detail or "批量登录成功"
+                    if sync_note:
+                        detail = "%s；%s" % (detail, sync_note)
+                        if log:
+                            log("[%s] 登录成功，但部分同步未完成: %s" % (result.email, sync_note))
+                    final = replace(result, auth_file="", detail=detail)
                 except Exception as exc:
-                    final = replace(
-                        result,
-                        ok=False,
-                        detail="登录成功但凭据同步失败: %s" % exc,
-                        auth_file="",
+                    # Unexpected failures still keep login success; only annotate.
+                    detail = "%s；凭据同步异常: %s" % (
+                        result.detail or "批量登录成功",
+                        exc,
                     )
-                    self.store.set_status(
-                        [result.account_id],
-                        AccountStatus.ERROR.value,
-                        final.detail,
-                    )
+                    final = replace(result, auth_file="", detail=detail)
                     if log:
-                        log("[%s] %s" % (result.email, final.detail))
+                        log("[%s] %s" % (result.email, detail))
             elif result.auth_file:
                 self.login._remove_transient_auth_file(result.auth_file)
                 final = replace(result, auth_file="")
