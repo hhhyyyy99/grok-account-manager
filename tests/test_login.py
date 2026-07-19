@@ -249,8 +249,75 @@ class BatchLoginCredentialTests(unittest.TestCase):
         self.assertEqual("123456", password_element.value)
 
     def test_login_rejects_invalid_credentials_message(self) -> None:
-        with self.assertRaisesRegex(browser_confirm.BrowserConfirmError, "邮箱或密码错误"):
-            browser_confirm._raise_for_login_error("Wrong email address or password.")
+        samples = (
+            "Wrong email address or password.",
+            "The email or password you entered is incorrect.",
+            "Incorrect password",
+            "邮箱地址或密码错误",
+            "密码不正确",
+        )
+        for sample in samples:
+            with self.subTest(sample=sample):
+                with self.assertRaisesRegex(
+                    browser_confirm.BrowserConfirmError, "邮箱或密码错误"
+                ):
+                    browser_confirm._raise_for_login_error(sample)
+
+    def test_password_page_retries_surface_wrong_password_error(self) -> None:
+        class FakeElement:
+            def clear(self):
+                return None
+
+            def input(self, _value):
+                return None
+
+            def click(self, by_js=False):
+                return None
+
+        class FakePage:
+            def ele(self, selector, timeout=0):
+                text = str(selector)
+                if "user_code" in text or "continue-with-email" in text:
+                    return None
+                if "type='email'" in text or "type=\"email\"" in text:
+                    return FakeElement()
+                if "password" in text:
+                    return FakeElement()
+                if "submit" in text or "sign-in-submit" in text:
+                    return FakeElement()
+                return None
+
+            def eles(self, _selector):
+                return []
+
+            def get(self, _url, timeout=None):
+                return None
+
+            def run_js(self, script):
+                if "innerText" in str(script):
+                    return "Sign in"
+                return ""
+
+        page = FakePage()
+        logs = []
+
+        with patch.object(browser_confirm, "_wait_turnstile", return_value=True), patch.object(
+            browser_confirm, "_click_exact", return_value=True
+        ), patch.object(browser_confirm, "_sleep", return_value=None), patch.object(
+            browser_confirm, "_page_url", return_value="https://accounts.x.ai/sign-in"
+        ), patch.object(browser_confirm, "_click_email_login_chooser", return_value=False):
+            with self.assertRaisesRegex(browser_confirm.BrowserConfirmError, "邮箱或密码错误"):
+                browser_confirm.approve_device_code(
+                    page,
+                    verification_uri_complete="https://accounts.x.ai/oauth2/device?user_code=ABCD",
+                    email="target@example.com",
+                    password="wrong-password",
+                    user_code="ABCD",
+                    timeout_sec=30,
+                    log=logs.append,
+                )
+
+        self.assertTrue(any("login attempt" in line for line in logs))
 
     def test_oauth_poll_retries_transient_network_error(self) -> None:
         response = {
@@ -811,6 +878,38 @@ class BatchLoginCredentialTests(unittest.TestCase):
             self.assertEqual(True, results[0].ok)
             self.assertIn("自动重置密码后", results[0].detail)
             self.assertTrue(any("邮箱或密码错误" in line for line in logs))
+
+    def test_batch_login_auto_resets_variant_password_error_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            account = manager.store.upsert(
+                AccountDraft(email="variant@example.com", password="old-password")
+            )
+            first = LoginResult(
+                account.id,
+                account.email,
+                False,
+                "The email or password you entered is incorrect.",
+            )
+            retried = LoginResult(account.id, account.email, True, "批量登录成功")
+            reset = PasswordResetResult(account.id, account.email, True, "密码已重置")
+            calls = []
+
+            def fake_login(_ids, _settings, log=None, progress=None):
+                calls.append(list(_ids))
+                return [first] if len(calls) == 1 else [retried]
+
+            logs = []
+            with patch.object(manager.login, "login_accounts", side_effect=fake_login):
+                with patch.object(manager, "reset_passwords", return_value=[reset]) as reset_passwords:
+                    with patch.object(manager, "_sync_relogin_credentials"):
+                        with patch.object(manager, "inspect_accounts", return_value=[]):
+                            results = manager.batch_login([account.id], log=logs.append)
+
+            self.assertEqual(2, len(calls))
+            reset_passwords.assert_called_once_with([account.id], log=logs.append)
+            self.assertTrue(results[0].ok)
+            self.assertTrue(any("自动重置密码" in line for line in logs))
 
 if __name__ == "__main__":
     unittest.main()

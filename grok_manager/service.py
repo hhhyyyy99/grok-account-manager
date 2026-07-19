@@ -303,15 +303,28 @@ class GrokManager:
     def _is_wrong_password_login(result: LoginResult) -> bool:
         if result.ok:
             return False
-        detail = str(result.detail or "").casefold()
-        return any(
-            marker in detail
-            for marker in (
-                "邮箱或密码错误",
-                "wrong email address or password",
-                "incorrect email or password",
-                "invalid email or password",
-            )
+        detail = str(result.detail or "")
+        low = detail.casefold()
+        markers = (
+            "邮箱或密码错误",
+            "邮箱地址或密码错误",
+            "电子邮箱或密码不正确",
+            "邮箱或密码不正确",
+            "密码不正确",
+            "密码错误",
+            "wrong email address or password",
+            "incorrect email or password",
+            "invalid email or password",
+            "email or password is incorrect",
+            "the password you entered is incorrect",
+            "incorrect password",
+            "invalid credentials",
+        )
+        if any(marker in low or marker in detail for marker in markers):
+            return True
+        return (
+            ("password" in low or "密码" in detail)
+            and any(word in low for word in ("incorrect", "invalid", "wrong", "错误", "不正确"))
         )
 
     def _auto_reset_login_failures(self, results: List[LoginResult], log=None, progress=None) -> List[LoginResult]:
