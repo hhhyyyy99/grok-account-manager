@@ -359,6 +359,118 @@ class PasswordResetTests(unittest.TestCase):
         )
 
 
+    def test_cloudflare_admin_recover_jwt_via_address_lookup(self) -> None:
+        class ListResponse:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "results": [
+                        {"id": 4640, "address": "target@example.com"},
+                        {"id": 9, "address": "other@example.com"},
+                    ],
+                    "count": 2,
+                }
+
+        class JwtResponse:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"jwt": "recovered-jwt"}
+
+        calls = []
+
+        def fake_get(url, headers=None, params=None):
+            calls.append((url, params or {}))
+            if url.endswith("/admin/address"):
+                return ListResponse()
+            if url.endswith("/admin/show_password/4640"):
+                return JwtResponse()
+            raise AssertionError("unexpected url %s" % url)
+
+        with patch.dict(
+            registration_app.config,
+            {
+                "cloudflare_api_base": "https://mail.test",
+                "cloudflare_auth_mode": "x-admin-auth",
+                "cloudflare_api_key": "secret",
+            },
+            clear=False,
+        ):
+            with patch.object(registration_app, "http_get", side_effect=fake_get):
+                jwt, address_id = registration_app.cloudflare_admin_recover_jwt(
+                    "target@example.com"
+                )
+
+        self.assertEqual(("recovered-jwt", "4640"), (jwt, address_id))
+        self.assertTrue(any(url.endswith("/admin/address") for url, _ in calls))
+        self.assertTrue(
+            any(url.endswith("/admin/show_password/4640") for url, _ in calls)
+        )
+
+    def test_find_mail_credential_recovers_via_admin_when_local_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            manager.reference.config_file.write_text(
+                json.dumps(
+                    {
+                        "email_provider": "cloudflare",
+                        "cloudflare_api_base": "https://mail.test",
+                        "cloudflare_api_key": "secret",
+                        "cloudflare_auth_mode": "x-admin-auth",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch(
+                "grok_register.app.cloudflare_admin_recover_jwt",
+                return_value=("admin-jwt", "123"),
+            ):
+                found = manager.reference.find_mail_credential("missing@example.com")
+            self.assertEqual("admin-jwt", found)
+            self.assertEqual(
+                "admin-jwt",
+                manager.vault.get_secret("mail-credential:missing@example.com"),
+            )
+
+    def test_reset_password_recovers_missing_credential_via_admin(self) -> None:
+        logs = []
+        with patch.object(registration_app, "get_email_provider", return_value="cloudflare"):
+            with patch.object(
+                registration_app,
+                "cloudflare_admin_recover_jwt",
+                return_value=("admin-jwt", "77"),
+            ) as recover:
+                with patch(
+                    "grok_register.password_reset._load_mail_snapshot",
+                    return_value=(set(), "admin-jwt", False),
+                ) as snapshot:
+                    with patch(
+                        "grok_register.password_reset.browser_confirm.create_standalone_page",
+                        side_effect=RuntimeError("stop-after-snapshot"),
+                    ):
+                        with self.assertRaisesRegex(
+                            Exception, "stop-after-snapshot|密码重置"
+                        ):
+                            try:
+                                reset_password(
+                                    email="missing@example.com",
+                                    mail_credential="",
+                                    log=logs.append,
+                                )
+                            except Exception as exc:
+                                # Accept either PasswordResetError wrapper or raw stop.
+                                raise exc
+        recover.assert_called_once_with("missing@example.com")
+        snapshot.assert_called_once()
+        self.assertTrue(any("管理员接口" in message for message in logs))
+
     def test_cloudflare_admin_get_jwt_reads_show_password_response(self) -> None:
         class Response:
             status_code = 200

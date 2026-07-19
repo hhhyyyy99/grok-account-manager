@@ -605,7 +605,63 @@ class ReferenceProject:
                 stored = ""
             if stored:
                 return stored
+        # No local JWT: recover via Cloudflare admin address lookup + show_password.
+        recovered = self.recover_mail_credential_via_admin(normalized_email)
+        if recovered:
+            return recovered
         return ""
+
+    def recover_mail_credential_via_admin(self, email: str) -> str:
+        """Use Cloudflare admin APIs to recover a missing mailbox JWT."""
+        normalized_email = str(email or "").strip().lower()
+        if not normalized_email or "@" not in normalized_email:
+            return ""
+        try:
+            config = self.load_registration_config()
+        except Exception:
+            return ""
+        provider = str(config.get("email_provider") or "").strip().lower()
+        if provider and provider != "cloudflare":
+            return ""
+        if not str(config.get("cloudflare_api_base") or "").strip():
+            return ""
+        if not str(config.get("cloudflare_api_key") or "").strip():
+            return ""
+        try:
+            from grok_register import app as registration_app
+
+            # Ensure worker/manager config is visible to the shared app module.
+            registration_app.config.update(
+                {
+                    key: config.get(key)
+                    for key in (
+                        "email_provider",
+                        "cloudflare_api_base",
+                        "cloudflare_api_key",
+                        "cloudflare_auth_mode",
+                        "cloudflare_path_domains",
+                        "cloudflare_path_accounts",
+                        "cloudflare_path_token",
+                        "cloudflare_path_messages",
+                    )
+                    if key in config
+                }
+            )
+            credential, _address_id = registration_app.cloudflare_admin_recover_jwt(
+                normalized_email
+            )
+        except Exception:
+            return ""
+        credential = str(credential or "").strip()
+        if not credential:
+            return ""
+        vault = self.credential_vault
+        if vault is not None and vault.is_unlocked:
+            try:
+                vault.put_secret("mail-credential:%s" % normalized_email, credential)
+            except Exception:
+                pass
+        return credential
 
     def persist_account_password(self, email: str, password: str, source: str = "") -> Path:
         normalized_email = str(email or "").strip().lower()

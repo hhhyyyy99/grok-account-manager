@@ -376,10 +376,26 @@ def reset_password(
     email = str(email or "").strip()
     mail_credential = str(mail_credential or "").strip()
     new_password = str(new_password or "").strip() or generate_password()
-    if not email or not mail_credential:
-        raise PasswordResetError("邮箱或邮箱访问凭据为空")
+    if not email:
+        raise PasswordResetError("邮箱为空")
     if len(new_password) < 12:
         raise PasswordResetError("新密码长度不足")
+    if not mail_credential:
+        # Recover JWT via admin address lookup + /admin/show_password/{id}.
+        provider = str(app.get_email_provider() or "").strip().lower()
+        if provider != "cloudflare":
+            raise PasswordResetError("邮箱访问凭据为空")
+        log("本地无邮箱 JWT，尝试管理员接口按邮箱恢复访问凭据")
+        try:
+            recovered, address_id = app.cloudflare_admin_recover_jwt(email)
+        except Exception as exc:
+            raise PasswordResetError(
+                "邮箱访问凭据为空，管理员接口恢复失败: %s" % exc
+            ) from exc
+        mail_credential = str(recovered or "").strip()
+        if not mail_credential:
+            raise PasswordResetError("邮箱访问凭据为空，管理员接口未返回 JWT")
+        log("管理员接口已恢复邮箱 JWT（address_id=%s）" % address_id)
 
     excluded_ids, mail_credential, use_admin_mail = _load_mail_snapshot(
         email, mail_credential, log
