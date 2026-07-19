@@ -234,6 +234,7 @@ class BatchLoginService:
         auth_file = str(value.get("path") or "")
         sso_token = str(value.get("sso_token") or "").strip()
         detail = str(value.get("error") or ("批量登录成功" if ok else "批量登录失败"))
+        previous_sso_token = ""
         if ok:
             try:
                 account = self.store.get(account_id)
@@ -241,6 +242,7 @@ class BatchLoginService:
                     raise ValueError("登录结果对应的账号不存在")
                 if account.email.casefold() != email.strip().casefold():
                     raise ValueError("登录结果邮箱与账号不匹配")
+                previous_sso_token = account.sso_token
                 auth = json.loads(Path(auth_file).read_text(encoding="utf-8-sig"))
                 auth_email = str(auth.get("email") or "").strip()
                 if auth_email and account.email.casefold() != auth_email.casefold():
@@ -266,4 +268,11 @@ class BatchLoginService:
                 detail = "CPA 凭据已刷新，但浏览器未返回新的 SSO cookie"
         if not ok and account_id:
             self.store.set_status([account_id], AccountStatus.ERROR.value, detail)
-        return LoginResult(account_id, email, ok, detail, auth_file)
+        return LoginResult(
+            account_id,
+            email,
+            ok,
+            detail,
+            auth_file,
+            previous_sso_token=previous_sso_token,
+        )

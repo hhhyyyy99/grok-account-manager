@@ -123,6 +123,7 @@ class LoginResult:
     ok: bool
     detail: str
     auth_file: str = ""
+    previous_sso_token: str = ""
 
 
 @dataclass(frozen=True)

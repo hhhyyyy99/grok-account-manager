@@ -478,6 +478,34 @@ class BatchLoginCredentialTests(unittest.TestCase):
             self.assertTrue(any("CPA hotload 已更新" in line for line in logs))
             self.assertTrue(any("复核完成: SSO=正常，CPA=正常" in line for line in logs))
 
+    def test_relogin_passes_previous_sso_to_grok2api_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            account = manager.store.upsert(
+                AccountDraft(
+                    email="first@example.com",
+                    password="password",
+                    sso_token="fresh-sso",
+                )
+            )
+            result = LoginResult(
+                account.id,
+                account.email,
+                True,
+                "登录成功",
+                previous_sso_token="old-sso",
+            )
+
+            with patch.object(manager.reference, "sync_grok2api") as sync:
+                manager._sync_relogin_credentials(result)
+
+            sync.assert_called_once_with(
+                "fresh-sso",
+                email="first@example.com",
+                log_callback=None,
+                previous_token="old-sso",
+            )
+
     def test_login_syncs_cpa_and_grok2api_before_next_result(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -512,7 +540,11 @@ class BatchLoginCredentialTests(unittest.TestCase):
                 encoding="utf-8",
             )
             account = manager.store.upsert(
-                AccountDraft(email="first@example.com", password="password")
+                AccountDraft(
+                    email="first@example.com",
+                    password="password",
+                    sso_token="old-sso",
+                )
             )
             auth_file = root / "xai-first@example.com.json"
             auth_file.write_text(
@@ -564,9 +596,10 @@ class BatchLoginCredentialTests(unittest.TestCase):
             with patch(
                 "grok_manager.login.subprocess.Popen", return_value=FakeProcess()
             ):
-                manager.batch_login([account.id])
+                results = manager.batch_login([account.id])
 
             self.assertEqual([(True, ["fresh-sso"])], observed)
+            self.assertEqual("old-sso", results[0].previous_sso_token)
 
     def test_login_updates_sso_and_cpa_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

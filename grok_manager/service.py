@@ -186,6 +186,7 @@ class GrokManager:
                 account.sso_token,
                 email=result.email,
                 log_callback=grok_log,
+                previous_token=result.previous_sso_token,
             )
         except Exception as exc:
             if log:

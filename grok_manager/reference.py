@@ -299,6 +299,7 @@ class ReferenceProject:
         sso_token: str,
         email: str = "",
         log_callback: Optional[LogCallback] = None,
+        previous_token: str = "",
     ) -> None:
         config = self.load_registration_config()
         if not bool(config.get("grok2api_auto_add_local", True)) and not bool(
@@ -321,6 +322,7 @@ class ReferenceProject:
             settings=config,
             default_token_file=self.data_root / "registration-token.json",
             replace_email=True,
+            previous_token=previous_token,
         )
 
     def _legacy_root_from_manager_config(self) -> Tuple[Optional[Path], bool]:

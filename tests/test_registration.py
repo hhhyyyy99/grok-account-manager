@@ -3,6 +3,7 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from grok_manager.config import ConfigStore, ManagerConfig
 from grok_manager.models import AccountDraft
@@ -274,6 +275,229 @@ class RegistrationImportTests(unittest.TestCase):
                     account.refresh_token if account else "",
                 ),
             )
+
+
+class Grok2ApiRemoteSyncTests(unittest.TestCase):
+    @staticmethod
+    def _settings() -> dict:
+        return {
+            "grok2api_remote_base": "https://grok2api.example/admin/api",
+            "grok2api_remote_app_key": "test-key",
+            "grok2api_pool_name": "ssoBasic",
+        }
+
+    def test_relogin_replaces_remote_credential_instead_of_adding(self) -> None:
+        from grok_register.app import add_token_to_grok2api_remote_pool
+
+        calls = []
+
+        class Response:
+            status_code = 200
+
+            @staticmethod
+            def raise_for_status():
+                return None
+
+            @staticmethod
+            def json():
+                return {
+                    "tokens": {
+                        "ssoBasic": [
+                            {
+                                "token": "old-sso",
+                                "note": "same@example.com",
+                                "tags": ["auto-register"],
+                            }
+                        ]
+                    }
+                }
+
+        def get(url, **_kwargs):
+            calls.append(("GET", url, None))
+            return Response()
+
+        def post(url, **kwargs):
+            calls.append(("POST", url, kwargs.get("json")))
+            return Response()
+
+        with patch("grok_register.app.http_get", side_effect=get), patch(
+            "grok_register.app.http_post", side_effect=post
+        ):
+            add_token_to_grok2api_remote_pool(
+                "fresh-sso",
+                email="same@example.com",
+                settings=self._settings(),
+                replace_email=True,
+            )
+
+        self.assertEqual(
+            [
+                ("GET", "https://grok2api.example/admin/api/tokens"),
+                ("POST", "https://grok2api.example/admin/api/tokens"),
+            ],
+            [(method, url) for method, url, _payload in calls],
+        )
+        pool = calls[-1][2]["ssoBasic"]
+        self.assertEqual(
+            [("same@example.com", "fresh-sso")],
+            [(item.get("note"), item.get("token")) for item in pool],
+        )
+
+    def test_relogin_can_replace_unlabelled_remote_credential_by_previous_token(self) -> None:
+        from grok_register.app import add_token_to_grok2api_remote_pool
+
+        saved = []
+
+        class ReadResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    "tokens": {
+                        "ssoBasic": [
+                            {"token": "old-sso", "tags": ["auto-register"]}
+                        ]
+                    }
+                }
+
+        class SaveResponse:
+            @staticmethod
+            def raise_for_status():
+                return None
+
+        def post(url, **kwargs):
+            self.assertFalse(url.endswith("/tokens/add"))
+            saved.append(kwargs["json"])
+            return SaveResponse()
+
+        with patch("grok_register.app.http_get", return_value=ReadResponse()), patch(
+            "grok_register.app.http_post", side_effect=post
+        ):
+            add_token_to_grok2api_remote_pool(
+                "fresh-sso",
+                email="same@example.com",
+                settings=self._settings(),
+                replace_email=True,
+                previous_token="old-sso",
+            )
+
+        self.assertEqual(
+            [
+                {
+                    "token": "fresh-sso",
+                    "tags": ["auto-register"],
+                    "note": "same@example.com",
+                }
+            ],
+            saved[0]["ssoBasic"],
+        )
+
+    def test_relogin_refuses_to_add_when_previous_credential_is_missing(self) -> None:
+        from grok_register.app import add_token_to_grok2api_remote_pool
+
+        class ReadResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    "tokens": {
+                        "ssoBasic": [
+                            {
+                                "token": "another-sso",
+                                "note": "other@example.com",
+                            }
+                        ]
+                    }
+                }
+
+        with patch("grok_register.app.http_get", return_value=ReadResponse()), patch(
+            "grok_register.app.http_post"
+        ) as post:
+            with self.assertRaisesRegex(RuntimeError, "未找到待替换"):
+                add_token_to_grok2api_remote_pool(
+                    "fresh-sso",
+                    email="same@example.com",
+                    settings=self._settings(),
+                    replace_email=True,
+                    previous_token="old-sso",
+                )
+
+        post.assert_not_called()
+
+    def test_registration_still_uses_remote_add_endpoint(self) -> None:
+        from grok_register.app import add_token_to_grok2api_remote_pool
+
+        class Response:
+            @staticmethod
+            def raise_for_status():
+                return None
+
+        calls = []
+
+        def post(url, **kwargs):
+            calls.append((url, kwargs["json"]))
+            return Response()
+
+        with patch("grok_register.app.http_post", side_effect=post), patch(
+            "grok_register.app.http_get"
+        ) as get:
+            add_token_to_grok2api_remote_pool(
+                "fresh-sso",
+                email="new@example.com",
+                settings=self._settings(),
+                replace_email=False,
+            )
+
+        self.assertEqual(
+            [
+                (
+                    "https://grok2api.example/admin/api/tokens/add",
+                    {
+                        "tokens": ["fresh-sso"],
+                        "pool": "basic",
+                        "tags": ["auto-register"],
+                    },
+                )
+            ],
+            calls,
+        )
+        get.assert_not_called()
+
+    def test_relogin_keeps_local_pool_when_remote_update_fails(self) -> None:
+        from grok_register.app import add_token_to_grok2api_pools
+
+        settings = {
+            **self._settings(),
+            "grok2api_auto_add_remote": True,
+            "grok2api_auto_add_local": True,
+        }
+        events = []
+
+        def remote(*_args, **_kwargs):
+            events.append("remote")
+            raise RuntimeError("remote unavailable")
+
+        def local(*_args, **_kwargs):
+            events.append("local")
+
+        with patch(
+            "grok_register.app.add_token_to_grok2api_remote_pool",
+            side_effect=remote,
+        ), patch(
+            "grok_register.app.add_token_to_grok2api_local_pool",
+            side_effect=local,
+        ):
+            add_token_to_grok2api_pools(
+                "fresh-sso",
+                email="same@example.com",
+                settings=settings,
+                replace_email=True,
+                previous_token="old-sso",
+            )
+
+        self.assertEqual(["remote"], events)
 
 
 if __name__ == "__main__":
