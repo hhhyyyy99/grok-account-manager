@@ -1197,17 +1197,27 @@ class BatchLoginCredentialTests(unittest.TestCase):
             retried = LoginResult(account.id, account.email, True, "批量登录成功")
             reset = PasswordResetResult(account.id, account.email, True, "密码已重置")
             calls = []
+            progress_events = []
 
             def fake_login(_ids, _settings, log=None, progress=None):
                 calls.append(list(_ids))
-                return [first] if len(calls) == 1 else [retried]
+                result = first if len(calls) == 1 else retried
+                if progress:
+                    progress(result, 1, 1)
+                return [result]
 
             logs = []
             with patch.object(manager.login, "login_accounts", side_effect=fake_login):
                 with patch.object(manager, "reset_passwords", return_value=[reset]) as reset_passwords:
                     with patch.object(manager, "_sync_relogin_credentials"):
                         with patch.object(manager, "inspect_accounts", return_value=[]):
-                            results = manager.batch_login([account.id], log=logs.append)
+                            results = manager.batch_login(
+                                [account.id],
+                                log=logs.append,
+                                progress=lambda result, completed, total: progress_events.append(
+                                    (completed, total, result.detail, result.ok)
+                                ),
+                            )
 
             self.assertEqual(2, len(calls))
             self.assertEqual([[account.id], [account.id]], calls)
@@ -1215,6 +1225,58 @@ class BatchLoginCredentialTests(unittest.TestCase):
             self.assertEqual(True, results[0].ok)
             self.assertIn("自动重置密码后", results[0].detail)
             self.assertTrue(any("邮箱或密码错误" in line for line in logs))
+            # Wrong-password result must not advance to 1/1 before reset+relogin settles.
+            self.assertTrue(any(item[0] == 0 for item in progress_events))
+            self.assertEqual((1, 1, True), (progress_events[-1][0], progress_events[-1][1], progress_events[-1][3]))
+
+    def test_batch_login_wrong_password_does_not_mark_batch_complete_early(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            good = manager.store.upsert(
+                AccountDraft(email="good@example.com", password="password")
+            )
+            bad = manager.store.upsert(
+                AccountDraft(email="bad@example.com", password="old-password")
+            )
+            good_result = LoginResult(good.id, good.email, True, "批量登录成功")
+            bad_result = LoginResult(bad.id, bad.email, False, "邮箱或密码错误")
+            retried = LoginResult(bad.id, bad.email, True, "批量登录成功")
+            reset = PasswordResetResult(bad.id, bad.email, True, "密码已重置")
+            progress_events = []
+            login_calls = []
+
+            def fake_login(ids, _settings, log=None, progress=None):
+                login_calls.append(list(ids))
+                if login_calls and len(login_calls) == 1 and set(ids) == {good.id, bad.id}:
+                    # Emulate worker completing both accounts in order.
+                    if progress:
+                        progress(good_result, 1, 2)
+                        progress(bad_result, 2, 2)
+                    return [good_result, bad_result]
+                if progress:
+                    progress(retried, 1, 1)
+                return [retried]
+
+            with patch.object(manager.login, "login_accounts", side_effect=fake_login):
+                with patch.object(manager, "reset_passwords", return_value=[reset]):
+                    with patch.object(manager, "_sync_relogin_credentials"):
+                        with patch.object(manager, "inspect_accounts", return_value=[]):
+                            results = manager.batch_login(
+                                [good.id, bad.id],
+                                progress=lambda result, completed, total: progress_events.append(
+                                    (completed, total, result.email, result.ok, result.detail)
+                                ),
+                            )
+
+            # After first-pass good login, progress is 1/2 — never jumps to 2/2 on bad password.
+            first_pass_counts = [item[0] for item in progress_events if item[1] == 2]
+            self.assertIn(1, first_pass_counts)
+            self.assertNotIn(2, first_pass_counts[:2])
+            # Final settled progress reaches 2/2 only after reset+relogin.
+            self.assertEqual(2, progress_events[-1][0])
+            self.assertEqual(2, progress_events[-1][1])
+            self.assertTrue(all(item.ok for item in results))
+            self.assertEqual(2, len(login_calls))
 
     def test_batch_login_ignores_non_canonical_password_error_messages(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

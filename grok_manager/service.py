@@ -510,85 +510,46 @@ class GrokManager:
         detail = str(result.detail or "").strip()
         return detail == "邮箱或密码错误" or detail.endswith("邮箱或密码错误")
 
-    def _auto_reset_login_failures(self, results: List[LoginResult], log=None, progress=None) -> List[LoginResult]:
-        candidates = [
-            result
-            for result in results
-            if result.account_id and self._is_wrong_password_login(result)
-        ]
-        if not candidates:
-            return results
+    def _reset_and_relogin_wrong_password(
+        self,
+        result: LoginResult,
+        *,
+        log,
+    ) -> LoginResult:
+        """Reset + re-login one wrong-password account to a final settled result."""
         log = log or (lambda _message: None)
-        candidate_ids = [result.account_id for result in candidates]
-        log("检测到 %s 个账号邮箱或密码错误，开始自动重置密码" % len(candidates))
-        for result in candidates:
-            log("[%s] 登录密码错误，开始自动重置密码" % result.email)
+        account_id = int(result.account_id or 0)
+        if not account_id:
+            return result
+        log("[%s] 登录密码错误，开始自动重置密码" % result.email)
         try:
-            reset_results = self.reset_passwords(candidate_ids, log=log)
+            reset_results = self.reset_passwords([account_id], log=log)
         except Exception as exc:
-            log("自动重置密码任务失败: %s" % exc)
-            return [
-                replace(
-                    result,
-                    detail="%s；自动重置密码任务失败：%s" % (result.detail, exc),
-                )
-                if result in candidates
-                else result
-                for result in results
-            ]
-        reset_by_id = {result.account_id: result for result in reset_results}
-        retry_ids = [
-            result.account_id
-            for result in candidates
-            if reset_by_id.get(result.account_id) and reset_by_id[result.account_id].ok
-        ]
-        retries: List[LoginResult] = []
-        if retry_ids:
-            log("自动重置密码完成 %s 个，开始使用新密码重新登录" % len(retry_ids))
-            retries = self.batch_login(
-                retry_ids,
-                log=log,
-                progress=None,
-                auto_reset_password=False,
-                _skip_review=True,
+            log("[%s] 自动重置密码任务失败: %s" % (result.email, exc))
+            return replace(
+                result,
+                detail="%s；自动重置密码任务失败：%s" % (result.detail, exc),
             )
-        retry_by_id = {result.account_id: result for result in retries}
-        merged: List[LoginResult] = []
-        candidate_id_set = set(candidate_ids)
-        for result in results:
-            if result.account_id not in candidate_id_set:
-                merged.append(result)
-                continue
-            reset_result = reset_by_id.get(result.account_id)
-            if reset_result is None:
-                merged.append(
-                    replace(result, detail="%s；自动重置密码未返回结果" % result.detail)
-                )
-                continue
-            if not reset_result.ok:
-                merged.append(
-                    replace(
-                        result,
-                        detail="%s；自动重置密码失败：%s"
-                        % (result.detail, reset_result.detail),
-                    )
-                )
-                continue
-            retry = retry_by_id.get(result.account_id)
-            if retry is None:
-                merged.append(
-                    replace(result, detail="密码已重置，但重新登录未返回结果")
-                )
-                continue
-            merged.append(
-                replace(
-                    retry,
-                    detail="自动重置密码后：%s" % retry.detail,
-                )
+        reset_result = reset_results[0] if reset_results else None
+        if reset_result is None:
+            return replace(result, detail="%s；自动重置密码未返回结果" % result.detail)
+        if not reset_result.ok:
+            return replace(
+                result,
+                detail="%s；自动重置密码失败：%s" % (result.detail, reset_result.detail),
             )
-            if progress:
-                progress(retry, len(results), len(results))
-        return merged
+        log("[%s] 密码已重置，开始使用新密码重新登录" % result.email)
+        retries = self.batch_login(
+            [account_id],
+            log=log,
+            progress=None,
+            auto_reset_password=False,
+            _skip_review=True,
+        )
+        retry = retries[0] if retries else None
+        if retry is None:
+            return replace(result, detail="密码已重置，但重新登录未返回结果")
+        return replace(retry, detail="自动重置密码后：%s" % retry.detail)
 
     def batch_login(
         self,
@@ -599,6 +560,13 @@ class GrokManager:
         _skip_review: bool = False,
     ) -> List[LoginResult]:
         log = log or (lambda _message: None)
+        ids = [int(account_id) for account_id in account_ids]
+        total_accounts = len(ids)
+        # Only advance when an account is fully settled. Wrong-password accounts stay
+        # unsettled until reset + re-login finish after the primary login worker ends
+        # (cannot nest another batch-login while the worker is still running).
+        settled = {"count": 0}
+        pending_reset: Dict[int, LoginResult] = {}
         registration_config = self.reference.load_registration_config()
         settings = LoginSettings(
             workers=self.config.login_workers,
@@ -612,7 +580,7 @@ class GrokManager:
             probe_after_login=False,
         )
 
-        def handle_result(result: LoginResult, completed: int, total: int):
+        def handle_result(result: LoginResult, _completed: int, _total: int):
             final = result
             if result.ok and result.account_id:
                 try:
@@ -635,18 +603,62 @@ class GrokManager:
             elif result.auth_file:
                 self.login._remove_transient_auth_file(result.auth_file)
                 final = replace(result, auth_file="")
+
+            if auto_reset_password and self._is_wrong_password_login(final):
+                # Keep progress below N/N until reset+relogin settles this account.
+                pending_reset[int(final.account_id)] = final
+                if progress:
+                    progress(
+                        replace(final, detail="邮箱或密码错误，等待自动重置密码"),
+                        settled["count"],
+                        total_accounts or 1,
+                    )
+                return final
+
+            settled["count"] += 1
             if progress:
-                progress(final, completed, total)
+                progress(final, settled["count"], total_accounts or 1)
             return final
 
         results = self.login.login_accounts(
-            account_ids,
+            ids,
             settings,
             log=log,
             progress=handle_result,
         )
-        if auto_reset_password:
-            results = self._auto_reset_login_failures(results, log=log, progress=progress)
+
+        if auto_reset_password and pending_reset:
+            # Primary login worker has exited; safe to start reset and re-login workers.
+            log(
+                "检测到 %s 个账号邮箱或密码错误，开始自动重置密码并重新登录"
+                % len(pending_reset)
+            )
+            by_id = {
+                int(result.account_id): result
+                for result in results
+                if int(result.account_id or 0)
+            }
+            for account_id, failed in list(pending_reset.items()):
+                settled_result = self._reset_and_relogin_wrong_password(failed, log=log)
+                by_id[account_id] = settled_result
+                settled["count"] += 1
+                if progress:
+                    progress(settled_result, settled["count"], total_accounts or 1)
+            # Preserve original account order from the requested id list when possible.
+            ordered: List[LoginResult] = []
+            seen: set[int] = set()
+            for account_id in ids:
+                item = by_id.get(account_id)
+                if item is not None:
+                    ordered.append(item)
+                    seen.add(account_id)
+            for result in results:
+                account_id = int(result.account_id or 0)
+                if account_id and account_id not in seen:
+                    ordered.append(by_id.get(account_id, result))
+                    seen.add(account_id)
+            results = ordered
+
         if _skip_review:
             return results
         refreshed = [result for result in results if result.ok and result.account_id]
