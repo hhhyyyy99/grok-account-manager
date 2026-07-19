@@ -142,3 +142,13 @@ class CpaRefreshResult:
     ok: bool
     detail: str
     auth_file: str = ""
+
+
+@dataclass(frozen=True)
+class CpaHotloadSyncResult:
+    account_id: int
+    email: str
+    ok: bool
+    detail: str
+    action: str = ""  # pull | push | noop | skip | error
+    auth_file: str = ""

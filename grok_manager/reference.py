@@ -270,6 +270,43 @@ class ReferenceProject:
             return self.save_registration_config({})
         return self.save_registration_config(self.load_registration_config())
 
+    def cpa_hotload_dir(self) -> Optional[Path]:
+        """Resolved CPA hotload directory when configured; None if unset."""
+        config = self.load_registration_config()
+        configured = str(config.get("cpa_hotload_dir") or "").strip()
+        if not configured:
+            return None
+        target_dir = Path(configured).expanduser()
+        if not target_dir.is_absolute():
+            target_dir = self.data_root / target_dir
+        return target_dir.resolve()
+
+    def cpa_hotload_enabled(self) -> bool:
+        config = self.load_registration_config()
+        return bool(config.get("cpa_copy_to_hotload", False)) and bool(
+            str(config.get("cpa_hotload_dir") or "").strip()
+        )
+
+    def hotload_auth_path_for_email(self, email: str, sub: str = "") -> Optional[Path]:
+        hotload_dir = self.cpa_hotload_dir()
+        if hotload_dir is None:
+            return None
+        from grok_register.cpa_xai.schema import credential_file_name
+
+        return hotload_dir / credential_file_name(email, sub)
+
+    def load_hotload_auth(self, email: str, sub: str = "") -> Optional[tuple[Path, Dict[str, Any]]]:
+        path = self.hotload_auth_path_for_email(email, sub)
+        if path is None or not path.is_file():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return path, payload
+
     def sync_cpa_hotload(self, auth_file: str | Path) -> Optional[Path]:
         config = self.load_registration_config()
         if not bool(config.get("cpa_copy_to_hotload", False)):

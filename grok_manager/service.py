@@ -14,6 +14,7 @@ from .password_reset import BatchPasswordResetService, PasswordResetSettings
 from .models import (
     Account,
     AccountStatus,
+    CpaHotloadSyncResult,
     CpaRefreshResult,
     InspectionResult,
     LoginResult,
@@ -806,6 +807,18 @@ class GrokManager:
 
         log = log or (lambda _message: None)
         ids = [int(account_id) for account_id in account_ids]
+        # Newest-wins sync first: if deployment CPA already renewed tokens, pull them
+        # before attempting refresh_token against a revoked manager copy.
+        try:
+            self.sync_cpa_hotload_accounts(
+                ids,
+                log=log,
+                cancelled=cancelled,
+                push_when_manager_newer=True,
+                reinspect=False,
+            )
+        except Exception as exc:
+            log("CPA 续期前 hotload 同步异常: %s" % exc)
         accounts = self.store.get_many(ids)
         by_id = {account.id: account for account in accounts}
         registration_config = self.reference.load_registration_config()
@@ -948,6 +961,336 @@ class GrokManager:
     def diagnostics(self) -> List[Tuple[bool, str]]:
         return self.reference.diagnostics(self.python_executable)
 
+    @staticmethod
+    def _cpa_token_rank(
+        access_token: str,
+        refresh_token: str = "",
+        expires_at: str = "",
+    ) -> tuple[int, int, int]:
+        """Higher rank means newer/more usable CPA credentials."""
+        from .inspection import jwt_expiration, parse_utc
+
+        access = str(access_token or "").strip()
+        refresh = str(refresh_token or "").strip()
+        expires = parse_utc(expires_at) or jwt_expiration(access)
+        exp_ts = int(expires.timestamp()) if expires is not None else 0
+        return (exp_ts, 1 if access else 0, 1 if refresh else 0)
+
+    def _write_manager_cpa_file(
+        self,
+        *,
+        email: str,
+        access_token: str,
+        refresh_token: str,
+        expires_at: str = "",
+        base_url: str = "",
+        payload_extra: Optional[Dict[str, Any]] = None,
+    ) -> Path:
+        from grok_register.cpa_xai.schema import DEFAULT_BASE_URL, build_cpa_xai_auth
+        from grok_register.cpa_xai.writer import write_cpa_xai_auth
+
+        registration_config = self.reference.load_registration_config()
+        resolved_base = (
+            str(base_url or "").strip()
+            or str(registration_config.get("cpa_base_url") or "").strip()
+            or DEFAULT_BASE_URL
+        )
+        extra = dict(payload_extra or {})
+        # Keep optional fields from the source payload when rebuilding.
+        id_token = str(extra.pop("id_token", "") or "").strip() or None
+        sub = str(extra.pop("sub", "") or "").strip() or None
+        payload = build_cpa_xai_auth(
+            email=email,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            id_token=id_token,
+            sub=sub,
+            expired=expires_at or None,
+            base_url=resolved_base,
+            extra=extra if extra else None,
+        )
+        if expires_at and not payload.get("expired"):
+            payload["expired"] = expires_at
+        return write_cpa_xai_auth(self.reference.managed_auth_dir, payload)
+
+    def sync_account_cpa_with_hotload(
+        self,
+        account: Account,
+        *,
+        log=None,
+        push_when_manager_newer: bool = True,
+    ) -> CpaHotloadSyncResult:
+        """Bidirectional newest-wins sync between manager DB and CPA hotload file."""
+        log = log or (lambda _message: None)
+        if not self.reference.cpa_hotload_enabled():
+            return CpaHotloadSyncResult(
+                account.id,
+                account.email,
+                True,
+                "未启用 CPA hotload，跳过同步",
+                action="skip",
+            )
+
+        hotload = self.reference.load_hotload_auth(account.email)
+        manager_access = str(account.access_token or "").strip()
+        manager_refresh = str(account.refresh_token or "").strip()
+        manager_expires = str(account.token_expires_at or "").strip()
+        manager_rank = self._cpa_token_rank(
+            manager_access, manager_refresh, manager_expires
+        )
+
+        if hotload is None:
+            if not manager_access or not manager_refresh:
+                return CpaHotloadSyncResult(
+                    account.id,
+                    account.email,
+                    True,
+                    "hotload 无文件且管理库缺少完整 CPA 凭据",
+                    action="noop",
+                )
+            if not push_when_manager_newer:
+                return CpaHotloadSyncResult(
+                    account.id,
+                    account.email,
+                    True,
+                    "hotload 无文件，未推送",
+                    action="noop",
+                )
+            try:
+                auth_path = self._write_manager_cpa_file(
+                    email=account.email,
+                    access_token=manager_access,
+                    refresh_token=manager_refresh,
+                    expires_at=manager_expires,
+                )
+                hotload_path = self.reference.sync_cpa_hotload(auth_path)
+                self.store.apply_cpa_credentials(
+                    account.id,
+                    manager_access,
+                    manager_refresh,
+                    manager_expires,
+                    str(auth_path),
+                    detail="已推送 CPA 凭据到 hotload",
+                )
+            except Exception as exc:
+                return CpaHotloadSyncResult(
+                    account.id,
+                    account.email,
+                    False,
+                    "推送 CPA 到 hotload 失败: %s" % exc,
+                    action="error",
+                )
+            detail = "hotload 无文件，已用管理库凭据推送"
+            if hotload_path is not None:
+                detail += " → %s" % hotload_path
+            log("[%s] %s" % (account.email, detail))
+            return CpaHotloadSyncResult(
+                account.id,
+                account.email,
+                True,
+                detail,
+                action="push",
+                auth_file=str(auth_path),
+            )
+
+        hot_path, payload = hotload
+        hot_access = str(payload.get("access_token") or "").strip()
+        hot_refresh = str(payload.get("refresh_token") or "").strip()
+        hot_expires = str(payload.get("expired") or "").strip()
+        if not hot_expires and hot_access:
+            try:
+                from grok_register.cpa_xai.schema import expired_from_access_token
+
+                hot_expires, _, _ = expired_from_access_token(hot_access)
+            except Exception:
+                hot_expires = ""
+        hot_rank = self._cpa_token_rank(hot_access, hot_refresh, hot_expires)
+
+        same_access = bool(hot_access) and hot_access == manager_access
+        same_refresh = (not hot_refresh and not manager_refresh) or (
+            bool(hot_refresh) and hot_refresh == manager_refresh
+        )
+        if same_access and same_refresh:
+            return CpaHotloadSyncResult(
+                account.id,
+                account.email,
+                True,
+                "管理库与 hotload CPA 已一致",
+                action="noop",
+                auth_file=str(hot_path),
+            )
+
+        # Newest wins. Prefer pull when hotload is strictly newer, or when manager
+        # lacks a usable access token but hotload has one.
+        should_pull = hot_rank > manager_rank or (
+            not manager_access and bool(hot_access and hot_refresh)
+        )
+        if should_pull:
+            if not hot_access or not hot_refresh:
+                return CpaHotloadSyncResult(
+                    account.id,
+                    account.email,
+                    False,
+                    "hotload 凭据不完整，无法回灌",
+                    action="error",
+                    auth_file=str(hot_path),
+                )
+            try:
+                auth_path = self._write_manager_cpa_file(
+                    email=account.email,
+                    access_token=hot_access,
+                    refresh_token=hot_refresh,
+                    expires_at=hot_expires,
+                    base_url=str(payload.get("base_url") or ""),
+                    payload_extra={
+                        key: value
+                        for key, value in payload.items()
+                        if key
+                        not in {
+                            "access_token",
+                            "refresh_token",
+                            "email",
+                            "expired",
+                            "expires_in",
+                            "last_refresh",
+                            "base_url",
+                        }
+                    },
+                )
+                self.store.apply_cpa_credentials(
+                    account.id,
+                    hot_access,
+                    hot_refresh,
+                    hot_expires,
+                    str(auth_path),
+                    detail="已从 CPA hotload 回灌更新凭据",
+                )
+            except Exception as exc:
+                return CpaHotloadSyncResult(
+                    account.id,
+                    account.email,
+                    False,
+                    "从 hotload 回灌失败: %s" % exc,
+                    action="error",
+                    auth_file=str(hot_path),
+                )
+            detail = "已从 hotload 回灌更新 CPA（到期 %s）" % (hot_expires or "未知")
+            log("[%s] %s" % (account.email, detail))
+            return CpaHotloadSyncResult(
+                account.id,
+                account.email,
+                True,
+                detail,
+                action="pull",
+                auth_file=str(auth_path),
+            )
+
+        if not push_when_manager_newer:
+            return CpaHotloadSyncResult(
+                account.id,
+                account.email,
+                True,
+                "管理库更新，但当前模式未推送到 hotload",
+                action="noop",
+            )
+        if not manager_access or not manager_refresh:
+            return CpaHotloadSyncResult(
+                account.id,
+                account.email,
+                False,
+                "管理库 CPA 不完整，无法推送到 hotload",
+                action="error",
+            )
+        try:
+            auth_path = self._write_manager_cpa_file(
+                email=account.email,
+                access_token=manager_access,
+                refresh_token=manager_refresh,
+                expires_at=manager_expires,
+            )
+            hotload_path = self.reference.sync_cpa_hotload(auth_path)
+            self.store.apply_cpa_credentials(
+                account.id,
+                manager_access,
+                manager_refresh,
+                manager_expires,
+                str(auth_path),
+                detail="已将更新的 CPA 凭据推送到 hotload",
+            )
+        except Exception as exc:
+            return CpaHotloadSyncResult(
+                account.id,
+                account.email,
+                False,
+                "推送 CPA 到 hotload 失败: %s" % exc,
+                action="error",
+            )
+        detail = "管理库更新，已覆盖 hotload"
+        if hotload_path is not None:
+            detail += " → %s" % hotload_path
+        log("[%s] %s" % (account.email, detail))
+        return CpaHotloadSyncResult(
+            account.id,
+            account.email,
+            True,
+            detail,
+            action="push",
+            auth_file=str(auth_path),
+        )
+
+    def sync_cpa_hotload_accounts(
+        self,
+        account_ids: Optional[Iterable[int]] = None,
+        *,
+        log=None,
+        progress=None,
+        cancelled=None,
+        push_when_manager_newer: bool = True,
+        reinspect: bool = False,
+    ) -> List[CpaHotloadSyncResult]:
+        """Sync manager CPA credentials with deployment hotload files (newest wins)."""
+        log = log or (lambda _message: None)
+        if account_ids is None:
+            accounts = self.store.list_accounts()
+        else:
+            accounts = self.store.get_many([int(value) for value in account_ids])
+        # Prefer accounts that already have CPA material or hotload files.
+        targets = [
+            account
+            for account in accounts
+            if str(account.access_token or "").strip()
+            or str(account.refresh_token or "").strip()
+            or str(account.auth_file or "").strip()
+            or self.reference.load_hotload_auth(account.email) is not None
+        ]
+        results: List[CpaHotloadSyncResult] = []
+        total = len(targets)
+        if not targets:
+            log("CPA hotload 同步：没有可同步账号")
+            return results
+        log("CPA hotload 同步：开始处理 %s 个账号（以新为准）" % total)
+        for index, account in enumerate(targets, start=1):
+            if cancelled and cancelled():
+                break
+            result = self.sync_account_cpa_with_hotload(
+                account,
+                log=log,
+                push_when_manager_newer=push_when_manager_newer,
+            )
+            results.append(result)
+            if progress:
+                progress(result, index, total)
+
+        changed_ids = [
+            result.account_id
+            for result in results
+            if result.ok and result.action in {"pull", "push"} and result.account_id
+        ]
+        if reinspect and changed_ids:
+            log("CPA hotload 同步变更 %s 个，开始复核" % len(changed_ids))
+            self.inspect_accounts(changed_ids, live=self.config.live_probe)
+        return results
+
     def active_cpa_account_ids(self) -> List[int]:
         return self.store.ids_for_cpa_statuses([AccountStatus.ACTIVE.value])
 
@@ -1003,6 +1346,31 @@ class GrokManager:
         from grok_register.cpa_xai.schema import DEFAULT_BASE_URL
 
         log = log or (lambda _message: None)
+        # Pull newer tokens from deployment hotload before deciding who needs refresh.
+        # This avoids marking accounts expired when CLIProxyAPI already renewed them.
+        if account_ids is None:
+            sync_ids = None
+        else:
+            sync_ids = [int(value) for value in account_ids]
+        try:
+            sync_results = self.sync_cpa_hotload_accounts(
+                sync_ids,
+                log=log,
+                cancelled=cancelled,
+                push_when_manager_newer=True,
+                reinspect=False,
+            )
+            pulled_ids = [
+                item.account_id
+                for item in sync_results
+                if item.ok and item.action == "pull" and item.account_id
+            ]
+            if reinspect and pulled_ids:
+                log("CPA 守护：hotload 回灌 %s 个，先复核" % len(pulled_ids))
+                self.inspect_accounts(pulled_ids, live=self.config.live_probe)
+        except Exception as exc:
+            log("CPA 守护：hotload 同步阶段异常: %s" % exc)
+
         candidates = self.cpa_accounts_needing_refresh(
             lead_seconds=lead_seconds,
             account_ids=account_ids,
@@ -1032,13 +1400,34 @@ class GrokManager:
         for index, account in enumerate(candidates, start=1):
             if cancelled and cancelled():
                 break
-            expires_at = expiration_for(account)
+            # Re-read after possible hotload pull so we refresh the latest tokens.
+            fresh = self.store.get(account.id) or account
+            expires_at = expiration_for(fresh)
+            # If hotload pull already moved expiry out of the lead window, skip.
+            lead = int(
+                lead_seconds
+                if lead_seconds is not None
+                else self.config.cpa_guard_lead_seconds
+            )
+            if expires_at is not None and expires_at > datetime.now(timezone.utc) + timedelta(
+                seconds=max(0, lead)
+            ):
+                result = CpaRefreshResult(
+                    fresh.id,
+                    fresh.email,
+                    True,
+                    "hotload 同步后仍在有效期内，跳过 refresh",
+                )
+                results.append(result)
+                if progress:
+                    progress(result, index, total)
+                continue
             log(
                 "[%s] access 到期 %s，开始 silent refresh"
-                % (account.email, expires_at.isoformat() if expires_at else "未知")
+                % (fresh.email, expires_at.isoformat() if expires_at else "未知")
             )
             silent = self._silent_refresh_cpa_account(
-                account,
+                fresh,
                 proxy=proxy,
                 base_url=base_url,
                 timeout=timeout,
@@ -1051,21 +1440,22 @@ class GrokManager:
                 continue
 
             detail = "CPA 凭据已过期: %s" % silent.detail
-            self.store.mark_cpa_expired(account.id, detail)
-            result = CpaRefreshResult(account.id, account.email, False, detail)
+            self.store.mark_cpa_expired(fresh.id, detail)
+            result = CpaRefreshResult(fresh.id, fresh.email, False, detail)
             results.append(result)
-            log("[%s] %s" % (account.email, detail))
+            log("[%s] %s" % (fresh.email, detail))
             if progress:
                 progress(result, index, total)
 
         refreshed_ids = [
             result.account_id for result in results if result.ok and result.account_id
         ]
-        if reinspect and refreshed_ids:
+        if reinspect and refreshed_ids and not (cancelled and cancelled()):
             log("CPA 守护：续期成功 %s 个，开始复核" % len(refreshed_ids))
             reviews = self.inspect_accounts(
                 refreshed_ids,
                 live=self.config.live_probe,
+                cancelled=cancelled,
             )
             reviews_by_id = {review.account_id: review for review in reviews}
             reviewed: List[CpaRefreshResult] = []
@@ -1122,17 +1512,23 @@ class GrokManager:
                     log=log,
                     cancelled=cancelled,
                 )
+                if cancelled and cancelled():
+                    log("CPA 守护进程已停止")
+                    return
                 ok = sum(1 for item in results if item.ok)
                 failed = len(results) - ok
                 log("CPA 守护本轮完成：处理 %s，成功 %s，标记过期 %s" % (len(results), ok, failed))
+            except KeyboardInterrupt:
+                log("CPA 守护进程已停止")
+                return
             except Exception as exc:
                 log("CPA 守护本轮异常: %s" % exc)
             if once:
                 return
-            # Interruptible sleep.
+            # Interruptible sleep (short slices so stop_cpa_guard returns quickly).
             deadline = time.time() + interval
             while time.time() < deadline:
                 if cancelled and cancelled():
                     log("CPA 守护进程已停止")
                     return
-                time.sleep(min(1.0, max(0.0, deadline - time.time())))
+                time.sleep(min(0.2, max(0.0, deadline - time.time())))

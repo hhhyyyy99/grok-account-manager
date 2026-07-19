@@ -359,7 +359,7 @@ class TokenInspector:
         if not hotload_token or hotload_token != account.access_token.strip():
             return CredentialCheck(
                 AccountStatus.EXPIRED.value,
-                "CPA hotload 仍是旧 token，需要重新同步",
+                "CPA hotload 与管理库 token 不一致，需要双向同步（以新为准）",
                 expires_at,
             )
         detail = "CPA hotload 凭据已同步"

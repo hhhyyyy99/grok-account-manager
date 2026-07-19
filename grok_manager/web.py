@@ -386,7 +386,9 @@ class GrokWebApplication:
                     cancelled=self._cpa_guard_stop.is_set,
                 )
             except Exception as exc:
-                print("[cpa-guard] 守护线程异常退出: %s" % exc, flush=True)
+                # KeyboardInterrupt is process-wide; daemon exit should stay quiet.
+                if not isinstance(exc, KeyboardInterrupt):
+                    print("[cpa-guard] 守护线程异常退出: %s" % exc, flush=True)
 
         self._cpa_guard_thread = threading.Thread(
             target=worker,
@@ -396,12 +398,20 @@ class GrokWebApplication:
         self._cpa_guard_thread.start()
         return True
 
-    def stop_cpa_guard(self, timeout: float = 5.0) -> None:
+    def stop_cpa_guard(self, timeout: float = 1.5) -> None:
+        """Signal the guard to stop; never block shutdown on a second Ctrl+C."""
         self._cpa_guard_stop.set()
         thread = self._cpa_guard_thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=max(0.1, float(timeout)))
         self._cpa_guard_thread = None
+        if thread is None or not thread.is_alive():
+            return
+        try:
+            thread.join(timeout=max(0.05, float(timeout)))
+        except KeyboardInterrupt:
+            # User hit Ctrl+C again while we waited for the daemon guard.
+            return
+        if thread.is_alive():
+            print("[cpa-guard] 守护线程仍在收尾，随进程退出", flush=True)
 
     @staticmethod
     def account_json(account: Account) -> Dict[str, Any]:
@@ -1095,7 +1105,13 @@ class GrokWebApplication:
         try:
             server.serve_forever(poll_interval=0.25)
         except KeyboardInterrupt:
-            pass
+            print("\n正在停止管理端…", flush=True)
         finally:
-            self.stop_cpa_guard()
-            server.server_close()
+            try:
+                self.stop_cpa_guard(timeout=1.0)
+            except KeyboardInterrupt:
+                pass
+            try:
+                server.server_close()
+            except Exception:
+                pass

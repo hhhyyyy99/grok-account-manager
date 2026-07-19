@@ -295,6 +295,33 @@ def command_cpa_guard(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_cpa_sync(args: argparse.Namespace) -> int:
+    manager = _manager()
+    ids = _selected_ids(manager, getattr(args, "ids", ""), bool(getattr(args, "all", False)))
+    if getattr(args, "ids", "") and not ids:
+        print("没有匹配的账号 ID", file=sys.stderr)
+        return 2
+    selected = ids or None
+
+    def log(message: str) -> None:
+        print("[cpa-sync] %s" % message, flush=True)
+
+    results = manager.sync_cpa_hotload_accounts(
+        selected,
+        log=log,
+        push_when_manager_newer=not bool(getattr(args, "pull_only", False)),
+        reinspect=not bool(getattr(args, "no_inspect", False)),
+    )
+    pulled = sum(1 for item in results if item.action == "pull")
+    pushed = sum(1 for item in results if item.action == "push")
+    failed = sum(1 for item in results if not item.ok)
+    print(
+        "CPA hotload 同步完成：处理 %s，回灌 %s，推送 %s，失败 %s"
+        % (len(results), pulled, pushed, failed)
+    )
+    return 1 if failed else 0
+
+
 def command_ui(args: argparse.Namespace) -> int:
     from .web import GrokWebApplication
 
@@ -416,6 +443,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="只跑一轮后退出（方便 cron / 测试）",
     )
     guard.set_defaults(handler=command_cpa_guard)
+
+    sync = subparsers.add_parser(
+        "cpa-sync",
+        help="管理库与 CPA hotload 双向同步（以新为准）",
+    )
+    sync.add_argument("--ids", default="", help="逗号分隔账号 ID；默认全部相关账号")
+    sync.add_argument("--all", action="store_true", help="同步全部账号")
+    sync.add_argument(
+        "--pull-only",
+        action="store_true",
+        help="只从 hotload 回灌，不把管理库更新的凭据推回去",
+    )
+    sync.add_argument(
+        "--no-inspect",
+        action="store_true",
+        help="同步后不自动复核",
+    )
+    sync.set_defaults(handler=command_cpa_sync)
     return parser
 
 

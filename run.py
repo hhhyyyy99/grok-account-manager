@@ -22,6 +22,7 @@ COMMANDS = frozenset(
         "config",
         "delete",
         "cpa-guard",
+        "cpa-sync",
     )
 )
 REQUIRED_MODULES = ("DrissionPage", "curl_cffi", "requests")
