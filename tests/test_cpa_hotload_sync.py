@@ -142,12 +142,13 @@ class CpaHotloadSyncTests(unittest.TestCase):
             manager = make_manager(root)
             hotload_dir = root / "hotload"
             self._enable_hotload(manager, hotload_dir)
+            expires = _future_iso(5000)
             account = manager.store.upsert(
                 AccountDraft(
                     email="same@example.com",
                     access_token="same-access",
                     refresh_token="same-refresh",
-                    token_expires_at=_future_iso(5000),
+                    token_expires_at=expires,
                 )
             )
             manager.store.apply_inspection(
@@ -156,7 +157,7 @@ class CpaHotloadSyncTests(unittest.TestCase):
                     status=AccountStatus.ACTIVE.value,
                     detail="active",
                     checked_at=_future_iso(0),
-                    expires_at=_future_iso(5000),
+                    expires_at=expires,
                     sso_status=AccountStatus.ACTIVE.value,
                     cpa_status=AccountStatus.ACTIVE.value,
                     cpa_detail="active",
@@ -167,7 +168,7 @@ class CpaHotloadSyncTests(unittest.TestCase):
                 account.email,
                 access="same-access",
                 refresh="same-refresh",
-                expired=_future_iso(5000),
+                expired=expires,
             )
             manager.store.touch_cpa_auth_file(account.id, str(path))
             result = manager.sync_account_cpa_with_hotload(manager.store.get(account.id))

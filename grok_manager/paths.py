@@ -100,12 +100,21 @@ def ensure_data_dirs() -> None:
 
 
 @contextmanager
-def interprocess_lock(name: str, data_root: Path | None = None) -> Iterator[None]:
+def interprocess_lock(
+    name: str,
+    data_root: Path | None = None,
+    *,
+    timeout_seconds: float = 300.0,
+) -> Iterator[None]:
     """Cross-process exclusive lock for CPA sync/guardian (Unix fcntl / Windows msvcrt)."""
+    import time
+
     root = Path(data_root or DATA_DIR).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     lock_path = root / (".%s.lock" % str(name or "lock").strip().replace("/", "_"))
     handle = open(lock_path, "a+", encoding="utf-8")
+    deadline = time.monotonic() + max(1.0, float(timeout_seconds))
+    locked = False
     try:
         try:
             os.chmod(lock_path, 0o600)
@@ -114,31 +123,47 @@ def interprocess_lock(name: str, data_root: Path | None = None) -> Iterator[None
         if sys.platform == "win32":
             import msvcrt
 
-            # Lock one byte at the start of the file.
             handle.seek(0)
             if handle.read(1) == "":
                 handle.write("0")
                 handle.flush()
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            while True:
+                handle.seek(0)
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    locked = True
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("获取跨进程锁超时: %s" % lock_path)
+                    time.sleep(0.05)
         else:
             import fcntl
 
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("获取跨进程锁超时: %s" % lock_path)
+                    time.sleep(0.05)
         yield
     finally:
-        try:
-            if sys.platform == "win32":
-                import msvcrt
+        if locked:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
 
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
 
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except OSError:
-            pass
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
         handle.close()
 
 

@@ -127,6 +127,8 @@ class InspectionResult:
     # Snapshot of CPA material used for this probe; apply is skipped if rotated.
     observed_access_token: str = ""
     observed_cpa_updated_at: str = ""
+    # True when TokenInspector recorded a CPA snapshot for CAS on apply.
+    cpa_snapshot: bool = False
 
 
 @dataclass(frozen=True)

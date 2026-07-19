@@ -72,13 +72,36 @@ class GrokManager:
         account_id: int,
         expected_refresh: str,
         detail: str,
+        *,
+        expected_access: str = "",
+        expected_cpa_updated_at: str = "",
     ) -> bool:
         """Mark expired only if another concurrent refresh has not already rotated tokens."""
         return self.store.mark_cpa_expired_if_refresh_unchanged(
             account_id,
             expected_refresh,
             detail,
+            expected_access=expected_access,
+            expected_cpa_updated_at=expected_cpa_updated_at,
         )
+
+    def _with_cpa_sync_lock(self):
+        from .paths import interprocess_lock
+
+        return interprocess_lock("cpa-sync", self.reference.data_root)
+
+    def _sync_hotload_path(self, auth_file: str | Path | None, account_id: int = 0):
+        """Copy managed auth to hotload under the global cpa-sync lock."""
+        if not auth_file:
+            return None
+        with self._with_cpa_sync_lock():
+            hotload_path = self.reference.sync_cpa_hotload(auth_file)
+            if hotload_path is not None and account_id:
+                try:
+                    self.store.touch_cpa_auth_file(int(account_id), str(hotload_path))
+                except Exception:
+                    pass
+            return hotload_path
 
     def _wire_adapters(self) -> None:
         self.registration = RegistrationRunner(self.reference, self.python_executable)
@@ -419,20 +442,15 @@ class GrokManager:
                 )
 
             try:
-                hotload_path = self.reference.sync_cpa_hotload(result.auth_file)
+                hotload_path = self._sync_hotload_path(result.auth_file, result.account_id)
             except Exception as exc:
                 message = "CPA hotload 未同步: %s" % exc
                 notes.append(message)
                 if log:
                     log("[%s] %s" % (result.email, message))
             else:
-                if hotload_path is not None:
-                    try:
-                        self.store.touch_cpa_auth_file(result.account_id, str(hotload_path))
-                    except Exception:
-                        pass
-                    if log:
-                        log("[%s] CPA hotload 已更新: %s" % (result.email, hotload_path))
+                if hotload_path is not None and log:
+                    log("[%s] CPA hotload 已更新: %s" % (result.email, hotload_path))
 
             if not sso_token:
                 message = "Grok2API 未同步: 没有可用的 SSO token"
@@ -539,13 +557,20 @@ class GrokManager:
                 detail="%s；自动重置密码失败：%s" % (result.detail, reset_result.detail),
             )
         log("[%s] 密码已重置，开始使用新密码重新登录" % result.email)
-        retries = self.batch_login(
-            [account_id],
-            log=log,
-            progress=None,
-            auto_reset_password=False,
-            _skip_review=True,
-        )
+        try:
+            retries = self.batch_login(
+                [account_id],
+                log=log,
+                progress=None,
+                auto_reset_password=False,
+                _skip_review=True,
+            )
+        except Exception as exc:
+            log("[%s] 自动重置后重新登录失败: %s" % (result.email, exc))
+            return replace(
+                result,
+                detail="密码已重置，但重新登录失败：%s" % exc,
+            )
         retry = retries[0] if retries else None
         if retry is None:
             return replace(result, detail="密码已重置，但重新登录未返回结果")
@@ -558,10 +583,23 @@ class GrokManager:
         progress=None,
         auto_reset_password: bool = True,
         _skip_review: bool = False,
+        cancelled=None,
     ) -> List[LoginResult]:
         log = log or (lambda _message: None)
-        ids = [int(account_id) for account_id in account_ids]
+        # Preserve first-seen order while dropping duplicates/invalid zeros.
+        seen_ids: set[int] = set()
+        ids: List[int] = []
+        for value in account_ids:
+            account_id = int(value or 0)
+            if account_id <= 0 or account_id in seen_ids:
+                continue
+            seen_ids.add(account_id)
+            ids.append(account_id)
+        existing = {account.id for account in self.store.get_many(ids)}
+        ids = [account_id for account_id in ids if account_id in existing]
         total_accounts = len(ids)
+        if not ids:
+            return []
         # Only advance when an account is fully settled. Wrong-password accounts stay
         # unsettled until reset + re-login finish after the primary login worker ends
         # (cannot nest another batch-login while the worker is still running).
@@ -628,23 +666,38 @@ class GrokManager:
         )
 
         if auto_reset_password and pending_reset:
-            # Primary login worker has exited; safe to start reset and re-login workers.
-            log(
-                "检测到 %s 个账号邮箱或密码错误，开始自动重置密码并重新登录"
-                % len(pending_reset)
-            )
             by_id = {
                 int(result.account_id): result
                 for result in results
                 if int(result.account_id or 0)
             }
+            if cancelled and cancelled():
+                log("任务已取消，跳过 %s 个密码错误账号的自动重置" % len(pending_reset))
+            else:
+                log(
+                    "检测到 %s 个账号邮箱或密码错误，开始自动重置密码并重新登录"
+                    % len(pending_reset)
+                )
             for account_id, failed in list(pending_reset.items()):
-                settled_result = self._reset_and_relogin_wrong_password(failed, log=log)
+                if cancelled and cancelled():
+                    settled_result = replace(
+                        failed,
+                        detail="%s；任务已取消，跳过自动重置密码" % failed.detail,
+                    )
+                else:
+                    try:
+                        settled_result = self._reset_and_relogin_wrong_password(
+                            failed, log=log
+                        )
+                    except Exception as exc:
+                        settled_result = replace(
+                            failed,
+                            detail="%s；自动恢复异常：%s" % (failed.detail, exc),
+                        )
                 by_id[account_id] = settled_result
                 settled["count"] += 1
                 if progress:
                     progress(settled_result, settled["count"], total_accounts or 1)
-            # Preserve original account order from the requested id list when possible.
             ordered: List[LoginResult] = []
             seen: set[int] = set()
             for account_id in ids:
@@ -770,44 +823,41 @@ class GrokManager:
         from grok_register.cpa_xai.schema import build_cpa_xai_auth
         from grok_register.cpa_xai.writer import write_cpa_xai_auth
 
-        with self._cpa_lock_for(account.id):
-            # Re-read under the account lock so concurrent guardian/manual refresh
-            # always operates on the latest rotating refresh token.
-            fresh = self.store.get(account.id) or account
-            refresh_token = str(fresh.refresh_token or "").strip()
-            if not refresh_token:
-                return CpaRefreshResult(
-                    fresh.id,
-                    fresh.email,
-                    False,
-                    "缺少 refresh_token",
-                )
-            auth_path: Path | None = None
-            try:
-                token = refresh_access_token(
-                    refresh_token,
-                    timeout=timeout,
-                    proxy=proxy or None,
-                )
-                payload = build_cpa_xai_auth(
-                    email=fresh.email,
-                    access_token=token.access_token,
-                    refresh_token=token.refresh_token,
-                    id_token=token.id_token,
-                    expires_in=token.expires_in,
-                    base_url=base_url,
-                )
-                auth_path = write_cpa_xai_auth(
-                    self.reference.managed_auth_dir,
-                    payload,
-                )
-                detail = "CPA 凭据已续期"
-                auth_meta = ""
-                from .paths import interprocess_lock
-
-                # Share the same cross-process lock as cpa-sync so CLI/web cannot
-                # race the hotload file while guardian rotates tokens.
-                with interprocess_lock("cpa-sync", self.reference.data_root):
+        # Lock order is always cpa-sync → account to avoid deadlock with batch sync.
+        with self._with_cpa_sync_lock():
+            with self._cpa_lock_for(account.id):
+                # Re-read under the account lock so concurrent guardian/manual refresh
+                # always operates on the latest rotating refresh token.
+                fresh = self.store.get(account.id) or account
+                refresh_token = str(fresh.refresh_token or "").strip()
+                if not refresh_token:
+                    return CpaRefreshResult(
+                        fresh.id,
+                        fresh.email,
+                        False,
+                        "缺少 refresh_token",
+                    )
+                auth_path: Path | None = None
+                try:
+                    token = refresh_access_token(
+                        refresh_token,
+                        timeout=timeout,
+                        proxy=proxy or None,
+                    )
+                    payload = build_cpa_xai_auth(
+                        email=fresh.email,
+                        access_token=token.access_token,
+                        refresh_token=token.refresh_token,
+                        id_token=token.id_token,
+                        expires_in=token.expires_in,
+                        base_url=base_url,
+                    )
+                    auth_path = write_cpa_xai_auth(
+                        self.reference.managed_auth_dir,
+                        payload,
+                    )
+                    detail = "CPA 凭据已续期"
+                    auth_meta = ""
                     try:
                         hotload_path = self.reference.sync_cpa_hotload(auth_path)
                     except Exception as exc:
@@ -830,32 +880,32 @@ class GrokManager:
                         auth_meta,
                         detail="CPA 凭据已续期",
                     )
-                log("[%s] CPA silent refresh 成功" % fresh.email)
-                return CpaRefreshResult(
-                    fresh.id,
-                    fresh.email,
-                    True,
-                    detail,
-                )
-            except OAuthDeviceError as exc:
-                return CpaRefreshResult(
-                    fresh.id,
-                    fresh.email,
-                    False,
-                    "CPA 续期失败: %s" % exc,
-                    retryable=bool(getattr(exc, "retryable", False)),
-                )
-            except Exception as exc:
-                return CpaRefreshResult(
-                    fresh.id,
-                    fresh.email,
-                    False,
-                    "CPA 续期异常: %s" % exc,
-                    retryable=True,
-                )
-            finally:
-                if auth_path is not None:
-                    self._remove_managed_auth_file(auth_path)
+                    log("[%s] CPA silent refresh 成功" % fresh.email)
+                    return CpaRefreshResult(
+                        fresh.id,
+                        fresh.email,
+                        True,
+                        detail,
+                    )
+                except OAuthDeviceError as exc:
+                    return CpaRefreshResult(
+                        fresh.id,
+                        fresh.email,
+                        False,
+                        "CPA 续期失败: %s" % exc,
+                        retryable=bool(getattr(exc, "retryable", False)),
+                    )
+                except Exception as exc:
+                    return CpaRefreshResult(
+                        fresh.id,
+                        fresh.email,
+                        False,
+                        "CPA 续期异常: %s" % exc,
+                        retryable=True,
+                    )
+                finally:
+                    if auth_path is not None:
+                        self._remove_managed_auth_file(auth_path)
 
     def _sync_cpa_hotload_for_result(
         self,
@@ -865,7 +915,7 @@ class GrokManager:
         if not result.ok or not result.auth_file:
             return result
         try:
-            hotload_path = self.reference.sync_cpa_hotload(result.auth_file)
+            hotload_path = self._sync_hotload_path(result.auth_file, result.account_id)
         except Exception as exc:
             note = "CPA hotload 未同步: %s" % exc
             log("[%s] %s" % (result.email, note))
@@ -873,10 +923,6 @@ class GrokManager:
         else:
             if hotload_path is not None:
                 log("[%s] CPA hotload 已更新: %s" % (result.email, hotload_path))
-                try:
-                    self.store.touch_cpa_auth_file(result.account_id, str(hotload_path))
-                except Exception:
-                    pass
             final = replace(result, auth_file="")
         self._remove_managed_auth_file(result.auth_file)
         return final
@@ -968,6 +1014,8 @@ class GrokManager:
                     account.id,
                     str(account.refresh_token or ""),
                     detail,
+                    expected_access=str(account.access_token or ""),
+                    expected_cpa_updated_at=str(getattr(account, "cpa_updated_at", "") or ""),
                 )
             else:
                 self.store.set_status(
@@ -1143,7 +1191,10 @@ class GrokManager:
         refresh_token: str,
         expires_at: str,
     ) -> tuple[Path, Optional[Path]]:
-        """Write a transient managed auth file, copy it to hotload, then delete it."""
+        """Write a transient managed auth file, copy it to hotload, then delete it.
+
+        Caller must already hold the cpa-sync interprocess lock (batch sync path).
+        """
         auth_path = self._write_manager_cpa_file(
             email=account.email,
             access_token=access_token,
@@ -1170,10 +1221,8 @@ class GrokManager:
         push_when_manager_newer: bool = True,
     ) -> CpaHotloadSyncResult:
         """Bidirectional newest-wins sync between manager DB and CPA hotload file."""
-        from .paths import interprocess_lock
-
         log = log or (lambda _message: None)
-        with interprocess_lock("cpa-sync", self.reference.data_root):
+        with self._with_cpa_sync_lock():
             # Re-read under the cross-process lock so CLI/web never act on a stale snapshot.
             fresh = self.store.get(account.id) or account
             return self._sync_account_cpa_with_hotload_unlocked(
@@ -1433,12 +1482,10 @@ class GrokManager:
         reinspect: bool = False,
     ) -> List[CpaHotloadSyncResult]:
         """Sync manager CPA credentials with deployment hotload files (newest wins)."""
-        from .paths import interprocess_lock
-
         log = log or (lambda _message: None)
         results: List[CpaHotloadSyncResult] = []
         # One cross-process lock for the whole batch; re-read each account under it.
-        with interprocess_lock("cpa-sync", self.reference.data_root):
+        with self._with_cpa_sync_lock():
             if account_ids is None:
                 accounts = self.store.list_accounts()
             else:
@@ -1637,6 +1684,8 @@ class GrokManager:
                     fresh.id,
                     str(fresh.refresh_token or ""),
                     detail,
+                    expected_access=str(fresh.access_token or ""),
+                    expected_cpa_updated_at=str(getattr(fresh, "cpa_updated_at", "") or ""),
                 )
                 if not marked:
                     detail = "CPA 续期失败，但凭据已由并发任务更新，跳过过期标记"

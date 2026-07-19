@@ -502,24 +502,37 @@ class AccountStore:
         account_id: int,
         expected_refresh: str,
         detail: str = "CPA 凭据已过期",
+        *,
+        expected_access: str = "",
+        expected_cpa_updated_at: str = "",
     ) -> bool:
-        """Atomically expire only when refresh_token still matches expected.
+        """Atomically expire only when CPA material still matches the expected snapshot.
 
-        An empty expected_refresh only expires accounts that still lack a refresh
-        token, so a concurrent login/remint that wrote a new token is not clobbered.
+        Empty expected_refresh only expires accounts that still lack a refresh token.
+        When expected_access / expected_cpa_updated_at are provided, any concurrent
+        rotation that changed those fields also aborts the expire.
         """
         with self.account_lock(account_id):
             account = self.get(account_id)
             if account is None:
                 return False
-            current = str(account.refresh_token or "").strip()
-            expected = str(expected_refresh or "").strip()
-            if expected:
-                if current and current != expected:
+            current_refresh = str(account.refresh_token or "").strip()
+            expected_refresh = str(expected_refresh or "").strip()
+            if expected_refresh:
+                if current_refresh and current_refresh != expected_refresh:
                     return False
-            elif current:
-                # Expected no refresh, but another task already stored one.
+            elif current_refresh:
                 return False
+            expected_access = str(expected_access or "").strip()
+            if expected_access:
+                current_access = str(account.access_token or "").strip()
+                if current_access and current_access != expected_access:
+                    return False
+            expected_stamp = str(expected_cpa_updated_at or "").strip()
+            if expected_stamp:
+                current_stamp = str(account.cpa_updated_at or "").strip()
+                if current_stamp and current_stamp != expected_stamp:
+                    return False
             self._mark_cpa_expired_unlocked(account_id, detail)
             return True
 
@@ -568,14 +581,32 @@ class AccountStore:
             observed_cpa_updated = str(
                 getattr(result, "observed_cpa_updated_at", "") or ""
             ).strip()
-            if observed_access and observed_access != str(current.access_token or "").strip():
-                return
-            if (
-                observed_cpa_updated
-                and str(current.cpa_updated_at or "").strip()
-                and observed_cpa_updated != str(current.cpa_updated_at or "").strip()
-            ):
-                return
+            current_access = str(current.access_token or "").strip()
+            current_stamp = str(current.cpa_updated_at or "").strip()
+            if bool(getattr(result, "cpa_snapshot", False)):
+                # Empty observation means the probe saw no CPA material; refuse to
+                # overwrite an account that gained CPA credentials after the probe.
+                if not observed_access and current_access:
+                    return
+                if observed_access and observed_access != current_access:
+                    return
+                if (
+                    observed_cpa_updated
+                    and current_stamp
+                    and observed_cpa_updated != current_stamp
+                ):
+                    return
+                if not observed_cpa_updated and current_stamp and current_access:
+                    return
+            elif observed_access or observed_cpa_updated:
+                if observed_access and observed_access != current_access:
+                    return
+                if (
+                    observed_cpa_updated
+                    and current_stamp
+                    and observed_cpa_updated != current_stamp
+                ):
+                    return
             with self._connect() as conn:
                 conn.execute(
                     """

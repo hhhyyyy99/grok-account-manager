@@ -35,7 +35,7 @@ class BatchLoginService:
         self.store = store
         self.project = project
         self.python_executable = python_executable
-        self._remint_expected_refresh: Dict[int, str] = {}
+        self._remint_expected_snapshot: Dict[int, Dict[str, str]] = {}
         self._worker = BatchWorkerProcess(
             project,
             python_executable,
@@ -155,12 +155,17 @@ class BatchLoginService:
         if not ready:
             return results
 
-        # Capture refresh versions before the long-running remint worker so failure
+        # Capture CPA versions before the long-running remint worker so failure
         # marking cannot treat a concurrent rotation as the pre-remint baseline.
-        expected_refresh_by_id = {
-            account.id: str(account.refresh_token or "").strip() for account in ready
+        expected_by_id = {
+            account.id: {
+                "refresh": str(account.refresh_token or "").strip(),
+                "access": str(account.access_token or "").strip(),
+                "cpa_updated_at": str(getattr(account, "cpa_updated_at", "") or "").strip(),
+            }
+            for account in ready
         }
-        self._remint_expected_refresh = expected_refresh_by_id
+        self._remint_expected_snapshot = expected_by_id
 
         self.project.validate()
         document = {
@@ -191,7 +196,7 @@ class BatchLoginService:
                 exit_failed_message="CPA SSO 续期工作进程异常退出: %s",
             )
         finally:
-            self._remint_expected_refresh = {}
+            self._remint_expected_snapshot = {}
         results.extend(worker_results)
         for account in ready:
             if account.id in parsed_ids:
@@ -311,9 +316,10 @@ class BatchLoginService:
             value.get("error")
             or ("通过 SSO 重新签发 CPA 凭据" if ok else "SSO 续期失败")
         )
-        expected_refresh = str(
-            (getattr(self, "_remint_expected_refresh", {}) or {}).get(account_id, "")
-        )
+        expected = (getattr(self, "_remint_expected_snapshot", {}) or {}).get(account_id) or {}
+        expected_refresh = str(expected.get("refresh") or "")
+        expected_access = str(expected.get("access") or "")
+        expected_cpa_updated_at = str(expected.get("cpa_updated_at") or "")
         if ok:
             try:
                 account = self.store.get(account_id)
@@ -353,6 +359,8 @@ class BatchLoginService:
                 account_id,
                 expected_refresh,
                 detail,
+                expected_access=expected_access,
+                expected_cpa_updated_at=expected_cpa_updated_at,
             )
         return CpaRefreshResult(
             account_id,

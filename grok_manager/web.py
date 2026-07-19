@@ -623,7 +623,12 @@ class GrokWebApplication:
             def progress(result, completed, total):
                 task.progress(completed, total, "%s: %s" % (result.email, result.detail))
 
-            results = self.manager.batch_login(ids, log=task.log, progress=progress)
+            results = self.manager.batch_login(
+                ids,
+                log=task.log,
+                progress=progress,
+                cancelled=lambda: task.cancel_requested,
+            )
             summary = summarize_account_results(results, action_label="登录")
             log_account_failures(
                 task,
