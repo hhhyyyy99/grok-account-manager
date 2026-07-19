@@ -605,24 +605,41 @@ def _remote_pool_save_payload(pools):
     return payload
 
 
-def _upsert_grok2api_pool(pool, token, email="", replace_email=False):
+def _upsert_grok2api_pool(
+    pool, token, email="", replace_email=False, previous_token=""
+):
     items = list(pool) if isinstance(pool, list) else []
+    old_token = _normalize_sso_token(previous_token)
     target_email = str(email or "").strip().casefold() if replace_email else ""
-    if target_email:
+
+    if replace_email and (old_token or target_email):
         replacement = None
         retained = []
+        changed = False
         for item in items:
-            note = str(item.get("note") or "").strip().casefold() if isinstance(item, dict) else ""
-            if note == target_email:
+            if isinstance(item, dict):
+                item_token = _normalize_sso_token(item.get("token", ""))
+                note = str(item.get("note") or "").strip().casefold()
+            else:
+                item_token = _normalize_sso_token(item)
+                note = ""
+            matches = (
+                (old_token and item_token == old_token)
+                or (target_email and note == target_email)
+                or item_token == token
+            )
+            if matches:
+                changed = True
                 if replacement is None and isinstance(item, dict):
                     replacement = dict(item)
                 continue
             retained.append(item)
-        if replacement is not None or len(retained) != len(items):
+        if changed:
             entry = replacement or {}
             entry["token"] = token
             entry["tags"] = entry.get("tags") or ["auto-relogin"]
-            entry["note"] = email
+            if email:
+                entry["note"] = email
             retained.append(entry)
             return retained, True
 
@@ -682,6 +699,7 @@ def add_token_to_grok2api_local_pool(
     settings=None,
     default_token_file=None,
     replace_email=False,
+    previous_token="",
 ):
     token = _normalize_sso_token(raw_token)
     if not token:
@@ -703,7 +721,11 @@ def add_token_to_grok2api_local_pool(
         if not isinstance(data, dict):
             data = {}
         pool, changed = _upsert_grok2api_pool(
-            data.get(pool_name), token, email=email, replace_email=replace_email
+            data.get(pool_name),
+            token,
+            email=email,
+            replace_email=replace_email,
+            previous_token=previous_token,
         )
         if not changed:
             if log_callback:
@@ -752,7 +774,7 @@ def _redact_sensitive_text(value):
     if not text:
         return text
     # Strip common credential carriers from logs/errors.
-    text = re.sub(r"(?i)([?&]app_key=)[^&\s]+", r"\1***", text)
+    text = re.sub(r"(?i)([?&]app_key=)[^&\s#]+", r"\1***", text)
     text = re.sub(r"(?i)(app_key[\"']?\s*[:=]\s*[\"']?)[^\"'\s,;&]+", r"\1***", text)
     text = re.sub(
         r"(?i)(authorization:\s*bearer\s+)[^\s,;]+",
@@ -762,13 +784,17 @@ def _redact_sensitive_text(value):
     return text
 
 
+def _safe_endpoint(endpoint):
+    return _redact_sensitive_text(endpoint)
+
+
 def _http_error_summary(exc, endpoint=""):
     status = getattr(getattr(exc, "response", None), "status_code", None)
     if status is None:
         status = getattr(exc, "status_code", None)
     parts = []
     if endpoint:
-        parts.append(str(endpoint))
+        parts.append(_safe_endpoint(endpoint))
     if status is not None:
         parts.append("HTTP %s" % status)
     message = _redact_sensitive_text(exc)
@@ -835,6 +861,14 @@ def add_token_to_grok2api_remote_pool(
         if log_callback:
             log_callback("[Debug] %s，跳过" % message)
         return False
+    # Keep secrets out of request URLs/logs: never accept app_key in base query.
+    if "?" in base or "#" in base or "app_key=" in base.lower():
+        message = "grok2api 远端 base 不能包含 query/fragment 或 app_key"
+        if replace_email:
+            raise RuntimeError(message)
+        if log_callback:
+            log_callback("[Debug] %s，跳过" % message)
+        return False
     # Prefer Authorization header so app_key never appears in request URLs/logs.
     headers = {
         "Content-Type": "application/json",
@@ -865,20 +899,57 @@ def add_token_to_grok2api_remote_pool(
                 if log_callback:
                     action = "已更新" if replace_email else "已写入"
                     log_callback(
-                        f"[+] {action} grok2api 远端池: {pool_name} ({endpoint})"
+                        f"[+] {action} grok2api 远端池: {pool_name} ({_safe_endpoint(endpoint)})"
                     )
                 return True
             except Exception as add_exc:
                 add_errors.append(_http_error_summary(add_exc, endpoint))
         return add_errors
 
+    def _remote_has_token(target_token):
+        needle = _normalize_sso_token(target_token)
+        if not needle:
+            return False
+        for api_base in api_bases:
+            endpoint = f"{api_base}/tokens"
+            try:
+                resp = http_get(
+                    endpoint,
+                    headers=headers,
+                    timeout=20,
+                    proxies={},
+                )
+                if resp.status_code != 200:
+                    continue
+                pools = _coerce_grok2api_token_pools(
+                    resp.json(), preferred_pool=pool_name
+                )
+                if not isinstance(pools, dict):
+                    continue
+                for items in pools.values():
+                    for item in items or []:
+                        if isinstance(item, dict):
+                            item_token = _normalize_sso_token(item.get("token", ""))
+                        else:
+                            item_token = _normalize_sso_token(item)
+                        if item_token == needle:
+                            return True
+            except Exception:
+                continue
+        return False
+
     # Modern grok2api exposes PUT /tokens/edit for single-token replace.
     # Prefer it on relogin so we do not rewrite multi-thousand token pools.
     if replace_email and old_token:
         if old_token == token:
-            if log_callback:
-                log_callback(f"[*] grok2api 远端池 token 未变化: {pool_name}")
-            return True
+            if _remote_has_token(token):
+                if log_callback:
+                    log_callback(f"[*] grok2api 远端池 token 未变化: {pool_name}")
+                return True
+            raise RuntimeError(
+                "grok2api 远端未找到待同步 token，已拒绝把未变化结果记为成功"
+                + (f": {email}" if email else "")
+            )
         edit_errors = []
         account_missing = False
         route_unavailable = False
@@ -898,8 +969,16 @@ def add_token_to_grok2api_remote_pool(
                 )
                 body_text = _response_body_text(resp_edit)
                 if _is_account_not_found_response(resp_edit.status_code, body_text):
+                    # Idempotent recovery: if the new token already exists, the
+                    # previous replace likely completed and only the response was lost.
+                    if _remote_has_token(token):
+                        if log_callback:
+                            log_callback(
+                                f"[*] grok2api 远端已存在新 token，视为替换完成: {pool_name}"
+                            )
+                        return True
                     account_missing = True
-                    edit_errors.append("%s: account_not_found" % endpoint)
+                    edit_errors.append("%s: account_not_found" % _safe_endpoint(endpoint))
                     continue
                 if resp_edit.status_code in (404, 405):
                     # Generic Not Found / Method Not Allowed means the route or
@@ -907,13 +986,13 @@ def add_token_to_grok2api_remote_pool(
                     # as "old token missing" and never auto-add duplicates.
                     route_unavailable = True
                     edit_errors.append(
-                        "%s: HTTP %s" % (endpoint, resp_edit.status_code)
+                        "%s: HTTP %s" % (_safe_endpoint(endpoint), resp_edit.status_code)
                     )
                     continue
                 resp_edit.raise_for_status()
                 if log_callback:
                     log_callback(
-                        f"[+] 已更新 grok2api 远端池: {pool_name} ({endpoint})"
+                        f"[+] 已更新 grok2api 远端池: {pool_name} ({_safe_endpoint(endpoint)})"
                     )
                 return True
             except Exception as edit_exc:
@@ -970,6 +1049,7 @@ def add_token_to_grok2api_pools(
                 settings=settings,
                 default_token_file=default_token_file,
                 replace_email=replace_email,
+                previous_token=previous_token,
             )
         except Exception as exc:
             # Local pool writes must never abort registration. Relogin also

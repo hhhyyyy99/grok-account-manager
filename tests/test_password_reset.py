@@ -431,6 +431,31 @@ class PasswordResetTests(unittest.TestCase):
                 password_form_present=False,
             )
         )
+        # Failure phrases that contain "password reset" must not count as success.
+        self.assertFalse(
+            _has_reset_success(
+                "https://accounts.x.ai/reset-password",
+                "Password reset failed",
+                True,
+                password_form_present=False,
+            )
+        )
+        self.assertFalse(
+            _has_reset_success(
+                "https://accounts.x.ai/reset-password",
+                "Password reset error",
+                True,
+                password_form_present=False,
+            )
+        )
+        self.assertFalse(
+            _has_reset_success(
+                "https://accounts.x.ai/reset-password",
+                "密码已重置失败",
+                True,
+                password_form_present=False,
+            )
+        )
         self.assertFalse(
             _has_reset_success("https://accounts.x.ai/sign-in", "Sign in", False)
         )

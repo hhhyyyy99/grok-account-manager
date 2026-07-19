@@ -124,7 +124,16 @@ def _has_reset_success(
     url_low = (url or "").lower()
     if not password_submitted:
         return False
-    error_words = (
+    # Failure always wins. Bare "password reset" is not success because it also
+    # appears in phrases like "Password reset failed".
+    failure_markers = (
+        "password reset failed",
+        "password reset error",
+        "reset failed",
+        "reset error",
+        "failed to reset",
+        "unable to reset",
+        "could not reset",
         "too many",
         "rate limit",
         "请求过于频繁",
@@ -144,21 +153,9 @@ def _has_reset_success(
         "错误",
         "过期",
     )
-    if any(word in low for word in error_words) and not any(
-        word in low
-        for word in (
-            "password reset",
-            "password updated",
-            "password changed",
-            "密码已重置",
-            "密码已更新",
-            "密码已修改",
-            "重置成功",
-        )
-    ):
+    if any(marker in low for marker in failure_markers):
         return False
     success_words = (
-        "password reset",
         "password updated",
         "password has been reset",
         "password has been updated",
@@ -197,8 +194,6 @@ def _has_reset_success(
                 "登录",
                 "使用邮箱登录",
                 "continue with email",
-                "email",
-                "password",
             )
         )
     ):

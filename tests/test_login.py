@@ -265,6 +265,10 @@ class BatchLoginCredentialTests(unittest.TestCase):
                 ):
                     browser_confirm._raise_for_login_error(sample)
 
+        # Co-occurrence of password + invalid must not invent a credential error.
+        browser_confirm._raise_for_login_error("Password\nInvalid request")
+        browser_confirm._raise_for_login_error("Invalid action")
+
     def test_password_page_stuck_does_not_invent_wrong_password_error(self) -> None:
         class FakeElement:
             def clear(self):
@@ -1030,7 +1034,7 @@ class BatchLoginCredentialTests(unittest.TestCase):
             seen = []
 
             def fail_sync(sso_token, email="", log_callback=None, previous_token=""):
-                seen.append(previous_token)
+                seen.append((previous_token, sso_token))
                 raise RuntimeError("remote unavailable")
 
             with patch.object(manager.reference, "sync_grok2api", side_effect=fail_sync):
@@ -1039,9 +1043,12 @@ class BatchLoginCredentialTests(unittest.TestCase):
 
             self.assertIn("Grok2API 未同步", note1)
             self.assertIn("Grok2API 未同步", note2)
-            self.assertEqual(["old-sso", "old-sso"], seen)
             self.assertEqual(
-                "old-sso",
+                [("old-sso", "fresh-sso"), ("old-sso", "newer-sso")],
+                seen,
+            )
+            self.assertEqual(
+                "old-sso\nfresh-sso",
                 manager.vault.get_secret("pending-sso-replace:pending@example.com"),
             )
 

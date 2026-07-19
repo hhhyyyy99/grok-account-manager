@@ -665,20 +665,9 @@ def _looks_like_wrong_password(visible_text: str) -> bool:
         "密码不正确",
         "密码错误",
     )
-    if any(marker in low or marker in text for marker in exact_markers):
-        return True
-    # Broader English variants that still clearly mean bad credentials.
-    if (
-        ("email" in low or "password" in low)
-        and any(word in low for word in ("incorrect", "invalid", "wrong"))
-        and any(word in low for word in ("password", "credential", "email"))
-    ):
-        # Avoid matching unrelated "invalid action" / "incorrect request" pages.
-        if "invalid action" in low:
-            return False
-        if "password" in low or "credential" in low:
-            return True
-    return False
+    # Only explicit credential-error copy may trigger auto password reset.
+    # Do not use co-occurrence heuristics such as "password" + "invalid".
+    return any(marker in low or marker in text for marker in exact_markers)
 
 
 def _raise_for_login_error(visible_text: str) -> None:
