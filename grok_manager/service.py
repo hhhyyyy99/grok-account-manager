@@ -280,7 +280,12 @@ class GrokManager:
         return text, ""
 
     def _remember_pending_sso_replace(
-        self, email: str, previous_token: str, new_token: str = ""
+        self,
+        email: str,
+        previous_token: str,
+        new_token: str = "",
+        *,
+        advance_old: bool = False,
     ) -> None:
         previous = str(previous_token or "").strip()
         fresh = str(new_token or "").strip()
@@ -296,8 +301,13 @@ class GrokManager:
             existing_raw = ""
         existing_old, existing_new = self._parse_pending_sso_secret(existing_raw)
 
-        # Preserve the original remote token that still needs to be replaced.
-        old = existing_old or previous
+        if advance_old and previous:
+            # Explicit chain progress after the remote reports the previous old
+            # token is already gone.
+            old = previous
+        else:
+            # Preserve the original remote token that still needs to be replaced.
+            old = existing_old or previous
         # Advance the "already attempted new token" when a later login produces a
         # newer value. Keep the first intermediate token if the caller only
         # re-sends the same pending pair.
@@ -342,6 +352,7 @@ class GrokManager:
         self, email: str, previous_token: str = "", current_token: str = ""
     ) -> List[str]:
         pending_old, pending_new = self._resolve_pending_sso_replace(email, previous_token)
+        current = str(current_token or "").strip()
         candidates: List[str] = []
         for token in (
             pending_old,
@@ -349,10 +360,16 @@ class GrokManager:
             pending_new,
         ):
             value = str(token or "").strip()
-            if not value or value == current_token:
+            if not value:
                 continue
+            # Keep same-token candidates so the remote layer can verify presence
+            # when previous == current.
             if value not in candidates:
                 candidates.append(value)
+        if not candidates and current:
+            # Explicit same-token relogin with no pending state still needs the
+            # remote existence check path.
+            candidates.append(current)
         return candidates
 
     def _sync_relogin_credentials(self, result: LoginResult, log=None) -> str:
@@ -366,10 +383,11 @@ class GrokManager:
             if not sso_token:
                 account = self.store.get(result.account_id) if result.account_id else None
                 sso_token = str(account.sso_token if account else "").strip()
-            if result.previous_sso_token or sso_token or previous_for_remote:
+            seed_previous = result.previous_sso_token or previous_for_remote
+            if seed_previous and seed_previous != sso_token:
                 self._remember_pending_sso_replace(
                     result.email,
-                    result.previous_sso_token or previous_for_remote,
+                    seed_previous,
                     sso_token or pending_new,
                 )
                 previous_for_remote, pending_new = self._resolve_pending_sso_replace(
@@ -404,7 +422,7 @@ class GrokManager:
                 current_token=sso_token,
             )
             if not previous_candidates:
-                previous_candidates = [""]
+                previous_candidates = [sso_token or ""]
 
             sync_errors: List[str] = []
             for index, previous_token in enumerate(previous_candidates):
@@ -426,7 +444,10 @@ class GrokManager:
                     if is_missing and has_next:
                         advanced_old = previous_candidates[index + 1]
                         self._remember_pending_sso_replace(
-                            result.email, advanced_old, sso_token
+                            result.email,
+                            advanced_old,
+                            sso_token,
+                            advance_old=True,
                         )
                         if log:
                             log(

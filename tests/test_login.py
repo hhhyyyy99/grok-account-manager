@@ -1106,5 +1106,84 @@ class BatchLoginCredentialTests(unittest.TestCase):
                 manager.vault.get_secret("pending-sso-replace:recover@example.com"),
             )
 
+    def test_same_token_relogin_keeps_previous_token_for_remote_check(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            account = manager.store.upsert(
+                AccountDraft(
+                    email="same@example.com",
+                    password="password",
+                    sso_token="same-sso",
+                    access_token="access",
+                    refresh_token="refresh",
+                )
+            )
+            result = LoginResult(
+                account.id,
+                account.email,
+                True,
+                "登录成功",
+                previous_sso_token="same-sso",
+                sso_token="same-sso",
+            )
+            seen = []
+
+            def sync(sso_token, email="", log_callback=None, previous_token=""):
+                seen.append((previous_token, sso_token))
+                return None
+
+            with patch.object(manager.reference, "sync_grok2api", side_effect=sync):
+                note = manager._sync_relogin_credentials(result)
+
+            self.assertEqual("", note)
+            self.assertEqual([("same-sso", "same-sso")], seen)
+
+    def test_pending_chain_persists_after_failed_intermediate_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            account = manager.store.upsert(
+                AccountDraft(
+                    email="chain@example.com",
+                    password="password",
+                    sso_token="fresh-sso",
+                    access_token="access",
+                    refresh_token="refresh",
+                )
+            )
+            manager.vault.put_secret(
+                "pending-sso-replace:chain@example.com", "old-sso\nfresh-sso"
+            )
+            result = LoginResult(
+                account.id,
+                account.email,
+                True,
+                "登录成功",
+                previous_sso_token="fresh-sso",
+                sso_token="newer-sso",
+            )
+            seen = []
+
+            def sync(sso_token, email="", log_callback=None, previous_token=""):
+                seen.append((previous_token, sso_token))
+                if previous_token == "old-sso":
+                    raise RuntimeError(
+                        "grok2api 远端未找到待替换凭据，已拒绝新增: chain@example.com"
+                    )
+                raise RuntimeError("remote unavailable after advance")
+
+            with patch.object(manager.reference, "sync_grok2api", side_effect=sync):
+                note = manager._sync_relogin_credentials(result)
+
+            self.assertIn("Grok2API 未同步", note)
+            self.assertEqual(
+                [("old-sso", "newer-sso"), ("fresh-sso", "newer-sso")],
+                seen,
+            )
+            # Intermediate token must remain as the next previous candidate.
+            self.assertEqual(
+                "fresh-sso\nnewer-sso",
+                manager.vault.get_secret("pending-sso-replace:chain@example.com"),
+            )
+
 if __name__ == "__main__":
     unittest.main()
