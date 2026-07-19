@@ -124,6 +124,7 @@ class LoginResult:
     detail: str
     auth_file: str = ""
     previous_sso_token: str = ""
+    sso_token: str = ""
 
 
 @dataclass(frozen=True)

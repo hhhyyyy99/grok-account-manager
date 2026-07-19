@@ -693,8 +693,11 @@ def add_token_to_grok2api_remote_pool(
     app_key = str(values.get("grok2api_remote_app_key", "") or "").strip()
     pool_name = str(values.get("grok2api_pool_name", "ssoBasic") or "ssoBasic").strip() or "ssoBasic"
     if not base or not app_key:
+        message = "grok2api 远端已启用但未配置 base/app_key"
+        if replace_email:
+            raise RuntimeError(message)
         if log_callback:
-            log_callback("[Debug] grok2api 远端未配置 base/app_key，跳过")
+            log_callback("[Debug] %s，跳过" % message)
         return False
     headers = {"Content-Type": "application/json"}
     query = {"app_key": app_key}
@@ -816,7 +819,6 @@ def add_token_to_grok2api_pools(
     values = config if settings is None else settings
     remote_enabled = bool(values.get("grok2api_auto_add_remote", False))
     local_enabled = bool(values.get("grok2api_auto_add_local", True))
-    errors = []
     if local_enabled:
         try:
             add_token_to_grok2api_local_pool(
@@ -828,12 +830,13 @@ def add_token_to_grok2api_pools(
                 replace_email=replace_email,
             )
         except Exception as exc:
+            # Local pool writes must never abort registration. Relogin also
+            # treats local failure as non-fatal; remote replace is the gate.
             if log_callback:
                 log_callback(f"[!] 写入 grok2api 本地池失败: {exc}")
-            errors.append(exc)
     if remote_enabled:
         try:
-            add_token_to_grok2api_remote_pool(
+            remote_ok = add_token_to_grok2api_remote_pool(
                 raw_token,
                 email=email,
                 log_callback=log_callback,
@@ -841,14 +844,14 @@ def add_token_to_grok2api_pools(
                 replace_email=replace_email,
                 previous_token=previous_token,
             )
+            if replace_email and not remote_ok:
+                raise RuntimeError("grok2api 远端替换未完成")
         except Exception as exc:
             prefix = "[!]" if replace_email else "[Debug]"
             if log_callback:
                 log_callback(f"{prefix} 写入 grok2api 远端池失败: {exc}")
             if replace_email:
-                errors.append(exc)
-    if errors:
-        raise errors[0]
+                raise
 
 
 def append_mail_credential(email, credential):

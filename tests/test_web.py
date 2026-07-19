@@ -9,12 +9,62 @@ from unittest.mock import patch
 from grok_manager.web import (
     ASSET_DIR,
     GrokWebApplication,
+    TaskRegistry,
     host_header_hostname,
     is_loopback_host,
     is_wildcard_host,
     normalize_bind_host,
+    task_result_failed,
 )
 from tests.support import make_manager
+
+
+class TaskResultStateTests(unittest.TestCase):
+    def test_task_result_failed_detects_partial_failures(self) -> None:
+        self.assertFalse(task_result_failed({"message": "ok", "failed": 0}))
+        self.assertTrue(task_result_failed({"message": "partial", "failed": 1}))
+        self.assertTrue(
+            task_result_failed(
+                {
+                    "resetCount": 2,
+                    "resetSucceeded": 1,
+                    "loginCount": 1,
+                    "loginSucceeded": 1,
+                }
+            )
+        )
+        self.assertTrue(
+            task_result_failed(
+                {
+                    "resetCount": 1,
+                    "resetSucceeded": 1,
+                    "loginCount": 1,
+                    "loginSucceeded": 0,
+                }
+            )
+        )
+
+    def test_registry_marks_partial_login_failure_as_failed(self) -> None:
+        registry = TaskRegistry()
+
+        def worker(_task):
+            return {
+                "count": 1,
+                "succeeded": 0,
+                "failed": 1,
+                "message": "登录完成，成功 0，失败 1",
+            }
+
+        task = registry.start("login", "批量登录", worker)
+        for _ in range(50):
+            if task.state in {"succeeded", "failed", "cancelled"}:
+                break
+            import time
+
+            time.sleep(0.01)
+
+        self.assertEqual("failed", task.state)
+        self.assertIn("失败 1", task.message)
 
 
 class LanAccessTests(unittest.TestCase):

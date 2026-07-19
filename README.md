@@ -113,7 +113,7 @@ data/
 ├── credentials.vault.json    # Argon2id + AES-GCM 保险库元数据与加密 secret
 ├── registration-config.json  # 非敏感配置与敏感字段密文
 ├── accounts.sqlite3          # 账号索引、状态与加密凭据
-├── registration-output/      # 注册临时产物；导入后清理明文凭据
+├── registration-output/      # 注册临时产物；导入后清理明文凭据（含 sub2api_exports）
 ├── auths/                    # 登录 worker 临时输出；回写后立即删除
 └── jobs/                     # 任务目录；密码通过匿名管道传递
 ```
@@ -192,7 +192,7 @@ uv run --locked python -m unittest discover -v
 - SSO 在线巡检只把 SSO cookie 发往 `accounts.x.ai/account`，使用 GET 且不修改账号。
 - CPA 在线巡检只把 access token 发往 CPA `base_url` 的 `/models`；若凭据文件指定了 `base_url`，优先使用该地址。
 - 批量登录和密码重置通过匿名管道把凭据传给 worker，不生成明文 `input.json`。
-- 导入后，应用数据目录中的 `accounts.txt`、`mail_credentials.txt` 和 `xai-*.json` 明文产物会被清理；邮箱凭据和重置后的密码只写入保险库，然后自动重新登录。
+- 导入后，应用数据目录中的 `accounts.txt`、`mail_credentials.txt`、`xai-*.json` 以及同批次 `sub2api_exports/` 明文产物会被清理；邮箱凭据和重置后的密码只写入保险库，然后自动重新登录。
 - Cloudflare 邮箱 JWT 过期时，会优先从旧 JWT 的 `address_id` 调用管理员 `show_password` 续期；续期失败才回退到管理员邮件列表接口。
 - Grok 密码重置路径为 `accounts.x.ai/sign-in` → “使用邮箱登录” → 邮箱“下一步” → 密码页“忘记密码？”；临时邮箱只用于接收验证码，不会重置邮箱密码。
 

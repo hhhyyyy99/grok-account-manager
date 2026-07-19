@@ -485,7 +485,9 @@ class BatchLoginCredentialTests(unittest.TestCase):
                 AccountDraft(
                     email="first@example.com",
                     password="password",
-                    sso_token="fresh-sso",
+                    sso_token="old-sso",
+                    access_token="access",
+                    refresh_token="refresh",
                 )
             )
             result = LoginResult(
@@ -494,6 +496,7 @@ class BatchLoginCredentialTests(unittest.TestCase):
                 True,
                 "登录成功",
                 previous_sso_token="old-sso",
+                sso_token="fresh-sso",
             )
 
             with patch.object(manager.reference, "sync_grok2api") as sync:
@@ -505,6 +508,8 @@ class BatchLoginCredentialTests(unittest.TestCase):
                 log_callback=None,
                 previous_token="old-sso",
             )
+            stored = manager.store.get(account.id)
+            self.assertEqual("fresh-sso", stored.sso_token if stored else "")
 
     def test_login_deletes_managed_auth_file_after_successful_sync(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -548,6 +553,11 @@ class BatchLoginCredentialTests(unittest.TestCase):
             self.assertFalse(result.ok)
             self.assertIn("凭据同步失败", result.detail)
             self.assertEqual(AccountStatus.ERROR.value, stored.status if stored else "")
+            # Keep the previous SSO so the next relogin can still match remote.
+            self.assertEqual("old-sso", stored.sso_token if stored else "")
+            self.assertEqual("old-sso", result.previous_sso_token)
+            self.assertEqual("fresh-sso", result.sso_token)
+            self.assertEqual("fresh-access", stored.access_token if stored else "")
             self.assertFalse(auth_file.exists())
             self.assertTrue(any("Grok2API 更新失败" in line for line in logs))
 
@@ -645,6 +655,80 @@ class BatchLoginCredentialTests(unittest.TestCase):
 
             self.assertEqual([(True, ["fresh-sso"])], observed)
             self.assertEqual("old-sso", results[0].previous_sso_token)
+            self.assertEqual("fresh-sso", results[0].sso_token)
+            stored = manager.store.get(account.id)
+            self.assertEqual("fresh-sso", stored.sso_token if stored else "")
+
+    def test_worker_runtime_reaps_process_when_parser_raises(self) -> None:
+        from grok_manager.worker_runtime import BatchWorkerProcess
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            waited = []
+            terminated = []
+            closed = []
+
+            class FakePipe:
+                def write(self, _payload):
+                    return None
+
+                def close(self):
+                    closed.append("stdin")
+
+            class FakeStdout:
+                def __iter__(self):
+                    yield "GM_RESULT " + json.dumps({"id": 1})
+
+                def close(self):
+                    closed.append("stdout")
+
+            class FakeProcess:
+                pid = 4242
+                stdin = FakePipe()
+                stdout = FakeStdout()
+
+                def poll(self):
+                    return None if not waited else 1
+
+                def terminate(self):
+                    terminated.append("terminate")
+
+                def kill(self):
+                    terminated.append("kill")
+
+                def wait(self, timeout=None):
+                    waited.append(timeout)
+                    return 1
+
+            process = FakeProcess()
+            worker = BatchWorkerProcess(
+                manager.reference,
+                sys.executable,
+                job_glob="login-*/input.json",
+                busy_error="busy",
+            )
+
+            def boom(_payload):
+                raise ValueError("parser exploded")
+
+            with patch(
+                "grok_manager.worker_runtime.subprocess.Popen", return_value=process
+            ), patch("grok_manager.worker_runtime.os.killpg", side_effect=ProcessLookupError):
+                with self.assertRaisesRegex(ValueError, "parser exploded"):
+                    worker.run(
+                        "batch-login",
+                        {"settings": {}, "accounts": []},
+                        log=lambda _message: None,
+                        parse_result=boom,
+                        stdin_missing_message="stdin missing",
+                        start_failed_message="start failed: %s",
+                        exit_failed_message="exit failed: %s",
+                    )
+
+            self.assertTrue(waited)
+            self.assertIn("terminate", terminated)
+            self.assertIn("stdout", closed)
+            self.assertIsNone(worker._process)
 
     def test_login_updates_sso_and_cpa_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

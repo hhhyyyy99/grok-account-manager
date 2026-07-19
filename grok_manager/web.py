@@ -27,6 +27,36 @@ LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 WILDCARD_HOSTS = frozenset({"0.0.0.0", "::", "[::]"})
 
 
+def task_result_failed(result: Dict[str, Any]) -> bool:
+    if not isinstance(result, dict):
+        return False
+    if result.get("ok") is False:
+        return True
+    failed = result.get("failed")
+    if isinstance(failed, (int, float)) and failed > 0:
+        return True
+    failed_count = result.get("failedCount")
+    if isinstance(failed_count, (int, float)) and failed_count > 0:
+        return True
+    reset_count = result.get("resetCount")
+    reset_succeeded = result.get("resetSucceeded")
+    if (
+        isinstance(reset_count, (int, float))
+        and isinstance(reset_succeeded, (int, float))
+        and reset_count > reset_succeeded
+    ):
+        return True
+    login_count = result.get("loginCount")
+    login_succeeded = result.get("loginSucceeded")
+    if (
+        isinstance(login_count, (int, float))
+        and isinstance(login_succeeded, (int, float))
+        and login_count > login_succeeded
+    ):
+        return True
+    return False
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -181,6 +211,9 @@ class TaskRegistry:
                 if task.cancel_requested:
                     task.state = "cancelled"
                     task.message = "任务已取消"
+                elif task_result_failed(result):
+                    task.state = "failed"
+                    task.message = safe_visible(result.get("message") or "任务完成但存在失败")
                 else:
                     task.state = "succeeded"
                     task.message = safe_visible(result.get("message") or "任务完成")

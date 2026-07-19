@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -87,6 +88,7 @@ class GrokManager:
         drafts = self.reference.import_records(files, extra_auth_dirs)
         imported_emails = set()
         used_auth_files: set[str] = set()
+        batch_dirs: set[Path] = set()
         for draft in drafts:
             imported_emails.add(str(draft.email or "").strip().lower())
             if draft.auth_file:
@@ -100,22 +102,50 @@ class GrokManager:
         )
         data_root = self.reference.data_root.resolve()
         for artifact in files:
+            resolved = self._resolved_data_root_path(artifact, data_root)
+            if resolved is not None:
+                batch_dirs.add(resolved.parent)
             self._delete_data_root_artifact(artifact, data_root)
         for auth_path in used_auth_files:
+            resolved = self._resolved_data_root_path(auth_path, data_root)
+            if resolved is not None:
+                parent = resolved.parent
+                batch_dirs.add(parent.parent if parent.name == "cpa_auths" else parent)
             self._delete_data_root_artifact(auth_path, data_root)
         self._prune_imported_mail_credentials(imported_emails, data_root)
+        for batch_dir in batch_dirs:
+            self._delete_data_root_tree(batch_dir / "sub2api_exports", data_root)
         return accounts
 
     @staticmethod
-    def _delete_data_root_artifact(path: Path | str, data_root: Path) -> None:
-        target = Path(path)
+    def _resolved_data_root_path(path: Path | str, data_root: Path) -> Optional[Path]:
         try:
-            resolved = target.expanduser().resolve()
+            resolved = Path(path).expanduser().resolve()
             resolved.relative_to(data_root)
+            return resolved
         except (OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _delete_data_root_artifact(path: Path | str, data_root: Path) -> None:
+        resolved = GrokManager._resolved_data_root_path(path, data_root)
+        if resolved is None:
             return
         try:
             resolved.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _delete_data_root_tree(path: Path | str, data_root: Path) -> None:
+        resolved = GrokManager._resolved_data_root_path(path, data_root)
+        if resolved is None or not resolved.exists():
+            return
+        try:
+            if resolved.is_dir():
+                shutil.rmtree(resolved)
+            else:
+                resolved.unlink(missing_ok=True)
         except OSError:
             pass
 
@@ -217,6 +247,23 @@ class GrokManager:
             cancelled=cancelled,
         )
 
+    def _commit_relogin_sso(self, result: LoginResult) -> None:
+        sso_token = str(result.sso_token or "").strip()
+        if not result.account_id or not sso_token:
+            raise RuntimeError("Grok2API 更新失败: 登录结果没有新的 SSO token")
+        account = self.store.get(result.account_id)
+        if account is None:
+            raise RuntimeError("Grok2API 更新失败: 管理库没有对应账号")
+        self.store.apply_login_credentials(
+            result.account_id,
+            account.access_token,
+            account.refresh_token,
+            account.token_expires_at,
+            account.auth_file,
+            detail=result.detail or "SSO 与 CPA 凭据已刷新",
+            sso_token=sso_token,
+        )
+
     def _sync_relogin_credentials(self, result: LoginResult, log=None) -> None:
         try:
             try:
@@ -228,9 +275,9 @@ class GrokManager:
             if hotload_path is not None and log:
                 log("[%s] CPA hotload 已更新: %s" % (result.email, hotload_path))
 
-            account = self.store.get(result.account_id)
-            if account is None or not account.sso_token:
-                message = "Grok2API 更新失败: 管理库没有新的 SSO token"
+            sso_token = str(result.sso_token or "").strip()
+            if not sso_token:
+                message = "Grok2API 更新失败: 登录结果没有新的 SSO token"
                 if log:
                     log("[%s] %s" % (result.email, message))
                 raise RuntimeError(message)
@@ -239,7 +286,7 @@ class GrokManager:
                 grok_log = lambda message: log("[%s] %s" % (result.email, message))
             try:
                 self.reference.sync_grok2api(
-                    account.sso_token,
+                    sso_token,
                     email=result.email,
                     log_callback=grok_log,
                     previous_token=result.previous_sso_token,
@@ -248,6 +295,7 @@ class GrokManager:
                 if log:
                     log("[%s] Grok2API 更新失败: %s" % (result.email, exc))
                 raise
+            self._commit_relogin_sso(result)
         finally:
             self.login._remove_transient_auth_file(result.auth_file)
 

@@ -161,6 +161,8 @@ class BatchLoginService:
                 refresh_token = str(auth.get("refresh_token") or "")
                 if not access_token or not refresh_token:
                     raise ValueError("凭据文件缺少 access_token/refresh_token")
+                # Keep the previous SSO in the store until remote/local pool
+                # sync succeeds, so a failed replace can still be retried.
                 self.store.apply_login_credentials(
                     account_id,
                     access_token,
@@ -168,13 +170,14 @@ class BatchLoginService:
                     str(auth.get("expired") or ""),
                     "",
                     detail="SSO 与 CPA 凭据已刷新" if sso_token else "CPA 凭据已刷新",
-                    sso_token=sso_token,
+                    sso_token="",
                 )
             except (OSError, json.JSONDecodeError, ValueError, AttributeError) as exc:
                 ok = False
                 detail = "登录成功但凭据回写失败: %s" % exc
                 self._remove_transient_auth_file(auth_file)
                 auth_file = ""
+                sso_token = ""
             if ok and not sso_token:
                 ok = False
                 detail = "CPA 凭据已刷新，但浏览器未返回新的 SSO cookie"
@@ -183,8 +186,10 @@ class BatchLoginService:
         elif auth_file:
             self._remove_transient_auth_file(auth_file)
             auth_file = ""
+            sso_token = ""
         if not ok and account_id:
             self.store.set_status([account_id], AccountStatus.ERROR.value, detail)
+            sso_token = ""
         return LoginResult(
             account_id,
             email,
@@ -192,4 +197,5 @@ class BatchLoginService:
             detail,
             auth_file,
             previous_sso_token=previous_sso_token,
+            sso_token=sso_token if ok else "",
         )

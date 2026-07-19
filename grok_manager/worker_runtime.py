@@ -160,9 +160,80 @@ class BatchWorkerProcess:
         except OSError as exc:
             log(start_failed_message % exc)
         finally:
-            if process is not None and process.stdout is not None:
-                process.stdout.close()
+            self._reap_process(process)
+        return results, parsed_ids, completed
+
+    def _reap_process(self, process: Optional[subprocess.Popen]) -> None:
+        if process is None:
             with self._lock:
                 if self._process is process:
                     self._process = None
-        return results, parsed_ids, completed
+            return
+        try:
+            stdin = getattr(process, "stdin", None)
+            if stdin is not None:
+                try:
+                    stdin.close()
+                except OSError:
+                    pass
+                try:
+                    process.stdin = None
+                except (AttributeError, TypeError):
+                    pass
+            still_running = True
+            try:
+                still_running = process.poll() is None
+            except Exception:
+                still_running = False
+            if still_running:
+                if os.name != "nt":
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except (OSError, ProcessLookupError):
+                        try:
+                            process.terminate()
+                        except OSError:
+                            pass
+                else:
+                    try:
+                        process.terminate()
+                    except OSError:
+                        pass
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    if os.name != "nt":
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except (OSError, ProcessLookupError):
+                            try:
+                                process.kill()
+                            except OSError:
+                                pass
+                    else:
+                        try:
+                            process.kill()
+                        except OSError:
+                            pass
+                    try:
+                        process.wait(timeout=2)
+                    except (subprocess.TimeoutExpired, OSError):
+                        pass
+                except TypeError:
+                    # Tests may stub wait() without a timeout argument.
+                    try:
+                        process.wait()
+                    except OSError:
+                        pass
+                except OSError:
+                    pass
+            stdout = getattr(process, "stdout", None)
+            if stdout is not None:
+                try:
+                    stdout.close()
+                except OSError:
+                    pass
+        finally:
+            with self._lock:
+                if self._process is process:
+                    self._process = None

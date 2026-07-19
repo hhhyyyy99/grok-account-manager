@@ -543,13 +543,6 @@ class ReferenceProject:
     def find_mail_credential(self, email: str, source: str = "") -> str:
         vault = self.credential_vault
         normalized_email = str(email or "").strip().lower()
-        if vault is not None and vault.is_unlocked:
-            try:
-                stored = vault.get_secret("mail-credential:%s" % normalized_email)
-            except Exception:
-                stored = ""
-            if stored:
-                return stored
         checked = set()
         source_path = Path(str(source or "")).expanduser()
         if source_path.is_file():
@@ -568,6 +561,13 @@ class ReferenceProject:
                 if vault is not None and vault.is_unlocked:
                     vault.put_secret("mail-credential:%s" % normalized_email, credential)
                 return credential
+        if vault is not None and vault.is_unlocked:
+            try:
+                stored = vault.get_secret("mail-credential:%s" % normalized_email)
+            except Exception:
+                stored = ""
+            if stored:
+                return stored
         return ""
 
     def persist_account_password(self, email: str, password: str, source: str = "") -> Path:

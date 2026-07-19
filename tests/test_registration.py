@@ -396,6 +396,96 @@ class RegistrationImportTests(unittest.TestCase):
                 manager.reference.find_mail_credential("first@example.com"),
             )
 
+    def test_reimport_prefers_new_mail_credential_over_vault(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = make_manager(root)
+            output = manager.reference.output_dir / "batch-old"
+            output.mkdir(parents=True)
+            accounts_file = output / "accounts.txt"
+            accounts_file.write_text(
+                "first@example.com----password----sso-one\n",
+                encoding="utf-8",
+            )
+            (output / "mail_credentials.txt").write_text(
+                "first@example.com\told-mail\n",
+                encoding="utf-8",
+            )
+            manager.import_reference_accounts([accounts_file])
+            self.assertEqual(
+                "old-mail",
+                manager.reference.find_mail_credential("first@example.com"),
+            )
+
+            newer = manager.reference.output_dir / "batch-new"
+            newer.mkdir(parents=True)
+            newer_accounts = newer / "accounts.txt"
+            newer_accounts.write_text(
+                "first@example.com----password----sso-two\n",
+                encoding="utf-8",
+            )
+            (newer / "mail_credentials.txt").write_text(
+                "first@example.com\tnew-mail\n",
+                encoding="utf-8",
+            )
+            manager.import_reference_accounts([newer_accounts])
+
+            self.assertEqual(
+                "new-mail",
+                manager.reference.find_mail_credential("first@example.com"),
+            )
+            self.assertFalse((newer / "mail_credentials.txt").exists())
+
+    def test_import_cleans_batch_sub2api_exports(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = make_manager(root)
+            batch = manager.reference.output_dir / "batch-1"
+            cpa_dir = batch / "cpa_auths"
+            export_dir = batch / "sub2api_exports"
+            cpa_dir.mkdir(parents=True)
+            export_dir.mkdir(parents=True)
+            accounts_file = batch / "accounts.txt"
+            accounts_file.write_text(
+                "first@example.com----password----sso-one\n",
+                encoding="utf-8",
+            )
+            auth_file = cpa_dir / "xai-first@example.com.json"
+            auth_file.write_text(
+                json.dumps(
+                    {
+                        "email": "first@example.com",
+                        "access_token": "access",
+                        "refresh_token": "refresh",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            export_file = export_dir / "sub2api-xai-first@example.com.json"
+            export_file.write_text(
+                json.dumps(
+                    {
+                        "accounts": [
+                            {
+                                "credentials": {
+                                    "access_token": "access",
+                                    "refresh_token": "refresh",
+                                }
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            imported = manager.import_reference_accounts(
+                [accounts_file], extra_auth_dirs=[cpa_dir]
+            )
+
+            self.assertEqual(["first@example.com"], [item.email for item in imported])
+            self.assertFalse(auth_file.exists())
+            self.assertFalse(export_dir.exists())
+
 
 class Grok2ApiRemoteSyncTests(unittest.TestCase):
     @staticmethod
@@ -619,6 +709,67 @@ class Grok2ApiRemoteSyncTests(unittest.TestCase):
                 )
 
         self.assertEqual(["local", "remote"], events)
+
+    def test_relogin_raises_when_remote_enabled_without_base_or_app_key(self) -> None:
+        from grok_register.app import add_token_to_grok2api_remote_pool
+
+        with self.assertRaisesRegex(RuntimeError, "未配置 base/app_key"):
+            add_token_to_grok2api_remote_pool(
+                "fresh-sso",
+                email="same@example.com",
+                settings={
+                    "grok2api_remote_base": "",
+                    "grok2api_remote_app_key": "",
+                    "grok2api_pool_name": "ssoBasic",
+                },
+                replace_email=True,
+            )
+
+    def test_registration_local_pool_failure_does_not_raise(self) -> None:
+        from grok_register.app import add_token_to_grok2api_pools
+
+        settings = {
+            **self._settings(),
+            "grok2api_auto_add_remote": False,
+            "grok2api_auto_add_local": True,
+        }
+
+        with patch(
+            "grok_register.app.add_token_to_grok2api_local_pool",
+            side_effect=OSError("disk full"),
+        ), patch(
+            "grok_register.app.add_token_to_grok2api_remote_pool"
+        ) as remote:
+            add_token_to_grok2api_pools(
+                "fresh-sso",
+                email="new@example.com",
+                settings=settings,
+                replace_email=False,
+            )
+
+        remote.assert_not_called()
+
+    def test_relogin_propagates_false_remote_replace_result(self) -> None:
+        from grok_register.app import add_token_to_grok2api_pools
+
+        settings = {
+            **self._settings(),
+            "grok2api_auto_add_remote": True,
+            "grok2api_auto_add_local": False,
+        }
+
+        with patch(
+            "grok_register.app.add_token_to_grok2api_remote_pool",
+            return_value=False,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "远端替换未完成"):
+                add_token_to_grok2api_pools(
+                    "fresh-sso",
+                    email="same@example.com",
+                    settings=settings,
+                    replace_email=True,
+                    previous_token="old-sso",
+                )
 
 
 if __name__ == "__main__":
