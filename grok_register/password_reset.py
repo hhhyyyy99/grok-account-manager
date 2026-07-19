@@ -113,19 +113,67 @@ def _fill_code(page: Any, code: str, log: LogFn) -> bool:
     )
 
 
-def _has_reset_success(url: str, text: str, password_submitted: bool) -> bool:
+def _has_reset_success(
+    url: str,
+    text: str,
+    password_submitted: bool,
+    *,
+    password_form_present: bool | None = None,
+) -> bool:
     low = (text or "").lower()
+    url_low = (url or "").lower()
     success_words = (
         "password reset",
         "password updated",
+        "password has been reset",
+        "password has been updated",
+        "password has been changed",
+        "password changed",
+        "your password was updated",
+        "your password was reset",
+        "you can now sign in",
+        "you can now log in",
+        "reset successfully",
+        "updated successfully",
         "密码已重置",
         "密码已更新",
+        "密码已修改",
+        "密码修改成功",
         "重置成功",
-        "reset successfully",
+        "现在可以登录",
+        "可以登录了",
+        "已成功重置",
     )
     if any(word in low for word in success_words):
         return True
-    return password_submitted and "sign-in" in (url or "").lower() and "new-password" not in low
+    if not password_submitted:
+        return False
+    # After a real submit, leaving the reset-password form is enough signal.
+    if "reset-password" not in url_low and "new-password" not in low:
+        if any(
+            marker in url_low
+            for marker in ("sign-in", "login", "account", "device", "oauth")
+        ):
+            return True
+        if any(
+            marker in low
+            for marker in (
+                "sign in",
+                "log in",
+                "login",
+                "登录",
+                "使用邮箱登录",
+                "continue with email",
+            )
+        ):
+            return True
+    if password_form_present is False and "reset-password" not in url_low:
+        return True
+    return (
+        "sign-in" in url_low
+        and "new-password" not in low
+        and "reset-password" not in url_low
+    )
 
 
 def _is_new_password_page(url: str, text: str) -> bool:
@@ -141,6 +189,19 @@ def _is_new_password_page(url: str, text: str) -> bool:
     return path_matches and any(marker in low for marker in form_markers) and any(
         marker in low for marker in action_markers
     )
+
+
+def _password_form_present(page: Any) -> bool:
+    try:
+        elements = list(page.eles(PASSWORD_SELECTOR) or [])
+    except Exception:
+        elements = []
+    if elements:
+        return True
+    try:
+        return bool(page.ele(PASSWORD_SELECTOR, timeout=0.2))
+    except Exception:
+        return False
 
 
 def _is_unauthorized(exc: BaseException) -> bool:
@@ -267,15 +328,22 @@ def reset_password(
         )
         page.get(SIGN_IN_URL)
         log("已打开 xAI 登录页")
+        last_wait_log = 0.0
         while time.time() < deadline:
             if cancel and cancel():
                 raise PasswordResetError("密码重置已取消")
             url = _page_url(page)
             text = _log_text(page)
             low = text.lower()
+            form_present = _password_form_present(page)
             if "too many" in low or "请求过于频繁" in text:
                 raise PasswordResetError("xAI 拒绝了过于频繁的重置请求")
-            if _has_reset_success(url, text, password_submitted):
+            if _has_reset_success(
+                url,
+                text,
+                password_submitted,
+                password_form_present=form_present,
+            ):
                 log("Grok 密码重置完成")
                 return {"ok": True, "password": new_password}
             if any(label in text for label in ("全部允许", "Accept All Cookies")):
@@ -338,15 +406,49 @@ def reset_password(
             except Exception:
                 pass
 
+            if password_submitted:
+                # After submit, keep waiting for navigation/confirmation instead of
+                # silently idling. Retry submit once if the form never leaves.
+                now = time.time()
+                if now - last_wait_log >= 5.0:
+                    snip = browser_confirm._norm(text)[:140]
+                    log(
+                        "等待 Grok 密码重置结果: url=%s form=%s visible=%s"
+                        % ((url or "")[:120], form_present, snip or "(empty)")
+                    )
+                    last_wait_log = now
+                if form_present and _is_new_password_page(url, text):
+                    if page.ele("@name=cf-turnstile-response", timeout=0.2):
+                        browser_confirm._wait_turnstile(page, log, 20)
+                    if browser_confirm._click_exact(
+                        page, SUBMIT_LABELS, log, real=True
+                    ):
+                        log("新密码页仍在，已重试提交")
+                        try:
+                            page.run_js(
+                                """
+const f = document.querySelector('form');
+if (!f) return false;
+const btn = [...f.querySelectorAll('button')].find((item) => {
+  const text = (item.innerText || item.textContent || '').trim();
+  return ['重置密码','Reset password','Update password','更新密码','Continue','继续','Done','完成'].includes(text);
+});
+if (btn) { btn.click(); return true; }
+f.submit();
+return true;
+                                """
+                            )
+                        except Exception:
+                            pass
+                time.sleep(0.8)
+                continue
+
             if (
                 reset_requested
                 and code_submitted
                 and password_elements
                 and _is_new_password_page(url, text)
             ):
-                if password_submitted:
-                    time.sleep(0.6)
-                    continue
                 for element in password_elements[:2]:
                     try:
                         element.clear(by_js=True)
@@ -360,9 +462,29 @@ def reset_password(
                 if not browser_confirm._click_exact(
                     page, SUBMIT_LABELS, log, real=True
                 ):
-                    raise PasswordResetError("新密码提交按钮不可用")
+                    # Some xAI builds only respond to native form submit.
+                    try:
+                        submitted = page.run_js(
+                            """
+const f = document.querySelector('form');
+if (!f) return false;
+const btn = [...f.querySelectorAll('button')].find((item) => {
+  const text = (item.innerText || item.textContent || '').trim();
+  return ['重置密码','Reset password','Update password','更新密码','Continue','继续','Done','完成'].includes(text);
+});
+if (btn) { btn.click(); return true; }
+f.submit();
+return true;
+                            """
+                        )
+                    except Exception:
+                        submitted = False
+                    if not submitted:
+                        raise PasswordResetError("新密码提交按钮不可用")
+                    log("clicked password submit via form fallback")
                 password_submitted = True
-                log("已提交 Grok 新密码")
+                last_wait_log = 0.0
+                log("已提交 Grok 新密码，等待结果页")
                 time.sleep(1.2)
                 continue
 
@@ -398,6 +520,10 @@ def reset_password(
                     continue
 
             time.sleep(0.6)
+        if password_submitted:
+            raise PasswordResetError(
+                "新密码已提交，但在规定时间内未确认重置成功"
+            )
         raise PasswordResetError("密码重置页面在规定时间内未完成")
     except PasswordResetError:
         raise

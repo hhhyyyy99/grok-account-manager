@@ -394,8 +394,45 @@ class PasswordResetTests(unittest.TestCase):
         self.assertRegex(password, r"[!@#$%^&*]")
 
     def test_reset_success_detection_accepts_xai_confirmation(self) -> None:
-        self.assertTrue(_has_reset_success("https://accounts.x.ai/sign-in", "Password updated", True))
-        self.assertFalse(_has_reset_success("https://accounts.x.ai/sign-in", "Sign in", False))
+        self.assertTrue(
+            _has_reset_success(
+                "https://accounts.x.ai/sign-in", "Password updated", True
+            )
+        )
+        self.assertTrue(
+            _has_reset_success(
+                "https://accounts.x.ai/sign-in",
+                "You can now sign in with your new password",
+                True,
+            )
+        )
+        self.assertTrue(
+            _has_reset_success(
+                "https://accounts.x.ai/sign-in?email=true",
+                "使用邮箱登录",
+                True,
+                password_form_present=False,
+            )
+        )
+        self.assertTrue(
+            _has_reset_success(
+                "https://accounts.x.ai/account",
+                "",
+                True,
+                password_form_present=False,
+            )
+        )
+        self.assertFalse(
+            _has_reset_success("https://accounts.x.ai/sign-in", "Sign in", False)
+        )
+        self.assertFalse(
+            _has_reset_success(
+                "https://accounts.x.ai/reset-password",
+                "设置新密码 确认密码 重置密码",
+                True,
+                password_form_present=True,
+            )
+        )
 
 
 if __name__ == "__main__":
