@@ -247,10 +247,55 @@ class GrokManager:
             cancelled=cancelled,
         )
 
+    @staticmethod
+    def _pending_sso_secret_name(email: str) -> str:
+        return "pending-sso-replace:%s" % str(email or "").strip().lower()
+
+    def _remember_pending_sso_replace(self, email: str, previous_token: str) -> None:
+        previous = str(previous_token or "").strip()
+        normalized_email = str(email or "").strip().lower()
+        if not previous or not normalized_email or self.vault is None or not self.vault.is_unlocked:
+            return
+        secret = self._pending_sso_secret_name(normalized_email)
+        # Keep the first unresolved remote token so later retries still match it.
+        try:
+            existing = self.vault.get_secret(secret)
+        except Exception:
+            existing = ""
+        if existing:
+            return
+        self.vault.put_secret(secret, previous)
+
+    def _resolve_pending_sso_replace(self, email: str, fallback: str = "") -> str:
+        normalized_email = str(email or "").strip().lower()
+        if normalized_email and self.vault is not None and self.vault.is_unlocked:
+            try:
+                stored = self.vault.get_secret(self._pending_sso_secret_name(normalized_email))
+            except Exception:
+                stored = ""
+            if stored:
+                return stored
+        return str(fallback or "").strip()
+
+    def _clear_pending_sso_replace(self, email: str) -> None:
+        normalized_email = str(email or "").strip().lower()
+        if not normalized_email or self.vault is None or not self.vault.is_unlocked:
+            return
+        try:
+            self.vault.delete_secret(self._pending_sso_secret_name(normalized_email))
+        except Exception:
+            pass
+
     def _sync_relogin_credentials(self, result: LoginResult, log=None) -> str:
         """Best-effort external sync after credentials are already persisted."""
         notes: List[str] = []
         try:
+            previous_for_remote = self._resolve_pending_sso_replace(
+                result.email, result.previous_sso_token
+            )
+            if result.previous_sso_token:
+                self._remember_pending_sso_replace(result.email, result.previous_sso_token)
+
             try:
                 hotload_path = self.reference.sync_cpa_hotload(result.auth_file)
             except Exception as exc:
@@ -264,7 +309,6 @@ class GrokManager:
 
             sso_token = str(result.sso_token or "").strip()
             if not sso_token:
-                # Prefer the SSO already written by the login handler.
                 account = self.store.get(result.account_id) if result.account_id else None
                 sso_token = str(account.sso_token if account else "").strip()
             if not sso_token:
@@ -282,13 +326,15 @@ class GrokManager:
                     sso_token,
                     email=result.email,
                     log_callback=grok_log,
-                    previous_token=result.previous_sso_token,
+                    previous_token=previous_for_remote,
                 )
             except Exception as exc:
                 message = "Grok2API 未同步: %s" % exc
                 notes.append(message)
                 if log:
                     log("[%s] %s" % (result.email, message))
+            else:
+                self._clear_pending_sso_replace(result.email)
             return "；".join(notes)
         finally:
             self.login._remove_transient_auth_file(result.auth_file)
@@ -297,29 +343,9 @@ class GrokManager:
     def _is_wrong_password_login(result: LoginResult) -> bool:
         if result.ok:
             return False
-        detail = str(result.detail or "")
-        low = detail.casefold()
-        markers = (
-            "邮箱或密码错误",
-            "邮箱地址或密码错误",
-            "电子邮箱或密码不正确",
-            "邮箱或密码不正确",
-            "密码不正确",
-            "密码错误",
-            "wrong email address or password",
-            "incorrect email or password",
-            "invalid email or password",
-            "email or password is incorrect",
-            "the password you entered is incorrect",
-            "incorrect password",
-            "invalid credentials",
-        )
-        if any(marker in low or marker in detail for marker in markers):
-            return True
-        return (
-            ("password" in low or "密码" in detail)
-            and any(word in low for word in ("incorrect", "invalid", "wrong", "错误", "不正确"))
-        )
+        # Only the canonical browser signal may trigger auto password reset.
+        detail = str(result.detail or "").strip()
+        return detail == "邮箱或密码错误" or detail.endswith("邮箱或密码错误")
 
     def _auto_reset_login_failures(self, results: List[LoginResult], log=None, progress=None) -> List[LoginResult]:
         candidates = [

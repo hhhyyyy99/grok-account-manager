@@ -197,6 +197,24 @@ class CredentialVault:
             if not raw:
                 return ""
             return self.decrypt_text(raw, "vault-secret:%s" % key)
+
+    def delete_secret(self, name: str) -> bool:
+        key = str(name or "").strip()
+        if not key:
+            return False
+        with self._lock:
+            document = self._load_metadata()
+            secrets = document.get("secrets") or {}
+            if not isinstance(secrets, dict) or key not in secrets:
+                return False
+            secrets.pop(key, None)
+            document["secrets"] = secrets
+            write_private_text_atomic(
+                self.path,
+                json.dumps(document, ensure_ascii=True, indent=2) + "\n",
+            )
+            return True
+
     @staticmethod
     def is_encrypted(value: str) -> bool:
         return str(value or "").startswith(ENVELOPE_PREFIX)

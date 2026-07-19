@@ -263,7 +263,7 @@ class BatchLoginCredentialTests(unittest.TestCase):
                 ):
                     browser_confirm._raise_for_login_error(sample)
 
-    def test_password_page_retries_surface_wrong_password_error(self) -> None:
+    def test_password_page_stuck_does_not_invent_wrong_password_error(self) -> None:
         class FakeElement:
             def clear(self):
                 return None
@@ -295,6 +295,7 @@ class BatchLoginCredentialTests(unittest.TestCase):
 
             def run_js(self, script):
                 if "innerText" in str(script):
+                    # Stuck password page without an explicit credential error.
                     return "Sign in"
                 return ""
 
@@ -306,7 +307,10 @@ class BatchLoginCredentialTests(unittest.TestCase):
         ), patch.object(browser_confirm, "_sleep", return_value=None), patch.object(
             browser_confirm, "_page_url", return_value="https://accounts.x.ai/sign-in"
         ), patch.object(browser_confirm, "_click_email_login_chooser", return_value=False):
-            with self.assertRaisesRegex(browser_confirm.BrowserConfirmError, "邮箱或密码错误"):
+            with self.assertRaisesRegex(
+                browser_confirm.BrowserConfirmError,
+                r"未检测到明确的邮箱或密码错误|浏览器登录未完成",
+            ):
                 browser_confirm.approve_device_code(
                     page,
                     verification_uri_complete="https://accounts.x.ai/oauth2/device?user_code=ABCD",
@@ -318,6 +322,57 @@ class BatchLoginCredentialTests(unittest.TestCase):
                 )
 
         self.assertTrue(any("login attempt" in line for line in logs))
+
+    def test_password_page_surfaces_explicit_wrong_password_error(self) -> None:
+        class FakeElement:
+            def clear(self):
+                return None
+
+            def input(self, _value):
+                return None
+
+            def click(self, by_js=False):
+                return None
+
+        class FakePage:
+            def ele(self, selector, timeout=0):
+                text = str(selector)
+                if "user_code" in text or "continue-with-email" in text:
+                    return None
+                if "type='email'" in text or "type=\"email\"" in text:
+                    return FakeElement()
+                if "password" in text:
+                    return FakeElement()
+                if "submit" in text or "sign-in-submit" in text:
+                    return FakeElement()
+                return None
+
+            def eles(self, _selector):
+                return []
+
+            def get(self, _url, timeout=None):
+                return None
+
+            def run_js(self, script):
+                if "innerText" in str(script):
+                    return "Wrong email address or password."
+                return ""
+
+        with patch.object(browser_confirm, "_wait_turnstile", return_value=True), patch.object(
+            browser_confirm, "_click_exact", return_value=True
+        ), patch.object(browser_confirm, "_sleep", return_value=None), patch.object(
+            browser_confirm, "_page_url", return_value="https://accounts.x.ai/sign-in"
+        ), patch.object(browser_confirm, "_click_email_login_chooser", return_value=False):
+            with self.assertRaisesRegex(browser_confirm.BrowserConfirmError, r"^邮箱或密码错误$"):
+                browser_confirm.approve_device_code(
+                    FakePage(),
+                    verification_uri_complete="https://accounts.x.ai/oauth2/device?user_code=ABCD",
+                    email="target@example.com",
+                    password="wrong-password",
+                    user_code="ABCD",
+                    timeout_sec=30,
+                    log=lambda _message: None,
+                )
 
     def test_oauth_poll_retries_transient_network_error(self) -> None:
         response = {
@@ -918,37 +973,75 @@ class BatchLoginCredentialTests(unittest.TestCase):
             self.assertIn("自动重置密码后", results[0].detail)
             self.assertTrue(any("邮箱或密码错误" in line for line in logs))
 
-    def test_batch_login_auto_resets_variant_password_error_messages(self) -> None:
+    def test_batch_login_ignores_non_canonical_password_error_messages(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = make_manager(Path(directory))
             account = manager.store.upsert(
                 AccountDraft(email="variant@example.com", password="old-password")
             )
+            # Only the canonical browser signal may trigger auto-reset.
             first = LoginResult(
                 account.id,
                 account.email,
                 False,
                 "The email or password you entered is incorrect.",
             )
-            retried = LoginResult(account.id, account.email, True, "批量登录成功")
-            reset = PasswordResetResult(account.id, account.email, True, "密码已重置")
-            calls = []
-
-            def fake_login(_ids, _settings, log=None, progress=None):
-                calls.append(list(_ids))
-                return [first] if len(calls) == 1 else [retried]
-
             logs = []
-            with patch.object(manager.login, "login_accounts", side_effect=fake_login):
-                with patch.object(manager, "reset_passwords", return_value=[reset]) as reset_passwords:
-                    with patch.object(manager, "_sync_relogin_credentials"):
-                        with patch.object(manager, "inspect_accounts", return_value=[]):
-                            results = manager.batch_login([account.id], log=logs.append)
+            with patch.object(manager.login, "login_accounts", return_value=[first]):
+                with patch.object(manager, "reset_passwords") as reset_passwords:
+                    with patch.object(manager, "inspect_accounts", return_value=[]):
+                        results = manager.batch_login([account.id], log=logs.append)
 
-            self.assertEqual(2, len(calls))
-            reset_passwords.assert_called_once_with([account.id], log=logs.append)
-            self.assertTrue(results[0].ok)
-            self.assertTrue(any("自动重置密码" in line for line in logs))
+            reset_passwords.assert_not_called()
+            self.assertFalse(results[0].ok)
+            self.assertEqual(first.detail, results[0].detail)
+            self.assertFalse(any("自动重置密码" in line for line in logs))
+
+    def test_pending_sso_replace_is_remembered_across_sync_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            account = manager.store.upsert(
+                AccountDraft(
+                    email="pending@example.com",
+                    password="password",
+                    sso_token="fresh-sso",
+                    access_token="access",
+                    refresh_token="refresh",
+                )
+            )
+            first = LoginResult(
+                account.id,
+                account.email,
+                True,
+                "登录成功",
+                previous_sso_token="old-sso",
+                sso_token="fresh-sso",
+            )
+            second = LoginResult(
+                account.id,
+                account.email,
+                True,
+                "登录成功",
+                previous_sso_token="fresh-sso",
+                sso_token="newer-sso",
+            )
+            seen = []
+
+            def fail_sync(sso_token, email="", log_callback=None, previous_token=""):
+                seen.append(previous_token)
+                raise RuntimeError("remote unavailable")
+
+            with patch.object(manager.reference, "sync_grok2api", side_effect=fail_sync):
+                note1 = manager._sync_relogin_credentials(first)
+                note2 = manager._sync_relogin_credentials(second)
+
+            self.assertIn("Grok2API 未同步", note1)
+            self.assertIn("Grok2API 未同步", note2)
+            self.assertEqual(["old-sso", "old-sso"], seen)
+            self.assertEqual(
+                "old-sso",
+                manager.vault.get_secret("pending-sso-replace:pending@example.com"),
+            )
 
 if __name__ == "__main__":
     unittest.main()

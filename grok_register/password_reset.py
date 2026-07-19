@@ -122,6 +122,41 @@ def _has_reset_success(
 ) -> bool:
     low = (text or "").lower()
     url_low = (url or "").lower()
+    if not password_submitted:
+        return False
+    error_words = (
+        "too many",
+        "rate limit",
+        "请求过于频繁",
+        "invalid",
+        "incorrect",
+        "expired",
+        "failed",
+        "error",
+        "unable",
+        "could not",
+        "session",
+        "unauthorized",
+        "forbidden",
+        "验证码",
+        "失败",
+        "无效",
+        "错误",
+        "过期",
+    )
+    if any(word in low for word in error_words) and not any(
+        word in low
+        for word in (
+            "password reset",
+            "password updated",
+            "password changed",
+            "密码已重置",
+            "密码已更新",
+            "密码已修改",
+            "重置成功",
+        )
+    ):
+        return False
     success_words = (
         "password reset",
         "password updated",
@@ -146,16 +181,14 @@ def _has_reset_success(
     )
     if any(word in low for word in success_words):
         return True
-    if not password_submitted:
-        return False
-    # After a real submit, leaving the reset-password form is enough signal.
-    if "reset-password" not in url_low and "new-password" not in low:
-        if any(
-            marker in url_low
-            for marker in ("sign-in", "login", "account", "device", "oauth")
-        ):
-            return True
-        if any(
+    # Leaving the form alone is not enough: require a sign-in landing without
+    # residual reset-password content.
+    if (
+        password_form_present is False
+        and "reset-password" not in url_low
+        and "new-password" not in low
+        and any(marker in url_low for marker in ("sign-in", "login"))
+        and any(
             marker in low
             for marker in (
                 "sign in",
@@ -164,16 +197,13 @@ def _has_reset_success(
                 "登录",
                 "使用邮箱登录",
                 "continue with email",
+                "email",
+                "password",
             )
-        ):
-            return True
-    if password_form_present is False and "reset-password" not in url_low:
+        )
+    ):
         return True
-    return (
-        "sign-in" in url_low
-        and "new-password" not in low
-        and "reset-password" not in url_low
-    )
+    return False
 
 
 def _is_new_password_page(url: str, text: str) -> bool:
@@ -320,6 +350,7 @@ def reset_password(
     reset_requested = False
     code_submitted = False
     password_submitted = False
+    password_resubmit_count = 0
     code = ""
     deadline = time.time() + max(60.0, float(timeout_seconds))
     try:
@@ -408,7 +439,7 @@ def reset_password(
 
             if password_submitted:
                 # After submit, keep waiting for navigation/confirmation instead of
-                # silently idling. Retry submit once if the form never leaves.
+                # silently idling. Retry submit at most once if the form never leaves.
                 now = time.time()
                 if now - last_wait_log >= 5.0:
                     snip = browser_confirm._norm(text)[:140]
@@ -417,13 +448,18 @@ def reset_password(
                         % ((url or "")[:120], form_present, snip or "(empty)")
                     )
                     last_wait_log = now
-                if form_present and _is_new_password_page(url, text):
+                if (
+                    form_present
+                    and _is_new_password_page(url, text)
+                    and password_resubmit_count < 1
+                ):
+                    password_resubmit_count += 1
                     if page.ele("@name=cf-turnstile-response", timeout=0.2):
                         browser_confirm._wait_turnstile(page, log, 20)
                     if browser_confirm._click_exact(
                         page, SUBMIT_LABELS, log, real=True
                     ):
-                        log("新密码页仍在，已重试提交")
+                        log("新密码页仍在，已重试提交一次")
                         try:
                             page.run_js(
                                 """

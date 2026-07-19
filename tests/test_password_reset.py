@@ -409,15 +409,24 @@ class PasswordResetTests(unittest.TestCase):
         self.assertTrue(
             _has_reset_success(
                 "https://accounts.x.ai/sign-in?email=true",
-                "使用邮箱登录",
+                "使用邮箱登录 Email Password",
                 True,
                 password_form_present=False,
             )
         )
-        self.assertTrue(
+        # Leaving the form without success copy is not enough.
+        self.assertFalse(
             _has_reset_success(
                 "https://accounts.x.ai/account",
                 "",
+                True,
+                password_form_present=False,
+            )
+        )
+        self.assertFalse(
+            _has_reset_success(
+                "https://accounts.x.ai/sign-in",
+                "Too many requests",
                 True,
                 password_form_present=False,
             )

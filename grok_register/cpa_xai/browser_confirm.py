@@ -969,10 +969,11 @@ def approve_device_code(
         if page.ele(PASSWORD_SELECTOR, timeout=0.3):
             phase = "password"
             if login_attempts >= 5:
-                # Do not idle until the outer timeout: repeated password-page
-                # failures must surface as a credential error so auto-reset can run.
+                # Only auto-reset when the page explicitly reports bad credentials.
                 _raise_for_login_error(_visible_text(page))
-                raise BrowserConfirmError("邮箱或密码错误")
+                raise BrowserConfirmError(
+                    "密码页多次提交仍未通过（未检测到明确的邮箱或密码错误）"
+                )
             login_attempts += 1
             log(f"login attempt {login_attempts}")
             if not _prepare_password_login(page, email, password, log):
@@ -990,7 +991,6 @@ def approve_device_code(
                 except Exception as e:
                     log(f"login submit fail: {e}")
             # wait navigation / credential error
-            stayed_on_password = False
             for _ in range(30):
                 if stop_event is not None and stop_event.is_set():
                     return
@@ -998,17 +998,9 @@ def approve_device_code(
                 current_text = _visible_text(page)
                 _raise_for_login_error(current_text)
                 if not page.ele(PASSWORD_SELECTOR, timeout=0.2):
-                    stayed_on_password = False
                     break
                 if "sign-in" not in _page_url(page):
-                    stayed_on_password = False
                     break
-                stayed_on_password = True
-            if stayed_on_password and login_attempts >= 2:
-                # Error toast may be short-lived; after two failed submits on the
-                # same password page, treat it as bad credentials.
-                _raise_for_login_error(_visible_text(page))
-                raise BrowserConfirmError("邮箱或密码错误")
             continue
 
         _sleep(1.0)
@@ -1017,9 +1009,8 @@ def approve_device_code(
         log("browser finished via stop_event")
         return
     log(f"browser loop ended phase={phase} login_attempts={login_attempts}")
-    if phase == "password" and login_attempts > 0:
-        _raise_for_login_error(_visible_text(page))
-        raise BrowserConfirmError("邮箱或密码错误")
+    # Never invent a wrong-password error for timeouts/stuck pages.
+    _raise_for_login_error(_visible_text(page))
     raise BrowserConfirmError(
         "浏览器登录未完成: phase=%s login_attempts=%s" % (phase, login_attempts)
     )
