@@ -156,6 +156,7 @@ button:active:not(:disabled), .button:active:not(:disabled) { transform: transla
 .topbar-meta { display: flex; align-items: center; gap: 13px; }
 .sync-state {
   display: inline-flex;
+  min-width: 7.5em;
   align-items: center;
   gap: 7px;
   color: var(--muted);
@@ -166,11 +167,15 @@ button:active:not(:disabled), .button:active:not(:disabled) { transform: transla
 .sync-state i {
   width: 6px;
   height: 6px;
+  flex: 0 0 6px;
   border-radius: 50%;
   background: #66a574;
   box-shadow: 0 0 0 3px #e2efe3;
 }
 .sync-state.refreshing i { background: var(--warning); box-shadow: 0 0 0 3px var(--warning-soft); animation: state-pulse 900ms ease-in-out infinite; }
+.react-main, .react-view, .account-panel, .react-table-wrap {
+  overflow-anchor: none;
+}
 .task-trigger {
   display: inline-flex;
   min-height: 36px;

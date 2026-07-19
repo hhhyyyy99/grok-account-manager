@@ -122,6 +122,17 @@ function jsonValidationError(value: string): string {
   }
 }
 
+function restoreWindowScroll(scrollY: number) {
+  // Polling re-renders can nudge the document scroll; pin it back after paint.
+  const apply = () => {
+    if (Math.abs(window.scrollY - scrollY) > 0.5) {
+      window.scrollTo(0, scrollY);
+    }
+  };
+  apply();
+  requestAnimationFrame(apply);
+}
+
 function useManagerState(search: string, status: string, page: number, pageSize: number) {
   const [state, setState] = useState<StatePayload>({
     accounts: [],
@@ -133,16 +144,22 @@ function useManagerState(search: string, status: string, page: number, pageSize:
   const [loaded, setLoaded] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const requestSequence = useRef(0);
+  const hasRunningTasks = useRef(false);
+  const refreshRef = useRef<(options?: { silent?: boolean }) => Promise<void>>(async () => undefined);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (options?: { silent?: boolean }) => {
+    const silent = Boolean(options?.silent);
     const requestId = ++requestSequence.current;
-    setRefreshing(true);
+    const scrollY = window.scrollY;
+    if (!silent) setRefreshing(true);
     try {
       const next = await getState({ search, status, page, pageSize });
-      if (requestId === requestSequence.current) {
-        setState(next);
-        setError("");
-      }
+      if (requestId !== requestSequence.current) return;
+      hasRunningTasks.current = next.tasks.some(isRunning);
+      setState(next);
+      setError("");
+      // Keep the user's place while background polls replace list/task data.
+      restoreWindowScroll(scrollY);
     } catch (reason) {
       if (requestId === requestSequence.current) {
         setError(reason instanceof Error ? reason.message : String(reason));
@@ -150,22 +167,44 @@ function useManagerState(search: string, status: string, page: number, pageSize:
     } finally {
       if (requestId === requestSequence.current) {
         setLoaded(true);
-        setRefreshing(false);
+        if (!silent) setRefreshing(false);
       }
     }
   }, [search, status, page, pageSize]);
 
+  refreshRef.current = refresh;
+
   useEffect(() => {
-    void refresh();
+    void refresh({ silent: false });
   }, [refresh]);
 
   useEffect(() => {
-    const active = state.tasks.some(isRunning);
-    const timer = window.setInterval(() => void refresh(), active ? 1200 : 8000);
-    return () => window.clearInterval(timer);
-  }, [refresh, state.tasks]);
+    // Self-rescheduling timeout avoids recreating intervals whenever task list identity changes.
+    let timer = 0;
+    let stopped = false;
+    const schedule = () => {
+      const delay = hasRunningTasks.current ? 1200 : 8000;
+      timer = window.setTimeout(() => {
+        void (async () => {
+          await refreshRef.current({ silent: true });
+          if (!stopped) schedule();
+        })();
+      }, delay);
+    };
+    schedule();
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
+  }, [search, status, page, pageSize]);
 
-  return { state, error, loading: !loaded, refreshing, refresh };
+  return {
+    state,
+    error,
+    loading: !loaded,
+    refreshing,
+    refresh: useCallback(() => refresh({ silent: false }), [refresh]),
+  };
 }
 
 export function App() {
@@ -330,8 +369,8 @@ export function App() {
             ))}
           </nav>
           <div className="topbar-meta">
-            <span className={`sync-state ${manager.refreshing ? "refreshing" : ""}`}>
-              <i aria-hidden="true" />{manager.refreshing ? "同步中" : "本地已连接"}
+            <span className={`sync-state ${manager.refreshing ? "refreshing" : ""}`} title={manager.refreshing ? "同步中" : "本地已连接"}>
+              <i aria-hidden="true" />本地已连接
             </span>
             <button className="task-trigger" type="button" onClick={openTasks} aria-label="打开任务中心">
               <span aria-hidden="true">≡</span><span>任务</span>
