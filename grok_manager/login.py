@@ -161,16 +161,19 @@ class BatchLoginService:
                 refresh_token = str(auth.get("refresh_token") or "")
                 if not access_token or not refresh_token:
                     raise ValueError("凭据文件缺少 access_token/refresh_token")
-                # Keep the previous SSO in the store until remote/local pool
-                # sync succeeds, so a failed replace can still be retried.
+                # Persist managed credentials immediately on login success. External
+                # pool sync (CPA hotload / Grok2API) is best-effort and must not
+                # delay or reverse this write.
+                if not sso_token:
+                    raise ValueError("浏览器未返回新的 SSO cookie")
                 self.store.apply_login_credentials(
                     account_id,
                     access_token,
                     refresh_token,
                     str(auth.get("expired") or ""),
                     "",
-                    detail="SSO 与 CPA 凭据已刷新" if sso_token else "CPA 凭据已刷新",
-                    sso_token="",
+                    detail="SSO 与 CPA 凭据已刷新",
+                    sso_token=sso_token,
                 )
             except (OSError, json.JSONDecodeError, ValueError, AttributeError) as exc:
                 ok = False
@@ -178,11 +181,6 @@ class BatchLoginService:
                 self._remove_transient_auth_file(auth_file)
                 auth_file = ""
                 sso_token = ""
-            if ok and not sso_token:
-                ok = False
-                detail = "CPA 凭据已刷新，但浏览器未返回新的 SSO cookie"
-                self._remove_transient_auth_file(auth_file)
-                auth_file = ""
         elif auth_file:
             self._remove_transient_auth_file(auth_file)
             auth_file = ""

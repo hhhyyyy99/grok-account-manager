@@ -247,25 +247,8 @@ class GrokManager:
             cancelled=cancelled,
         )
 
-    def _commit_relogin_sso(self, result: LoginResult) -> None:
-        sso_token = str(result.sso_token or "").strip()
-        if not result.account_id or not sso_token:
-            raise RuntimeError("Grok2API 更新失败: 登录结果没有新的 SSO token")
-        account = self.store.get(result.account_id)
-        if account is None:
-            raise RuntimeError("Grok2API 更新失败: 管理库没有对应账号")
-        self.store.apply_login_credentials(
-            result.account_id,
-            account.access_token,
-            account.refresh_token,
-            account.token_expires_at,
-            account.auth_file,
-            detail=result.detail or "SSO 与 CPA 凭据已刷新",
-            sso_token=sso_token,
-        )
-
     def _sync_relogin_credentials(self, result: LoginResult, log=None) -> str:
-        """Sync hotload/Grok2API after login. Returns a non-fatal note, if any."""
+        """Best-effort external sync after credentials are already persisted."""
         notes: List[str] = []
         try:
             try:
@@ -281,29 +264,31 @@ class GrokManager:
 
             sso_token = str(result.sso_token or "").strip()
             if not sso_token:
-                message = "Grok2API 未同步: 登录结果没有新的 SSO token"
+                # Prefer the SSO already written by the login handler.
+                account = self.store.get(result.account_id) if result.account_id else None
+                sso_token = str(account.sso_token if account else "").strip()
+            if not sso_token:
+                message = "Grok2API 未同步: 没有可用的 SSO token"
                 notes.append(message)
                 if log:
                     log("[%s] %s" % (result.email, message))
-            else:
-                grok_log = None
+                return "；".join(notes)
+
+            grok_log = None
+            if log:
+                grok_log = lambda message: log("[%s] %s" % (result.email, message))
+            try:
+                self.reference.sync_grok2api(
+                    sso_token,
+                    email=result.email,
+                    log_callback=grok_log,
+                    previous_token=result.previous_sso_token,
+                )
+            except Exception as exc:
+                message = "Grok2API 未同步: %s" % exc
+                notes.append(message)
                 if log:
-                    grok_log = lambda message: log("[%s] %s" % (result.email, message))
-                try:
-                    self.reference.sync_grok2api(
-                        sso_token,
-                        email=result.email,
-                        log_callback=grok_log,
-                        previous_token=result.previous_sso_token,
-                    )
-                except Exception as exc:
-                    message = "Grok2API 未同步: %s" % exc
-                    notes.append(message)
-                    if log:
-                        log("[%s] %s" % (result.email, message))
-                # Commit the fresh SSO even when remote/local pool sync fails so
-                # the managed account still holds the successful login result.
-                self._commit_relogin_sso(result)
+                    log("[%s] %s" % (result.email, message))
             return "；".join(notes)
         finally:
             self.login._remove_transient_auth_file(result.auth_file)

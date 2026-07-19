@@ -552,7 +552,7 @@ class BatchLoginCredentialTests(unittest.TestCase):
                 AccountDraft(
                     email="first@example.com",
                     password="password",
-                    sso_token="old-sso",
+                    sso_token="fresh-sso",
                     access_token="access",
                     refresh_token="refresh",
                 )
@@ -567,8 +567,9 @@ class BatchLoginCredentialTests(unittest.TestCase):
             )
 
             with patch.object(manager.reference, "sync_grok2api") as sync:
-                manager._sync_relogin_credentials(result)
+                note = manager._sync_relogin_credentials(result)
 
+            self.assertEqual("", note)
             sync.assert_called_once_with(
                 "fresh-sso",
                 email="first@example.com",
@@ -577,6 +578,43 @@ class BatchLoginCredentialTests(unittest.TestCase):
             )
             stored = manager.store.get(account.id)
             self.assertEqual("fresh-sso", stored.sso_token if stored else "")
+
+    def test_login_persists_credentials_before_external_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = make_manager(root)
+            install_fake_login_modules(manager.reference.root, "target@example.com")
+            account = manager.store.upsert(
+                AccountDraft(
+                    email="target@example.com",
+                    password="password",
+                    sso_token="old-sso",
+                )
+            )
+            observed = []
+
+            def observe_sync(sso_token, email="", log_callback=None, previous_token=""):
+                stored = manager.store.get(account.id)
+                observed.append(
+                    (
+                        sso_token,
+                        previous_token,
+                        stored.sso_token if stored else "",
+                        stored.access_token if stored else "",
+                    )
+                )
+
+            with patch.object(manager.reference, "sync_grok2api", side_effect=observe_sync):
+                result = manager.batch_login([account.id])[0]
+            stored = manager.store.get(account.id)
+
+            self.assertTrue(result.ok)
+            self.assertEqual(
+                [("fresh-sso", "old-sso", "fresh-sso", "fresh-access")],
+                observed,
+            )
+            self.assertEqual("fresh-sso", stored.sso_token if stored else "")
+            self.assertEqual("fresh-access", stored.access_token if stored else "")
 
     def test_login_deletes_managed_auth_file_after_successful_sync(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
