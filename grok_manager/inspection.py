@@ -265,14 +265,11 @@ class TokenInspector:
 
     def _probe_cpa(self, account: Account, expires_at: str) -> CredentialCheck:
         base_url = DEFAULT_BASE_URL
-        if account.auth_file:
-            try:
-                payload = json.loads(Path(account.auth_file).read_text(encoding="utf-8-sig"))
-                configured = str(payload.get("base_url") or "").strip()
-                if configured:
-                    base_url = configured.rstrip("/")
-            except (OSError, json.JSONDecodeError, AttributeError):
-                pass
+        auth_payload = self._load_account_auth_payload(account)
+        if auth_payload is not None:
+            configured = str(auth_payload.get("base_url") or "").strip()
+            if configured:
+                base_url = configured.rstrip("/")
         hostname = str(urlparse(base_url).hostname or "").lower()
         if hostname in ("127.0.0.1", "localhost", "::1"):
             return self._inspect_local_cpa_hotload(account, expires_at)
@@ -319,6 +316,42 @@ class TokenInspector:
                 0,
             )
 
+    def _load_account_auth_payload(self, account: Account) -> Optional[dict]:
+        candidates: List[Path] = []
+        if account.auth_file:
+            candidates.append(Path(account.auth_file))
+        hotload = self._resolve_local_hotload_file(account)
+        if hotload is not None:
+            candidates.append(hotload)
+        seen: set[str] = set()
+        for path in candidates:
+            key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8-sig"))
+            except (OSError, json.JSONDecodeError, AttributeError):
+                continue
+            if isinstance(payload, dict):
+                return payload
+        return None
+
+    def _resolve_local_hotload_file(self, account: Account) -> Optional[Path]:
+        if self.cpa_hotload_dir is None:
+            return None
+        from grok_register.cpa_xai.schema import credential_file_name
+
+        if account.auth_file:
+            name = Path(account.auth_file).name
+            if name:
+                candidate = self.cpa_hotload_dir / name
+                if candidate.is_file() or not account.email:
+                    return candidate
+        if account.email:
+            return self.cpa_hotload_dir / credential_file_name(account.email)
+        return None
+
     def _inspect_local_cpa_hotload(
         self,
         account: Account,
@@ -331,14 +364,13 @@ class TokenInspector:
                 expires_at,
             )
 
-        filename = Path(account.auth_file).name
-        if not filename:
+        hotload_file = self._resolve_local_hotload_file(account)
+        if hotload_file is None:
             return CredentialCheck(
                 AccountStatus.INVALID.value,
                 "账号没有可用于 CPA hotload 的 auth 文件",
                 expires_at,
             )
-        hotload_file = self.cpa_hotload_dir / filename
         if not hotload_file.is_file():
             return CredentialCheck(
                 AccountStatus.INVALID.value,

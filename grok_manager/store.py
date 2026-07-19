@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     sso_detail TEXT NOT NULL DEFAULT '',
     cpa_status TEXT NOT NULL DEFAULT 'unknown',
     cpa_detail TEXT NOT NULL DEFAULT '',
+    cpa_updated_at TEXT NOT NULL DEFAULT '',
     last_checked_at TEXT NOT NULL DEFAULT '',
     last_login_at TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
@@ -48,6 +49,7 @@ MIGRATION_COLUMNS = {
     "sso_detail": "TEXT NOT NULL DEFAULT ''",
     "cpa_status": "TEXT NOT NULL DEFAULT 'unknown'",
     "cpa_detail": "TEXT NOT NULL DEFAULT ''",
+    "cpa_updated_at": "TEXT NOT NULL DEFAULT ''",
     "source_modified_at": "TEXT NOT NULL DEFAULT ''",
 }
 
@@ -499,6 +501,9 @@ class AccountStore:
         account = self.get(account_id)
         if account is None:
             raise ValueError("登录凭据对应的账号不存在")
+        # Login deliberately stores the provided auth_file (often empty after the
+        # transient managed file is deleted). CPA renewals use apply_cpa_credentials
+        # which preserves an existing pointer when the new value is blank.
         with self._connect() as conn:
             conn.execute(
                 """
@@ -507,6 +512,7 @@ class AccountStore:
                     sso_token = CASE WHEN ? != '' THEN ? ELSE sso_token END,
                     auth_file = ?, status = ?, status_detail = ?,
                     sso_status = ?, sso_detail = ?, cpa_status = ?, cpa_detail = ?,
+                    cpa_updated_at = ?,
                     last_login_at = ?, updated_at = ?
                 WHERE id = ?
                 """,
@@ -525,6 +531,7 @@ class AccountStore:
                     "登录后待巡检",
                     now,
                     now,
+                    now,
                     int(account_id),
                 ),
             )
@@ -537,8 +544,15 @@ class AccountStore:
         expires_at: str,
         auth_file: str = "",
         detail: str = "CPA 凭据已续期",
+        *,
+        preserve_status: bool = False,
     ) -> None:
-        """Update CPA tokens only; leave SSO fields untouched."""
+        """Update CPA tokens only; leave SSO fields untouched.
+
+        auth_file is a metadata pointer (often the hotload path). Empty input keeps
+        the existing pointer so temporary managed files can be deleted without
+        wiping inspection metadata.
+        """
         now = utc_now_iso()
         account = self.get(account_id)
         if account is None:
@@ -548,14 +562,25 @@ class AccountStore:
         if not access_token or not refresh_token:
             raise ValueError("CPA 续期需要 access_token 与 refresh_token")
         auth_file = str(auth_file or "").strip()
+        if preserve_status:
+            status = account.status
+            status_detail = detail[:1000] if detail else account.status_detail
+            cpa_status = account.cpa_status
+            cpa_detail = detail[:1000] if detail else account.cpa_detail
+        else:
+            status = AccountStatus.UNKNOWN.value
+            status_detail = detail[:1000]
+            cpa_status = AccountStatus.UNKNOWN.value
+            cpa_detail = "续期后待巡检"
         with self._connect() as conn:
             conn.execute(
                 """
                 UPDATE accounts
                 SET access_token = ?, refresh_token = ?, token_expires_at = ?,
-                    auth_file = ?,
+                    auth_file = CASE WHEN ? != '' THEN ? ELSE auth_file END,
                     status = ?, status_detail = ?,
                     cpa_status = ?, cpa_detail = ?,
+                    cpa_updated_at = ?,
                     updated_at = ?
                 WHERE id = ?
                 """,
@@ -564,11 +589,35 @@ class AccountStore:
                     self._encrypt_credential(account.email, "refresh_token", refresh_token),
                     expires_at.strip(),
                     self._encrypt_credential(account.email, "auth_file", auth_file),
-                    AccountStatus.UNKNOWN.value,
-                    detail[:1000],
-                    AccountStatus.UNKNOWN.value,
-                    "续期后待巡检",
+                    self._encrypt_credential(account.email, "auth_file", auth_file),
+                    status,
+                    status_detail,
+                    cpa_status,
+                    cpa_detail,
                     now,
+                    now,
+                    int(account_id),
+                ),
+            )
+
+    def touch_cpa_auth_file(self, account_id: int, auth_file: str) -> None:
+        """Update only the CPA auth_file metadata pointer."""
+        path = str(auth_file or "").strip()
+        if not path:
+            return
+        account = self.get(account_id)
+        if account is None:
+            raise ValueError("账号不存在")
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE accounts
+                SET auth_file = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    self._encrypt_credential(account.email, "auth_file", path),
+                    utc_now_iso(),
                     int(account_id),
                 ),
             )

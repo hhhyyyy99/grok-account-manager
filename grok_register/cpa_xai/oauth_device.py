@@ -6,6 +6,7 @@ Endpoints from https://auth.x.ai/.well-known/openid-configuration
 from __future__ import annotations
 
 import json
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -140,14 +141,43 @@ def _redact_oauth_value(value: Any) -> Any:
         return redacted
     if isinstance(value, list):
         return [_redact_oauth_value(item) for item in value]
-    if isinstance(value, str) and value.count(".") >= 2 and len(value) > 40:
-        # JWT-shaped strings occasionally appear outside known keys.
-        return "***"
+    if isinstance(value, str):
+        return _redact_oauth_text(value)
     return value
+
+
+def _redact_oauth_text(text: str) -> str:
+    """Redact secrets that leak into free-form OAuth error strings."""
+    value = str(text or "")
+    if not value:
+        return value
+    # Common shapes: refresh_token=..., "access_token":"...", Bearer eyJ...
+    patterns = (
+        r"(?i)\b(access_token|refresh_token|id_token|device_code|client_secret|password)\s*[:=]\s*([^\s,;]+)",
+        r'(?i)("(?:access_token|refresh_token|id_token|device_code|client_secret|password)"\s*:\s*")([^"]+)(")',
+        r"(?i)\b(bearer)\s+([A-Za-z0-9\-._~+/]+=*)",
+    )
+    redacted = value
+    redacted = re.sub(patterns[0], r"\1=***", redacted)
+    redacted = re.sub(patterns[1], r"\1***\3", redacted)
+    redacted = re.sub(patterns[2], r"\1 ***", redacted)
+    if redacted.count(".") >= 2 and len(redacted) > 40 and " " not in redacted.strip():
+        return "***"
+    # JWT-shaped substrings embedded in longer messages.
+    redacted = re.sub(
+        r"\beyJ[A-Za-z0-9_\-]+=*\.[A-Za-z0-9_\-]+=*\.[A-Za-z0-9_\-+=]*\b",
+        "***",
+        redacted,
+    )
+    return redacted
 
 
 def _format_oauth_body(body: Any) -> str:
     return repr(_redact_oauth_value(body))
+
+
+def _format_oauth_text(text: str) -> str:
+    return _redact_oauth_text(str(text or ""))
 
 
 def request_device_code(
@@ -252,7 +282,7 @@ def poll_device_token(
         desc = ""
         if isinstance(body, dict):
             err = str(body.get("error") or "")
-            desc = str(body.get("error_description") or "")
+            desc = _format_oauth_text(str(body.get("error_description") or ""))
         if err in ("authorization_pending", "slow_down"):
             if err == "slow_down":
                 sleep_for = min(sleep_for + 5, 30)
@@ -303,7 +333,7 @@ def refresh_access_token(
     desc = ""
     if isinstance(body, dict):
         err = str(body.get("error") or "")
-        desc = str(body.get("error_description") or "")
+        desc = _format_oauth_text(str(body.get("error_description") or ""))
     if err or status >= 400:
         # 5xx and transport-adjacent failures are transient; 4xx grant errors are not.
         retryable = status >= 500 or status == 429

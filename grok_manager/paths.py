@@ -98,6 +98,22 @@ def ensure_data_dirs() -> None:
             pass
 
 
+def remove_managed_auth_file(
+    auth_file: str | Path | None,
+    managed_auth_dir: Path | None = None,
+) -> None:
+    """Delete a transient plaintext xai-*.json under the managed auth directory."""
+    if not auth_file:
+        return
+    root = Path(managed_auth_dir or MANAGED_AUTH_DIR).expanduser().resolve()
+    try:
+        target = Path(auth_file).expanduser().resolve()
+        target.relative_to(root)
+        target.unlink(missing_ok=True)
+    except (OSError, ValueError):
+        pass
+
+
 def write_private_text_atomic(path: Path, content: str, encoding: str = "utf-8") -> Path:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -269,6 +285,7 @@ def _migrate_account_database(source: Path, destination: Path) -> tuple[bool, in
                 "sso_detail",
                 "cpa_status",
                 "cpa_detail",
+                "cpa_updated_at",
                 "last_checked_at",
                 "last_login_at",
                 "created_at",

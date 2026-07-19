@@ -306,6 +306,41 @@ class CpaGuardTests(unittest.TestCase):
         self.assertTrue(err.retryable)
         self.assertIsInstance(raised.exception, oauth_device.OAuthDeviceError)
 
+    def test_oauth_error_description_is_redacted_on_refresh_and_poll(self) -> None:
+        leak = "refresh_token=super-secret-refresh-value"
+
+        def fake_post_refresh(_url, _form, timeout=30.0, *, proxy=None):
+            return 400, {
+                "error": "invalid_grant",
+                "error_description": leak,
+            }
+
+        with patch.object(oauth_device, "_post_form", side_effect=fake_post_refresh):
+            with self.assertRaises(oauth_device.OAuthDeviceError) as raised:
+                oauth_device.refresh_access_token("any-refresh")
+        message = str(raised.exception)
+        self.assertNotIn("super-secret-refresh-value", message)
+        self.assertIn("invalid_grant", message)
+        self.assertIn("***", message)
+
+        def fake_post_poll(_url, _form, timeout=30.0, *, proxy=None):
+            return 400, {
+                "error": "access_denied",
+                "error_description": "id_token=eyJhbGciOiJIUzI1NiJ9.payload.signature",
+            }
+
+        with patch.object(oauth_device, "_post_form", side_effect=fake_post_poll):
+            with self.assertRaises(oauth_device.OAuthDeviceError) as poll_raised:
+                oauth_device.poll_device_token(
+                    "device",
+                    interval=1,
+                    expires_in=10,
+                    timeout=1,
+                )
+        poll_message = str(poll_raised.exception)
+        self.assertNotIn("eyJhbGciOiJIUzI1NiJ9", poll_message)
+        self.assertIn("access_denied", poll_message)
+
 
 if __name__ == "__main__":
     unittest.main()

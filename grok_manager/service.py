@@ -405,8 +405,13 @@ class GrokManager:
                 if log:
                     log("[%s] %s" % (result.email, message))
             else:
-                if hotload_path is not None and log:
-                    log("[%s] CPA hotload 已更新: %s" % (result.email, hotload_path))
+                if hotload_path is not None:
+                    try:
+                        self.store.touch_cpa_auth_file(result.account_id, str(hotload_path))
+                    except Exception:
+                        pass
+                    if log:
+                        log("[%s] CPA hotload 已更新: %s" % (result.email, hotload_path))
 
             if not sso_token:
                 message = "Grok2API 未同步: 没有可用的 SSO token"
@@ -715,14 +720,9 @@ class GrokManager:
         return any(marker in text for marker in permanent_markers)
 
     def _remove_managed_auth_file(self, auth_file: str | Path | None) -> None:
-        if not auth_file:
-            return
-        try:
-            target = Path(auth_file).expanduser().resolve()
-            target.relative_to(self.reference.managed_auth_dir.resolve())
-            target.unlink(missing_ok=True)
-        except (OSError, ValueError):
-            pass
+        from .paths import remove_managed_auth_file
+
+        remove_managed_auth_file(auth_file, self.reference.managed_auth_dir)
 
     def _silent_refresh_cpa_account(
         self,
@@ -764,24 +764,27 @@ class GrokManager:
                 self.reference.managed_auth_dir,
                 payload,
             )
-            self.store.apply_cpa_credentials(
-                account.id,
-                token.access_token,
-                token.refresh_token,
-                str(payload.get("expired") or ""),
-                "",
-                detail="CPA 凭据已续期",
-            )
             detail = "CPA 凭据已续期"
+            auth_meta = ""
             try:
                 hotload_path = self.reference.sync_cpa_hotload(auth_path)
             except Exception as exc:
                 note = "CPA hotload 未同步: %s" % exc
                 detail = "%s；%s" % (detail, note)
                 log("[%s] %s" % (account.email, note))
+                hotload_path = None
             else:
                 if hotload_path is not None:
+                    auth_meta = str(hotload_path)
                     log("[%s] CPA hotload 已更新: %s" % (account.email, hotload_path))
+            self.store.apply_cpa_credentials(
+                account.id,
+                token.access_token,
+                token.refresh_token,
+                str(payload.get("expired") or ""),
+                auth_meta,
+                detail="CPA 凭据已续期",
+            )
             log("[%s] CPA silent refresh 成功" % account.email)
             return CpaRefreshResult(
                 account.id,
@@ -825,6 +828,10 @@ class GrokManager:
         else:
             if hotload_path is not None:
                 log("[%s] CPA hotload 已更新: %s" % (result.email, hotload_path))
+                try:
+                    self.store.touch_cpa_auth_file(result.account_id, str(hotload_path))
+                except Exception:
+                    pass
             final = replace(result, auth_file="")
         self._remove_managed_auth_file(result.auth_file)
         return final
@@ -1087,12 +1094,17 @@ class GrokManager:
             access_token=access_token,
             refresh_token=refresh_token,
             expires_at=expires_at,
-            last_refresh=str(account.updated_at or ""),
+            last_refresh=str(account.cpa_updated_at or account.updated_at or ""),
         )
         try:
             hotload_path = self.reference.sync_cpa_hotload(auth_path)
         finally:
             self._remove_managed_auth_file(auth_path)
+        if hotload_path is not None:
+            try:
+                self.store.touch_cpa_auth_file(account.id, str(hotload_path))
+            except Exception:
+                pass
         return auth_path, hotload_path
 
     def sync_account_cpa_with_hotload(
@@ -1121,7 +1133,8 @@ class GrokManager:
             manager_access,
             manager_refresh,
             manager_expires,
-            freshness_at=str(account.updated_at or ""),
+            # Use CPA-specific timestamp only; generic updated_at also moves on inspect.
+            freshness_at=str(account.cpa_updated_at or ""),
         )
 
         if hotload is None:
@@ -1195,6 +1208,40 @@ class GrokManager:
             bool(hot_refresh) and hot_refresh == manager_refresh
         )
         if same_access and same_refresh:
+            # Tokens match, but expired/unknown accounts still need status recovery so
+            # guardian (active-only) can resume. Align metadata without rotating tokens.
+            needs_revive = account.cpa_status != AccountStatus.ACTIVE.value
+            expires_mismatch = bool(hot_expires) and hot_expires != manager_expires
+            auth_mismatch = str(account.auth_file or "").strip() != str(hot_path)
+            if needs_revive or expires_mismatch or auth_mismatch:
+                try:
+                    self.store.apply_cpa_credentials(
+                        account.id,
+                        hot_access,
+                        hot_refresh,
+                        hot_expires or manager_expires,
+                        str(hot_path),
+                        detail="hotload 与管理库 CPA 一致，待复核",
+                    )
+                except Exception as exc:
+                    return CpaHotloadSyncResult(
+                        account.id,
+                        account.email,
+                        False,
+                        "同步一致凭据元数据失败: %s" % exc,
+                        action="error",
+                        auth_file=str(hot_path),
+                    )
+                detail = "管理库与 hotload CPA 一致，已对齐元数据并待复核"
+                log("[%s] %s" % (account.email, detail))
+                return CpaHotloadSyncResult(
+                    account.id,
+                    account.email,
+                    True,
+                    detail,
+                    action="pull" if needs_revive else "noop",
+                    auth_file=str(hot_path),
+                )
             return CpaHotloadSyncResult(
                 account.id,
                 account.email,
@@ -1226,7 +1273,7 @@ class GrokManager:
                     hot_access,
                     hot_refresh,
                     hot_expires,
-                    "",
+                    str(hot_path),
                     detail="已从 CPA hotload 回灌更新凭据",
                 )
             except Exception as exc:

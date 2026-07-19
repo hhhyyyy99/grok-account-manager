@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional
 
 
 def utc_now_iso() -> str:
@@ -75,10 +75,18 @@ class Account:
     last_login_at: str
     created_at: str
     updated_at: str
+    cpa_updated_at: str = ""
 
     @classmethod
     def from_row(cls, row: Mapping[str, Any]) -> "Account":
-        return cls(**{field: row[field] for field in cls.__dataclass_fields__})
+        values: Dict[str, Any] = {}
+        keys = set(row.keys()) if hasattr(row, "keys") else set()
+        for field in cls.__dataclass_fields__:
+            if field in keys:
+                values[field] = row[field]
+            else:
+                values[field] = 0 if field == "id" else ""
+        return cls(**values)
 
     @property
     def status_label(self) -> str:

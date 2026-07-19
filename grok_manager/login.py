@@ -218,14 +218,9 @@ class BatchLoginService:
         }
 
     def _remove_transient_auth_file(self, auth_file: str) -> None:
-        if not auth_file:
-            return
-        try:
-            target = Path(auth_file).expanduser().resolve()
-            target.relative_to(self.project.managed_auth_dir.resolve())
-            target.unlink(missing_ok=True)
-        except (OSError, ValueError):
-            pass
+        from .paths import remove_managed_auth_file
+
+        remove_managed_auth_file(auth_file, self.project.managed_auth_dir)
 
     def _handle_result(self, payload: str) -> LoginResult:
         try:

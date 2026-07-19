@@ -780,7 +780,7 @@ function taskFailures(task: Task): TaskFailure[] {
   return raw
     .map((item) => {
       if (!item || typeof item !== "object") return null;
-      const value = item as Record<string, unknown>;
+      const value = item as unknown as Record<string, unknown>;
       return {
         id: Number(value.id) || 0,
         email: String(value.email || ""),
