@@ -254,6 +254,8 @@ class BatchLoginCredentialTests(unittest.TestCase):
             "The email or password you entered is incorrect.",
             "Incorrect password",
             "邮箱地址或密码错误",
+            "错误的邮箱地址或密码",
+            "错误的邮箱或密码",
             "密码不正确",
         )
         for sample in samples:

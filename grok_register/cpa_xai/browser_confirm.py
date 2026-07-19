@@ -657,6 +657,8 @@ def _looks_like_wrong_password(visible_text: str) -> bool:
         "invalid credentials",
         "邮箱或密码错误",
         "邮箱地址或密码错误",
+        "错误的邮箱地址或密码",
+        "错误的邮箱或密码",
         "电子邮箱或密码不正确",
         "邮箱或密码不正确",
         "你输入的邮箱或密码不正确",
