@@ -142,6 +142,7 @@ class CpaRefreshResult:
     ok: bool
     detail: str
     auth_file: str = ""
+    retryable: bool = False
 
 
 @dataclass(frozen=True)

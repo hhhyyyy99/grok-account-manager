@@ -5,7 +5,7 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .config import ConfigStore, ManagerConfig
 from .inspection import InspectionService, TokenInspector, expiration_for
@@ -698,6 +698,32 @@ class GrokManager:
         )
         return any(marker in text for marker in markers)
 
+    @staticmethod
+    def _refresh_failure_is_permanent(detail: str, *, retryable: bool = False) -> bool:
+        """Only revoked/invalid grants permanently kill a refresh token."""
+        if retryable:
+            return False
+        text = str(detail or "").lower()
+        if "network error" in text or "timed out" in text or "timeout" in text:
+            return False
+        permanent_markers = (
+            "invalid_grant",
+            "revoked",
+            "invalid_token",
+            "缺少 refresh_token",
+        )
+        return any(marker in text for marker in permanent_markers)
+
+    def _remove_managed_auth_file(self, auth_file: str | Path | None) -> None:
+        if not auth_file:
+            return
+        try:
+            target = Path(auth_file).expanduser().resolve()
+            target.relative_to(self.reference.managed_auth_dir.resolve())
+            target.unlink(missing_ok=True)
+        except (OSError, ValueError):
+            pass
+
     def _silent_refresh_cpa_account(
         self,
         account: Account,
@@ -719,6 +745,7 @@ class GrokManager:
                 False,
                 "缺少 refresh_token",
             )
+        auth_path: Path | None = None
         try:
             token = refresh_access_token(
                 refresh_token,
@@ -742,7 +769,7 @@ class GrokManager:
                 token.access_token,
                 token.refresh_token,
                 str(payload.get("expired") or ""),
-                str(auth_path),
+                "",
                 detail="CPA 凭据已续期",
             )
             detail = "CPA 凭据已续期"
@@ -761,7 +788,6 @@ class GrokManager:
                 account.email,
                 True,
                 detail,
-                auth_file=str(auth_path),
             )
         except OAuthDeviceError as exc:
             return CpaRefreshResult(
@@ -769,6 +795,7 @@ class GrokManager:
                 account.email,
                 False,
                 "CPA 续期失败: %s" % exc,
+                retryable=bool(getattr(exc, "retryable", False)),
             )
         except Exception as exc:
             return CpaRefreshResult(
@@ -776,7 +803,11 @@ class GrokManager:
                 account.email,
                 False,
                 "CPA 续期异常: %s" % exc,
+                retryable=True,
             )
+        finally:
+            if auth_path is not None:
+                self._remove_managed_auth_file(auth_path)
 
     def _sync_cpa_hotload_for_result(
         self,
@@ -790,10 +821,13 @@ class GrokManager:
         except Exception as exc:
             note = "CPA hotload 未同步: %s" % exc
             log("[%s] %s" % (result.email, note))
-            return replace(result, detail="%s；%s" % (result.detail, note))
-        if hotload_path is not None:
-            log("[%s] CPA hotload 已更新: %s" % (result.email, hotload_path))
-        return result
+            final = replace(result, detail="%s；%s" % (result.detail, note), auth_file="")
+        else:
+            if hotload_path is not None:
+                log("[%s] CPA hotload 已更新: %s" % (result.email, hotload_path))
+            final = replace(result, auth_file="")
+        self._remove_managed_auth_file(result.auth_file)
+        return final
 
     def batch_refresh_cpa(
         self,
@@ -966,15 +1000,39 @@ class GrokManager:
         access_token: str,
         refresh_token: str = "",
         expires_at: str = "",
-    ) -> tuple[int, int, int]:
-        """Higher rank means newer/more usable CPA credentials."""
+        *,
+        freshness_at: str = "",
+    ) -> tuple[int, int, int, int]:
+        """Higher rank means newer/more usable CPA credentials.
+
+        Tie-break order: access expiry → presence of access → presence of refresh
+        → credential freshness (hotload last_refresh / file mtime / manager updated_at).
+        """
         from .inspection import jwt_expiration, parse_utc
 
         access = str(access_token or "").strip()
         refresh = str(refresh_token or "").strip()
         expires = parse_utc(expires_at) or jwt_expiration(access)
         exp_ts = int(expires.timestamp()) if expires is not None else 0
-        return (exp_ts, 1 if access else 0, 1 if refresh else 0)
+        freshness = parse_utc(freshness_at)
+        freshness_ts = int(freshness.timestamp()) if freshness is not None else 0
+        return (exp_ts, 1 if access else 0, 1 if refresh else 0, freshness_ts)
+
+    @staticmethod
+    def _path_mtime_iso(path: Path | None) -> str:
+        if path is None:
+            return ""
+        try:
+            if not path.is_file():
+                return ""
+            return (
+                datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+        except OSError:
+            return ""
 
     def _write_manager_cpa_file(
         self,
@@ -984,6 +1042,7 @@ class GrokManager:
         refresh_token: str,
         expires_at: str = "",
         base_url: str = "",
+        last_refresh: str = "",
         payload_extra: Optional[Dict[str, Any]] = None,
     ) -> Path:
         from grok_register.cpa_xai.schema import DEFAULT_BASE_URL, build_cpa_xai_auth
@@ -1006,12 +1065,35 @@ class GrokManager:
             id_token=id_token,
             sub=sub,
             expired=expires_at or None,
+            last_refresh=last_refresh or None,
             base_url=resolved_base,
             extra=extra if extra else None,
         )
         if expires_at and not payload.get("expired"):
             payload["expired"] = expires_at
         return write_cpa_xai_auth(self.reference.managed_auth_dir, payload)
+
+    def _push_manager_cpa_to_hotload(
+        self,
+        account: Account,
+        *,
+        access_token: str,
+        refresh_token: str,
+        expires_at: str,
+    ) -> tuple[Path, Optional[Path]]:
+        """Write a transient managed auth file, copy it to hotload, then delete it."""
+        auth_path = self._write_manager_cpa_file(
+            email=account.email,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            expires_at=expires_at,
+            last_refresh=str(account.updated_at or ""),
+        )
+        try:
+            hotload_path = self.reference.sync_cpa_hotload(auth_path)
+        finally:
+            self._remove_managed_auth_file(auth_path)
+        return auth_path, hotload_path
 
     def sync_account_cpa_with_hotload(
         self,
@@ -1036,7 +1118,10 @@ class GrokManager:
         manager_refresh = str(account.refresh_token or "").strip()
         manager_expires = str(account.token_expires_at or "").strip()
         manager_rank = self._cpa_token_rank(
-            manager_access, manager_refresh, manager_expires
+            manager_access,
+            manager_refresh,
+            manager_expires,
+            freshness_at=str(account.updated_at or ""),
         )
 
         if hotload is None:
@@ -1057,20 +1142,11 @@ class GrokManager:
                     action="noop",
                 )
             try:
-                auth_path = self._write_manager_cpa_file(
-                    email=account.email,
+                _auth_path, hotload_path = self._push_manager_cpa_to_hotload(
+                    account,
                     access_token=manager_access,
                     refresh_token=manager_refresh,
                     expires_at=manager_expires,
-                )
-                hotload_path = self.reference.sync_cpa_hotload(auth_path)
-                self.store.apply_cpa_credentials(
-                    account.id,
-                    manager_access,
-                    manager_refresh,
-                    manager_expires,
-                    str(auth_path),
-                    detail="已推送 CPA 凭据到 hotload",
                 )
             except Exception as exc:
                 return CpaHotloadSyncResult(
@@ -1090,7 +1166,6 @@ class GrokManager:
                 True,
                 detail,
                 action="push",
-                auth_file=str(auth_path),
             )
 
         hot_path, payload = hotload
@@ -1104,7 +1179,16 @@ class GrokManager:
                 hot_expires, _, _ = expired_from_access_token(hot_access)
             except Exception:
                 hot_expires = ""
-        hot_rank = self._cpa_token_rank(hot_access, hot_refresh, hot_expires)
+        hot_freshness = (
+            str(payload.get("last_refresh") or "").strip()
+            or self._path_mtime_iso(hot_path)
+        )
+        hot_rank = self._cpa_token_rank(
+            hot_access,
+            hot_refresh,
+            hot_expires,
+            freshness_at=hot_freshness,
+        )
 
         same_access = bool(hot_access) and hot_access == manager_access
         same_refresh = (not hot_refresh and not manager_refresh) or (
@@ -1121,7 +1205,8 @@ class GrokManager:
             )
 
         # Newest wins. Prefer pull when hotload is strictly newer, or when manager
-        # lacks a usable access token but hotload has one.
+        # lacks a usable access token but hotload has one. Equal expiry falls back to
+        # last_refresh / file mtime / updated_at so rotated tokens are not overwritten.
         should_pull = hot_rank > manager_rank or (
             not manager_access and bool(hot_access and hot_refresh)
         )
@@ -1136,33 +1221,12 @@ class GrokManager:
                     auth_file=str(hot_path),
                 )
             try:
-                auth_path = self._write_manager_cpa_file(
-                    email=account.email,
-                    access_token=hot_access,
-                    refresh_token=hot_refresh,
-                    expires_at=hot_expires,
-                    base_url=str(payload.get("base_url") or ""),
-                    payload_extra={
-                        key: value
-                        for key, value in payload.items()
-                        if key
-                        not in {
-                            "access_token",
-                            "refresh_token",
-                            "email",
-                            "expired",
-                            "expires_in",
-                            "last_refresh",
-                            "base_url",
-                        }
-                    },
-                )
                 self.store.apply_cpa_credentials(
                     account.id,
                     hot_access,
                     hot_refresh,
                     hot_expires,
-                    str(auth_path),
+                    "",
                     detail="已从 CPA hotload 回灌更新凭据",
                 )
             except Exception as exc:
@@ -1182,7 +1246,7 @@ class GrokManager:
                 True,
                 detail,
                 action="pull",
-                auth_file=str(auth_path),
+                auth_file=str(hot_path),
             )
 
         if not push_when_manager_newer:
@@ -1201,21 +1265,22 @@ class GrokManager:
                 "管理库 CPA 不完整，无法推送到 hotload",
                 action="error",
             )
+        # Equal rank with different tokens: refuse to overwrite either side.
+        if hot_rank == manager_rank:
+            return CpaHotloadSyncResult(
+                account.id,
+                account.email,
+                True,
+                "管理库与 hotload 到期时间相同且无法判定新旧，保留双方凭据",
+                action="noop",
+                auth_file=str(hot_path),
+            )
         try:
-            auth_path = self._write_manager_cpa_file(
-                email=account.email,
+            _auth_path, hotload_path = self._push_manager_cpa_to_hotload(
+                account,
                 access_token=manager_access,
                 refresh_token=manager_refresh,
                 expires_at=manager_expires,
-            )
-            hotload_path = self.reference.sync_cpa_hotload(auth_path)
-            self.store.apply_cpa_credentials(
-                account.id,
-                manager_access,
-                manager_refresh,
-                manager_expires,
-                str(auth_path),
-                detail="已将更新的 CPA 凭据推送到 hotload",
             )
         except Exception as exc:
             return CpaHotloadSyncResult(
@@ -1235,7 +1300,6 @@ class GrokManager:
             True,
             detail,
             action="push",
-            auth_file=str(auth_path),
         )
 
     def sync_cpa_hotload_accounts(
@@ -1341,7 +1405,8 @@ class GrokManager:
 
         - Only accounts with cpa_status=active are considered.
         - access_token within lead window (or already past / unparseable) → refresh_token.
-        - refresh failure / missing refresh → mark CPA expired.
+        - Permanent grant failures (invalid_grant/revoked) → mark CPA expired.
+        - Transient network/5xx failures keep the account active for the next round.
         """
         from grok_register.cpa_xai.schema import DEFAULT_BASE_URL
 
@@ -1439,8 +1504,13 @@ class GrokManager:
                     progress(silent, index, total)
                 continue
 
-            detail = "CPA 凭据已过期: %s" % silent.detail
-            self.store.mark_cpa_expired(fresh.id, detail)
+            if self._refresh_failure_is_permanent(
+                silent.detail, retryable=bool(getattr(silent, "retryable", False))
+            ):
+                detail = "CPA 凭据已过期: %s" % silent.detail
+                self.store.mark_cpa_expired(fresh.id, detail)
+            else:
+                detail = "CPA 续期暂时失败，将在下一轮重试: %s" % silent.detail
             result = CpaRefreshResult(fresh.id, fresh.email, False, detail)
             results.append(result)
             log("[%s] %s" % (fresh.email, detail))

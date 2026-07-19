@@ -146,11 +146,30 @@ function useManagerState(search: string, status: string, page: number, pageSize:
   const requestSequence = useRef(0);
   const hasRunningTasks = useRef(false);
   const refreshRef = useRef<(options?: { silent?: boolean }) => Promise<void>>(async () => undefined);
+  const scrollPinnedY = useRef<number | null>(null);
+  const userScrolledDuringSilent = useRef(false);
+
+  useEffect(() => {
+    const onScroll = () => {
+      // If the user moves away from the pinned position while a silent poll is in
+      // flight, do not yank them back when the response lands.
+      if (scrollPinnedY.current == null) return;
+      if (Math.abs(window.scrollY - scrollPinnedY.current) > 1) {
+        userScrolledDuringSilent.current = true;
+      }
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
 
   const refresh = useCallback(async (options?: { silent?: boolean }) => {
     const silent = Boolean(options?.silent);
     const requestId = ++requestSequence.current;
     const scrollY = window.scrollY;
+    if (silent) {
+      scrollPinnedY.current = scrollY;
+      userScrolledDuringSilent.current = false;
+    }
     if (!silent) setRefreshing(true);
     try {
       const next = await getState({ search, status, page, pageSize });
@@ -158,13 +177,18 @@ function useManagerState(search: string, status: string, page: number, pageSize:
       hasRunningTasks.current = next.tasks.some(isRunning);
       setState(next);
       setError("");
-      // Keep the user's place while background polls replace list/task data.
-      restoreWindowScroll(scrollY);
+      // Only restore scroll for silent polls that the user did not interrupt.
+      if (silent && !userScrolledDuringSilent.current) {
+        restoreWindowScroll(scrollY);
+      }
     } catch (reason) {
       if (requestId === requestSequence.current) {
         setError(reason instanceof Error ? reason.message : String(reason));
       }
     } finally {
+      if (silent && requestId === requestSequence.current) {
+        scrollPinnedY.current = null;
+      }
       if (requestId === requestSequence.current) {
         setLoaded(true);
         if (!silent) setRefreshing(false);

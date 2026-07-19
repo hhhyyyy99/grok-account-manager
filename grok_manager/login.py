@@ -325,7 +325,7 @@ class BatchLoginService:
                     access_token,
                     refresh_token,
                     str(auth.get("expired") or ""),
-                    auth_file,
+                    "",
                     detail="通过 SSO 重新签发 CPA 凭据",
                 )
                 detail = "通过 SSO 重新签发 CPA 凭据"
@@ -344,5 +344,6 @@ class BatchLoginService:
             email,
             ok,
             detail,
+            # Caller syncs hotload then deletes this temporary managed auth file.
             auth_file=auth_file if ok else "",
         )

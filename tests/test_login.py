@@ -492,12 +492,13 @@ class BatchLoginCredentialTests(unittest.TestCase):
             self.assertEqual("keep-sso", stored.sso_token if stored else "")
             self.assertEqual("fresh-access", stored.access_token if stored else "")
             self.assertEqual("fresh-refresh", stored.refresh_token if stored else "")
-            self.assertEqual(1, len(auth_files))
-            payload = json.loads(auth_files[0].read_text(encoding="utf-8"))
-            self.assertEqual("fresh-access", payload["access_token"])
-            self.assertEqual("fresh-refresh", payload["refresh_token"])
+            # Managed auth files are transient and must be cleaned after vault write.
+            self.assertEqual([], auth_files)
             hotload_files = list(hotload_dir.glob("xai-*.json"))
             self.assertEqual(1, len(hotload_files))
+            payload = json.loads(hotload_files[0].read_text(encoding="utf-8"))
+            self.assertEqual("fresh-access", payload["access_token"])
+            self.assertEqual("fresh-refresh", payload["refresh_token"])
 
     def test_batch_refresh_cpa_requires_refresh_token(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

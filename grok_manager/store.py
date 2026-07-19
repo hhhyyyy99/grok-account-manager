@@ -547,12 +547,13 @@ class AccountStore:
         refresh_token = str(refresh_token or "").strip()
         if not access_token or not refresh_token:
             raise ValueError("CPA 续期需要 access_token 与 refresh_token")
+        auth_file = str(auth_file or "").strip()
         with self._connect() as conn:
             conn.execute(
                 """
                 UPDATE accounts
                 SET access_token = ?, refresh_token = ?, token_expires_at = ?,
-                    auth_file = CASE WHEN ? != '' THEN ? ELSE auth_file END,
+                    auth_file = ?,
                     status = ?, status_detail = ?,
                     cpa_status = ?, cpa_detail = ?,
                     updated_at = ?
@@ -562,7 +563,6 @@ class AccountStore:
                     self._encrypt_credential(account.email, "access_token", access_token),
                     self._encrypt_credential(account.email, "refresh_token", refresh_token),
                     expires_at.strip(),
-                    self._encrypt_credential(account.email, "auth_file", auth_file),
                     self._encrypt_credential(account.email, "auth_file", auth_file),
                     AccountStatus.UNKNOWN.value,
                     detail[:1000],
