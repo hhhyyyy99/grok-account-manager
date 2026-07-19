@@ -84,6 +84,7 @@ function taskKindLabel(kind: string): string {
     import: "导入",
     inspect: "巡检",
     login: "登录",
+    consent: "授权确认",
     "refresh-cpa": "CPA 续期",
     "reset-password": "重置密码",
     register: "注册",
@@ -581,6 +582,7 @@ function AccountsView(props: AccountsViewProps) {
             <button type="button" disabled={!selected.size || busy} onClick={() => requireSelection("/api/inspect", "巡检任务已创建")}><span aria-hidden="true">↻</span>巡检</button>
             <button type="button" disabled={!selected.size || busy} onClick={() => requireSelection("/api/refresh-cpa", "CPA 续期任务已创建")}><span aria-hidden="true">⟳</span>CPA 续期</button>
             <button type="button" disabled={!selected.size || busy} onClick={() => requireSelection("/api/login", "登录任务已创建")}><span aria-hidden="true">→</span>批量登录</button>
+            <button type="button" disabled={!selected.size || busy} onClick={() => requireSelection("/api/consent", "授权确认任务已创建")}><span aria-hidden="true">✓</span>授权确认</button>
             <button type="button" disabled={!selected.size || busy} onClick={() => requireSelection("/api/reset-password", "改密任务已创建")}><span aria-hidden="true">↺</span>重置密码</button>
             <span className="export-control">
               <select aria-label="导出格式" value={exportFormat} onChange={(event) => setExportFormat(event.target.value)}>
@@ -689,8 +691,9 @@ function AccountRow({ account, selected, onSelect, onAction }: {
       <td><span className={`react-status ${statusClass(account.ssoStatus)}`}>{account.ssoStatusLabel}</span><small>{account.hasSso ? "已配置" : "缺少 cookie"}</small></td>
       <td><span className={`react-status ${statusClass(account.cpaStatus)}`}>{account.cpaStatusLabel}</span><small>{account.hasAccessToken ? "access token" : "缺少 token"}</small></td>
       <td><small>{formatTime(account.lastCheckedAt)}</small></td>
-      <td>
+      <td className="row-actions">
         <button className="icon-action" type="button" title="巡检账号" aria-label={`巡检 ${account.email}`} onClick={() => void onAction("/api/inspect", { ids: [account.id] }, "巡检任务已创建")}>↻</button>
+        <button className="icon-action" type="button" title="授权确认（TOS）" aria-label={`授权确认 ${account.email}`} onClick={() => void onAction("/api/consent", { ids: [account.id] }, "授权确认任务已创建")}>✓</button>
       </td>
     </tr>
   );

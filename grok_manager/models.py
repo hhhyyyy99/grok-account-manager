@@ -147,6 +147,15 @@ class LoginResult:
 
 
 @dataclass(frozen=True)
+class ConsentResult:
+    account_id: int
+    email: str
+    ok: bool
+    detail: str
+    tos_ok: bool = False
+
+
+@dataclass(frozen=True)
 class PasswordResetResult:
     account_id: int
     email: str

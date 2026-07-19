@@ -496,6 +496,12 @@ button:active:not(:disabled), .button:active:not(:disabled) { transform: transla
 .react-status.checking::before, .react-status.running::before { background: var(--warning); animation: state-pulse 900ms ease-in-out infinite; }
 .react-status.needs_login, .react-status.unknown, .react-status.queued, .react-status.limited { border-color: #d5dfe5; background: var(--info-soft); color: var(--info); }
 .react-status.needs_login::before, .react-status.unknown::before, .react-status.queued::before, .react-status.limited::before { background: var(--info); }
+.row-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
 .icon-action {
   display: inline-grid;
   width: 31px;

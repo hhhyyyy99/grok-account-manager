@@ -639,6 +639,39 @@ class GrokWebApplication:
 
         return self.tasks.start("login", "批量登录", worker, exclusive_group="browser-automation")
 
+    def start_consent(self, payload: Dict[str, Any]) -> TaskRecord:
+        ids = self._ids(payload)
+        if not ids:
+            raise ValueError("没有待授权确认的账号")
+
+        def worker(task: TaskRecord) -> Dict[str, Any]:
+            task.log("开始授权确认 %s 个账号（TOS）" % len(ids))
+
+            def progress(result, completed, total):
+                task.progress(completed, total, "%s: %s" % (result.email, result.detail))
+                task.log("#%s %s: %s" % (result.account_id, result.email, result.detail))
+
+            results = self.manager.consent_accounts(
+                ids,
+                log=task.log,
+                progress=progress,
+                cancelled=lambda: task.cancel_requested,
+            )
+            summary = summarize_account_results(results, action_label="授权确认")
+            log_account_failures(
+                task,
+                summary["failures"],
+                truncated=bool(summary.get("failureTruncated")),
+            )
+            return summary
+
+        return self.tasks.start(
+            "consent",
+            "授权确认",
+            worker,
+            exclusive_group="browser-automation",
+        )
+
     def start_cpa_refresh(self, payload: Dict[str, Any]) -> TaskRecord:
         ids = self._ids(payload)
         if not ids:
@@ -799,7 +832,14 @@ class GrokWebApplication:
             raise KeyError("任务不存在")
         if task.state in TERMINAL_STATES:
             return task
-        if task.kind not in ("register", "login", "reset-password", "inspect", "refresh-cpa"):
+        if task.kind not in (
+            "register",
+            "login",
+            "consent",
+            "reset-password",
+            "inspect",
+            "refresh-cpa",
+        ):
             raise RuntimeError("该任务不支持中途取消")
         task.cancel_requested = True
         if task.kind == "register":
@@ -807,6 +847,10 @@ class GrokWebApplication:
         elif task.kind == "login":
             self.manager.password_reset.cancel()
             self.manager.login.cancel()
+            self.manager.consent.cancel()
+        elif task.kind == "consent":
+            self.manager.consent.cancel()
+            task.message = "正在停止授权确认"
         elif task.kind == "reset-password":
             self.manager.password_reset.cancel()
         elif task.kind == "inspect":
@@ -1026,6 +1070,8 @@ class GrokWebApplication:
                         self._json({"task": application.start_password_reset(payload).serialize(False)}, 202)
                     elif parsed.path == "/api/login":
                         self._json({"task": application.start_login(payload).serialize(False)}, 202)
+                    elif parsed.path == "/api/consent":
+                        self._json({"task": application.start_consent(payload).serialize(False)}, 202)
                     elif parsed.path == "/api/refresh-cpa":
                         self._json(
                             {"task": application.start_cpa_refresh(payload).serialize(False)},

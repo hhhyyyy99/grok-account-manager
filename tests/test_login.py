@@ -483,6 +483,10 @@ class BatchLoginCredentialTests(unittest.TestCase):
                 manager,
                 "inspect_accounts",
                 return_value=[],
+            ), patch.object(
+                manager,
+                "consent_accounts",
+                return_value=[],
             ):
                 result = manager.batch_refresh_cpa([account.id])[0]
             stored = manager.store.get(account.id)
@@ -587,6 +591,10 @@ class BatchLoginCredentialTests(unittest.TestCase):
                 manager,
                 "inspect_accounts",
                 return_value=[],
+            ), patch.object(
+                manager,
+                "consent_accounts",
+                return_value=[],
             ):
                 result = manager.batch_refresh_cpa([account.id])[0]
             stored = manager.store.get(account.id)
@@ -681,7 +689,8 @@ class BatchLoginCredentialTests(unittest.TestCase):
                 )
             )
 
-            result = manager.batch_login([account.id])[0]
+            with patch.object(manager, "consent_accounts", return_value=[]):
+                result = manager.batch_login([account.id])[0]
             stored = manager.store.get(account.id)
 
             self.assertEqual(
@@ -822,7 +831,8 @@ class BatchLoginCredentialTests(unittest.TestCase):
             )
             logs = []
 
-            result = manager.batch_login([account.id], log=logs.append)[0]
+            with patch.object(manager, "consent_accounts", return_value=[]):
+                result = manager.batch_login([account.id], log=logs.append)[0]
             stored = manager.store.get(account.id)
             hotloaded = json.loads(
                 (hotload_dir / "xai-hotload@example.com.json").read_text(
@@ -903,7 +913,8 @@ class BatchLoginCredentialTests(unittest.TestCase):
                 )
 
             with patch.object(manager.reference, "sync_grok2api", side_effect=observe_sync):
-                result = manager.batch_login([account.id])[0]
+                with patch.object(manager, "consent_accounts", return_value=[]):
+                    result = manager.batch_login([account.id])[0]
             stored = manager.store.get(account.id)
 
             self.assertTrue(result.ok)
@@ -923,7 +934,8 @@ class BatchLoginCredentialTests(unittest.TestCase):
                 AccountDraft(email="target@example.com", password="password")
             )
 
-            result = manager.batch_login([account.id])[0]
+            with patch.object(manager, "consent_accounts", return_value=[]):
+                result = manager.batch_login([account.id])[0]
             auth_file = manager.reference.managed_auth_dir / "xai-target@example.com.json"
 
             self.assertTrue(result.ok)
@@ -950,7 +962,8 @@ class BatchLoginCredentialTests(unittest.TestCase):
                 "sync_grok2api",
                 side_effect=RuntimeError("remote pool missing previous credential"),
             ):
-                result = manager.batch_login([account.id], log=logs.append)[0]
+                with patch.object(manager, "consent_accounts", return_value=[]):
+                    result = manager.batch_login([account.id], log=logs.append)[0]
             stored = manager.store.get(account.id)
 
             # Login itself still succeeds; remote sync is only annotated.
@@ -1054,6 +1067,8 @@ class BatchLoginCredentialTests(unittest.TestCase):
 
             with patch(
                 "grok_manager.worker_runtime.subprocess.Popen", return_value=FakeProcess()
+            ), patch.object(manager, "consent_accounts", return_value=[]), patch.object(
+                manager, "inspect_accounts", return_value=[]
             ):
                 results = manager.batch_login([account.id])
 
@@ -1150,7 +1165,8 @@ class BatchLoginCredentialTests(unittest.TestCase):
                 )
             )
 
-            result = manager.batch_login([account.id])[0]
+            with patch.object(manager, "consent_accounts", return_value=[]):
+                result = manager.batch_login([account.id])[0]
             stored = manager.store.get(account.id)
 
             self.assertEqual(
@@ -1182,7 +1198,8 @@ class BatchLoginCredentialTests(unittest.TestCase):
             failure = LoginResult(account.id, account.email, False, "安全验证未完成")
             with patch.object(manager.login, "login_accounts", return_value=[failure]):
                 with patch.object(manager, "reset_passwords") as reset_passwords:
-                    result = manager.batch_login([account.id])[0]
+                    with patch.object(manager, "consent_accounts", return_value=[]):
+                        result = manager.batch_login([account.id])[0]
 
             reset_passwords.assert_not_called()
             self.assertEqual((False, "安全验证未完成"), (result.ok, result.detail))
@@ -1212,7 +1229,7 @@ class BatchLoginCredentialTests(unittest.TestCase):
             with patch.object(manager.login, "login_accounts", side_effect=fake_login):
                 with patch.object(manager, "reset_passwords") as reset_passwords:
                     with patch.object(manager, "_sync_relogin_credentials", return_value=""):
-                        with patch.object(manager, "inspect_accounts", return_value=[]):
+                        with patch.object(manager, "inspect_accounts", return_value=[]), patch.object(manager, "consent_accounts", return_value=[]):
                             results = manager.batch_login(
                                 [account.id],
                                 progress=lambda result, completed, total: progress_events.append(
@@ -1255,7 +1272,7 @@ class BatchLoginCredentialTests(unittest.TestCase):
             with patch.object(manager.login, "login_accounts", side_effect=fake_login):
                 with patch.object(manager, "reset_passwords") as reset_passwords:
                     with patch.object(manager, "_sync_relogin_credentials", return_value=""):
-                        with patch.object(manager, "inspect_accounts", return_value=[]):
+                        with patch.object(manager, "inspect_accounts", return_value=[]), patch.object(manager, "consent_accounts", return_value=[]):
                             results = manager.batch_login(
                                 [good.id, bad.id],
                                 progress=lambda result, completed, total: progress_events.append(
@@ -1279,7 +1296,7 @@ class BatchLoginCredentialTests(unittest.TestCase):
 
             with patch.object(manager.login, "login_accounts") as login_accounts:
                 with patch.object(manager, "reset_passwords") as reset_passwords:
-                    with patch.object(manager, "inspect_accounts", return_value=[]):
+                    with patch.object(manager, "inspect_accounts", return_value=[]), patch.object(manager, "consent_accounts", return_value=[]):
                         results = manager.batch_login(
                             [account.id],
                             progress=lambda result, completed, total: progress_events.append(
@@ -1324,7 +1341,7 @@ class BatchLoginCredentialTests(unittest.TestCase):
             with patch.object(manager.login, "login_accounts", side_effect=fake_login):
                 with patch.object(manager, "reset_passwords") as reset_passwords:
                     with patch.object(manager, "_sync_relogin_credentials", return_value=""):
-                        with patch.object(manager, "inspect_accounts", return_value=[]):
+                        with patch.object(manager, "inspect_accounts", return_value=[]), patch.object(manager, "consent_accounts", return_value=[]):
                             results = manager.batch_login([one.id, two.id])
 
             reset_passwords.assert_not_called()
@@ -1354,7 +1371,7 @@ class BatchLoginCredentialTests(unittest.TestCase):
                 ),
             ):
                 with patch.object(manager, "reset_passwords") as reset_passwords:
-                    with patch.object(manager, "inspect_accounts", return_value=[]):
+                    with patch.object(manager, "inspect_accounts", return_value=[]), patch.object(manager, "consent_accounts", return_value=[]):
                         results = manager.batch_login(
                             [account.id], auto_reset_password=False
                         )
@@ -1568,7 +1585,7 @@ class BatchLoginCredentialTests(unittest.TestCase):
             missing_id = 999999
             with patch.object(manager.login, "login_accounts", side_effect=fake_login):
                 with patch.object(manager, "_sync_relogin_credentials", return_value=""):
-                    with patch.object(manager, "inspect_accounts", return_value=[]):
+                    with patch.object(manager, "inspect_accounts", return_value=[]), patch.object(manager, "consent_accounts", return_value=[]):
                         results = manager.batch_login(
                             [second.id, missing_id, first.id, second.id],
                             progress=lambda result, completed, total: progress_events.append(
@@ -1613,7 +1630,7 @@ class BatchLoginCredentialTests(unittest.TestCase):
             with patch.object(manager.login, "login_accounts", side_effect=fake_login):
                 with patch.object(manager, "reset_passwords") as reset:
                     with patch.object(manager, "_sync_relogin_credentials", return_value=""):
-                        with patch.object(manager, "inspect_accounts", return_value=[]):
+                        with patch.object(manager, "inspect_accounts", return_value=[]), patch.object(manager, "consent_accounts", return_value=[]):
                             results = manager.batch_login([two.id, one.id])
 
             self.assertEqual([[two.id, one.id]], login_calls)

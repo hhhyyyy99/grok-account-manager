@@ -2,18 +2,23 @@
 
 Paths resolve relative to the grok_reg project root (parent of cpa_xai).
 
-Proven flow (2026-07-10, free account):
-  1. Open verification_uri_complete (user_code prefilled)
-  2. Click 继续 on device page
-  3. Cookie banner: 全部允许 (optional)
-  4. Login with email / 使用邮箱登录 → fill email → 下一步
-  5. Wait cf-turnstile-response → fill password → REAL click 登录
-  6. May land /account redirect or device page → 继续
-  7. Consent page /oauth2/device/consent → REAL click exact 允许
+Proven flow (2026-07-10, free account; updated 2026-07-20):
+  1. Attach SSO / login session
+  2. Open grok.com and finish account TOS gate first:
+     Cookie → tos-gate「知道了」
+     (must complete before Grok Build OAuth, or SSO stays unusable)
+  3. Open verification_uri_complete (user_code prefilled)
+  4. Click 继续 on device page
+  5. Cookie banner: 全部允许 (optional)
+  6. Login with email / 使用邮箱登录 → fill email → 下一步
+  7. Wait cf-turnstile-response → fill password → REAL click 登录
+  8. May land /account redirect or device page → 继续
+  9. Consent page /oauth2/device/consent → REAL click exact 允许
      (by_js click causes Invalid action / empty form action)
-  8. /oauth2/device/done "设备已授权" + token poll SUCCESS
+ 10. /oauth2/device/done "设备已授权" + token poll SUCCESS
 
 Hard rules:
+  - Account TOS gate runs before Build OAuth allow
   - Token poll is source of truth
   - Button match is EXACT text only (允许 ≠ 全部允许)
   - Consent Allow MUST be a real click, not by_js
@@ -22,8 +27,10 @@ Hard rules:
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import struct
 import sys
 import threading
 import time
@@ -37,6 +44,52 @@ LogFn = Callable[[str], None]
 
 PASSWORD_SELECTOR = (
     "css:input[name='password'], input[data-testid='password'], input[type='password']"
+)
+
+TOS_GATE_MARKER = "tos-gate"
+COOKIE_CONSENT_LABELS = (
+    "接受所有 Cookie",
+    "全部允许",
+    "Accept All Cookies",
+    "Accept all cookies",
+    "Accept All",
+    "Allow All",
+)
+TOS_GATE_LABELS = (
+    "知道了",
+    "Got it",
+    "I understand",
+    "I agree",
+    "Agree",
+    "Accept",
+    "Continue",
+    "继续",
+    "同意",
+)
+CLOUDFLARE_MARKERS = (
+    "just a moment",
+    "checking your browser",
+    "cf-challenge",
+    "challenge-platform",
+    "cdn-cgi/challenge",
+    "attention required",
+    "enable javascript and cookies",
+    "verify you are human",
+    "performing security verification",
+    "needs to review the security",
+    "ray id",
+)
+GROK_APP_MARKERS = (
+    "新建聊天",
+    "new chat",
+    "你想知道什么",
+    "what do you want to know",
+    "imagine",
+    "automations",
+    "私密模式",
+    "private mode",
+    "切换侧边栏",
+    "ask grok",
 )
 
 
@@ -524,6 +577,293 @@ def _page_url(page: Any) -> str:
         return ""
 
 
+def _norm_probe_text(value: str) -> str:
+    return " ".join(str(value or "").split()).casefold()
+
+
+def looks_like_cloudflare(url: str = "", text: str = "") -> bool:
+    blob = _norm_probe_text("%s %s" % (url, text))
+    if not blob:
+        return False
+    return any(marker in blob for marker in CLOUDFLARE_MARKERS)
+
+
+def looks_like_tos_gate(url: str = "", text: str = "") -> bool:
+    url_l = str(url or "").casefold()
+    text_l = _norm_probe_text(text)
+    if TOS_GATE_MARKER in url_l:
+        return True
+    return any(
+        marker.casefold() in text_l
+        for marker in (
+            "服务条款和可接受使用政策",
+            "terms of service",
+            "acceptable use policy",
+            "知道了",
+            "got it",
+        )
+    )
+
+
+def looks_like_sign_in(url: str = "", text: str = "") -> bool:
+    url_l = str(url or "").casefold()
+    text_l = _norm_probe_text(text)
+    if any(part in url_l for part in ("/sign-in", "/signin", "/login")):
+        return True
+    return any(
+        marker in text_l
+        for marker in (
+            "使用邮箱登录",
+            "continue with email",
+            "sign in with email",
+            "login with email",
+        )
+    )
+
+
+def looks_like_grok_app(url: str = "", text: str = "") -> bool:
+    url_l = str(url or "").casefold()
+    text_l = _norm_probe_text(text)
+    if "grok.com" not in url_l:
+        return False
+    if looks_like_cloudflare(url_l, text_l) or looks_like_tos_gate(url_l, text_l):
+        return False
+    if looks_like_sign_in(url_l, text_l):
+        return False
+    return any(marker.casefold() in text_l for marker in GROK_APP_MARKERS)
+
+
+def _encode_grpc_tos_accepted() -> bytes:
+    payload = struct.pack("B", (2 << 3) | 0) + struct.pack("B", 1)
+    return b"\x00" + struct.pack(">I", len(payload)) + payload
+
+
+def _browser_post_binary(
+    page: Any,
+    *,
+    url: str,
+    data_hex: str,
+    content_type: str,
+    origin: str,
+    referer: str,
+) -> dict[str, Any]:
+    payload = {
+        "url": url,
+        "dataHex": data_hex,
+        "contentType": content_type,
+        "origin": origin,
+        "referer": referer,
+    }
+    script = (
+        """
+        const payload = %s;
+        const bytes = new Uint8Array(
+          payload.dataHex.match(/.{1,2}/g).map((b) => parseInt(b, 16))
+        );
+        return fetch(payload.url, {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'content-type': payload.contentType,
+            'x-grpc-web': '1',
+            'x-user-agent': 'connect-es/2.1.1',
+            'origin': payload.origin,
+            'referer': payload.referer,
+          },
+          body: bytes,
+        }).then(async (response) => {
+          const text = await response.text();
+          return {
+            status: response.status,
+            body: (text || '').slice(0, 300),
+          };
+        }).catch((error) => ({ error: String(error) }));
+        """
+        % json.dumps(payload, ensure_ascii=False)
+    )
+    try:
+        result = page.run_js(script)
+    except Exception as exc:
+        return {"error": str(exc)}
+    return result if isinstance(result, dict) else {"error": "invalid browser binary post"}
+
+
+def prepare_account_gates(
+    page: Any,
+    *,
+    log: LogFn | None = None,
+    timeout_sec: float = 60.0,
+    stop_event: threading.Event | None = None,
+) -> dict[str, Any]:
+    """Finish grok.com TOS gate before Grok Build OAuth allow.
+
+    Pass criteria (strict):
+      - not stuck on Cloudflare challenge
+      - not on sign-in
+      - not on tos-gate
+      - and either:
+          * landed on grok app UI markers, or
+          * previously saw/clicked TOS and then left tos-gate without CF/sign-in
+
+    SetTosAcceptedVersion API is only auxiliary; it cannot alone mark success
+    while the page still looks like CF/tos-gate/sign-in.
+    """
+    log = log or _noop_log
+    if page is None:
+        return {
+            "ok": False,
+            "tos_ok": False,
+            "detail": "page is None",
+        }
+
+    def stopped() -> bool:
+        return bool(stop_event is not None and stop_event.is_set())
+
+    notes: list[str] = []
+    cookie_ok = False
+    clicked_tos = False
+    saw_tos = False
+    saw_cf = False
+    api_ok = False
+    try:
+        log("prepare account TOS gate on grok.com before Build authorize")
+        try:
+            page.get("https://grok.com/")
+        except TypeError:
+            page.get("https://grok.com/")
+        _sleep(2.0)
+
+        deadline = time.time() + max(20.0, float(timeout_sec))
+        while time.time() < deadline and not stopped():
+            url = _page_url(page) or ""
+            text = _visible_text(page) or ""
+            url_l = url.casefold()
+            text_l = _norm_probe_text(text)
+
+            if looks_like_cloudflare(url, text):
+                saw_cf = True
+                log("cloudflare challenge detected; waiting")
+                _sleep(2.0)
+                continue
+
+            if looks_like_sign_in(url, text):
+                notes.append("页面回到登录")
+                break
+
+            if any(label.casefold() in text_l for label in COOKIE_CONSENT_LABELS) or "cookie" in text_l:
+                if _click_exact(page, list(COOKIE_CONSENT_LABELS), log, real=False):
+                    cookie_ok = True
+                    notes.append("Cookie 已同意")
+                    _sleep(1.0)
+                    continue
+
+            if looks_like_tos_gate(url, text):
+                saw_tos = True
+                if _click_exact(page, list(TOS_GATE_LABELS), log, real=True):
+                    clicked_tos = True
+                    notes.append("已点击 TOS 确认")
+                    _sleep(1.8)
+                    continue
+                _sleep(1.0)
+                continue
+
+            # Left tos-gate/sign-in/CF: only pass when app UI is visible, or we
+            # already handled TOS and are no longer blocked.
+            if looks_like_grok_app(url, text):
+                notes.append("已进入 Grok 主界面")
+                break
+            if TOS_GATE_MARKER not in url_l and not looks_like_sign_in(url, text):
+                if clicked_tos or saw_tos:
+                    notes.append("已离开 TOS 门禁")
+                    break
+                # No gate and no app markers yet — keep waiting a bit for SPA.
+            _sleep(1.0)
+
+        # API accept is auxiliary only.
+        try:
+            tos_api = _browser_post_binary(
+                page,
+                url="https://accounts.x.ai/auth_mgmt.AuthManagement/SetTosAcceptedVersion",
+                data_hex=_encode_grpc_tos_accepted().hex(),
+                content_type="application/grpc-web+proto",
+                origin="https://accounts.x.ai",
+                referer="https://accounts.x.ai/accept-tos",
+            )
+            status = int(tos_api.get("status") or 0)
+            if 200 <= status < 300:
+                api_ok = True
+                notes.append("SetTosAcceptedVersion 成功")
+            elif tos_api.get("error"):
+                notes.append("SetTosAcceptedVersion 异常: %s" % tos_api.get("error"))
+            else:
+                notes.append("SetTosAcceptedVersion HTTP %s" % status)
+        except Exception as exc:
+            notes.append("SetTosAcceptedVersion 异常: %s" % exc)
+
+        final_url = _page_url(page) or ""
+        final_text = _visible_text(page) or ""
+        if looks_like_cloudflare(final_url, final_text):
+            detail = "；".join(notes + ["Cloudflare 挑战未通过"])
+            log("account TOS gate done ok=False detail=%s" % detail)
+            return {"ok": False, "tos_ok": False, "detail": detail}
+        if looks_like_sign_in(final_url, final_text):
+            detail = "；".join(notes + ["SSO 无效或回到登录页"])
+            log("account TOS gate done ok=False detail=%s" % detail)
+            return {"ok": False, "tos_ok": False, "detail": detail}
+        if looks_like_tos_gate(final_url, final_text):
+            if _click_exact(page, list(TOS_GATE_LABELS), log, real=True):
+                clicked_tos = True
+                notes.append("TOS 门禁二次确认")
+                _sleep(1.5)
+                final_url = _page_url(page) or ""
+                final_text = _visible_text(page) or ""
+            if looks_like_cloudflare(final_url, final_text):
+                detail = "；".join(notes + ["Cloudflare 挑战未通过"])
+                log("account TOS gate done ok=False detail=%s" % detail)
+                return {"ok": False, "tos_ok": False, "detail": detail}
+            if looks_like_tos_gate(final_url, final_text):
+                detail = "；".join(notes + ["仍停留在 tos-gate"])
+                log("account TOS gate done ok=False detail=%s" % detail)
+                return {"ok": False, "tos_ok": False, "detail": detail}
+
+        app_ok = looks_like_grok_app(final_url, final_text)
+        left_gate = (
+            not looks_like_tos_gate(final_url, final_text)
+            and not looks_like_cloudflare(final_url, final_text)
+            and not looks_like_sign_in(final_url, final_text)
+            and "grok.com" in final_url.casefold()
+        )
+        # Strict pass only when page is free of CF/tos/sign-in AND either:
+        # - Grok app UI is visible, or
+        # - we actually clicked TOS and then left the gate.
+        # API success alone is never enough (avoids CF false pass).
+        tos_ok = bool(left_gate and (app_ok or clicked_tos))
+        if saw_cf and not tos_ok:
+            notes.append("曾出现 Cloudflare 挑战")
+        if not tos_ok and left_gate and not saw_tos and not app_ok:
+            notes.append("未识别到主界面，且未出现/点击 TOS 门禁")
+        if tos_ok and app_ok and "已进入 Grok 主界面" not in "；".join(notes):
+            notes.append("已进入 Grok 主界面")
+        if tos_ok and clicked_tos and "TOS 门禁已通过" not in "；".join(notes):
+            notes.append("TOS 门禁已通过")
+
+        detail = "；".join(notes) if notes else ("账号授权完成" if tos_ok else "账号授权未确认")
+        log("account TOS gate done ok=%s detail=%s" % (tos_ok, detail))
+        return {
+            "ok": bool(tos_ok),
+            "tos_ok": bool(tos_ok),
+            "detail": detail,
+        }
+    except Exception as exc:
+        detail = "账号授权异常: %s" % exc
+        log(detail)
+        return {
+            "ok": False,
+            "tos_ok": False,
+            "detail": detail,
+        }
+
+
 def _visible_text(page: Any) -> str:
     try:
         t = page.run_js(
@@ -821,7 +1161,9 @@ def approve_device_code(
     stop_event: threading.Event | None = None,
     log: LogFn | None = None,
     allow_passwordless: bool = False,
-) -> None:
+    ensure_account_gates: bool = False,
+    account_gates_state: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     log = log or _noop_log
     if page is None:
         raise BrowserConfirmError("page is None")
@@ -849,11 +1191,40 @@ def approve_device_code(
     phase = "device"
     login_attempts = 0
     last_url = ""
+    gates_done = bool(account_gates_state and account_gates_state.get("ok"))
+    gate_state = dict(account_gates_state or {})
+
+    def _run_account_gates_before_build() -> None:
+        nonlocal gates_done, gate_state
+        if gates_done or not ensure_account_gates:
+            return
+        log("login session ready — run TOS gate before Build authorize")
+        remaining = max(20.0, deadline - time.time())
+        gate_state = prepare_account_gates(
+            page,
+            log=log,
+            timeout_sec=min(60.0, remaining),
+            stop_event=stop_event,
+        )
+        gates_done = True
+        if gate_state.get("ok"):
+            log("account TOS ready before Build authorize: %s" % gate_state.get("detail"))
+        else:
+            log(
+                "account TOS incomplete before Build authorize: %s"
+                % (gate_state.get("detail") or "unknown")
+            )
+        # Resume device flow after grok.com detour.
+        try:
+            page.get(verification_uri_complete)
+        except Exception as e:
+            log(f"reopen device uri after account gates failed: {e}")
+        _sleep(1.0)
 
     while time.time() < deadline:
         if stop_event is not None and stop_event.is_set():
             log("stop_event set — leave browser loop")
-            return
+            return gate_state or None
 
         url = _page_url(page)
         text = _visible_text(page)
@@ -899,6 +1270,9 @@ def approve_device_code(
         # Consent page — REAL click exact 允许
         if "/consent" in url or "授权 Grok Build" in text or "Authorize Grok Build" in text:
             phase = "consent"
+            # Account TOS must complete before Build OAuth allow, otherwise
+            # the resulting SSO/session is still blocked by tos-gate.
+            _run_account_gates_before_build()
             # Prefer real click; React needs it to set form action=allow
             if _click_exact(page, ["允许", "Allow", "Authorize", "Approve"], log, real=True):
                 _sleep(2.5)
@@ -950,6 +1324,10 @@ def approve_device_code(
 
         # Account redirect
         if "正在重定向" in text or ("/account" in url and "sign-in" not in url):
+            # Logged-in account page is a good moment to finish TOS before Build.
+            if ensure_account_gates and not gates_done:
+                _run_account_gates_before_build()
+                continue
             if _click_exact(page, ["继续", "Continue"], log, real=False):
                 _sleep(2.0)
                 continue
@@ -1016,7 +1394,7 @@ def approve_device_code(
             # wait navigation / credential error
             for _ in range(30):
                 if stop_event is not None and stop_event.is_set():
-                    return
+                    return gate_state or None
                 _sleep(0.5)
                 current_text = _visible_text(page)
                 _raise_for_login_error(current_text)
@@ -1030,7 +1408,7 @@ def approve_device_code(
 
     if stop_event is not None and stop_event.is_set():
         log("browser finished via stop_event")
-        return
+        return gate_state or None
     log(f"browser loop ended phase={phase} login_attempts={login_attempts}")
     # Never invent a wrong-password error for timeouts/stuck pages.
     _raise_for_login_error(_visible_text(page))
@@ -1119,6 +1497,33 @@ def mint_with_browser(
                 log(f"post-inject session url={url[:120]} visible={snip}")
             except Exception as e:
                 log(f"post-inject check: {e}")
+            # With an existing SSO session, finish TOS/age before Build OAuth.
+            pre_gate = prepare_account_gates(
+                work_page,
+                log=log,
+                timeout_sec=min(60.0, float(browser_timeout_sec)),
+            )
+            if not pre_gate.get("ok"):
+                log(
+                    "account TOS incomplete before Build authorize: %s"
+                    % (pre_gate.get("detail") or "unknown")
+                )
+            else:
+                log(
+                    "account TOS ready before Build authorize: %s"
+                    % (pre_gate.get("detail") or "ok")
+                )
+        else:
+            # Password login path finishes TOS inside approve_device_code,
+            # after sign-in and before clicking Build「允许」.
+            pre_gate = {
+                "ok": False,
+                "tos_ok": False,
+                "detail": "deferred-until-login",
+            }
+
+        if cancel and cancel():
+            raise BrowserConfirmError("cancelled before Build authorize")
 
         stop_event = threading.Event()
         token_box: dict[str, Any] = {}
@@ -1149,7 +1554,7 @@ def mint_with_browser(
         t = threading.Thread(target=_poll, name="oauth-poll", daemon=True)
         t.start()
         try:
-            approve_device_code(
+            gate_result = approve_device_code(
                 work_page,
                 verification_uri_complete=sess.verification_uri_complete,
                 email=email,
@@ -1159,7 +1564,13 @@ def mint_with_browser(
                 stop_event=stop_event,
                 log=log,
                 allow_passwordless=allow_passwordless,
+                # Always allow a last-chance gate run before Build「允许」.
+                # Cookie path may have already finished; password path does it here.
+                ensure_account_gates=True,
+                account_gates_state=pre_gate if cookies else None,
             )
+            if isinstance(gate_result, dict) and gate_result.get("detail"):
+                pre_gate = gate_result
         except BrowserConfirmError as e:
             browser_error = e
             stop_event.set()
@@ -1176,6 +1587,7 @@ def mint_with_browser(
                 "token_type": tr.token_type,
                 "expires_in": tr.expires_in,
                 "user_code": sess.user_code,
+                "account_gates": pre_gate,
             }
         if browser_error is not None:
             raise browser_error

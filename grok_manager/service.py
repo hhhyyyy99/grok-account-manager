@@ -10,12 +10,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .config import ConfigStore, ManagerConfig
+from .consent import BatchConsentService, ConsentSettings
 from .inspection import InspectionService, TokenInspector, expiration_for
 from .login import BatchLoginService, LoginSettings
 from .password_reset import BatchPasswordResetService, PasswordResetSettings
 from .models import (
     Account,
     AccountStatus,
+    ConsentResult,
     CpaHotloadSyncResult,
     CpaRefreshResult,
     InspectionResult,
@@ -147,6 +149,7 @@ class GrokManager:
         )
         self.login = BatchLoginService(self.store, self.reference, self.python_executable)
         self.password_reset = BatchPasswordResetService(self.store, self.reference, self.python_executable)
+        self.consent = BatchConsentService(self.store)
 
     def save_manager_config(self, config: ManagerConfig) -> None:
         self.config_store.save(config)
@@ -668,6 +671,11 @@ class GrokManager:
         refreshed = [result for result in results if result.ok and result.account_id]
         refreshed_ids = [result.account_id for result in refreshed]
         if refreshed_ids:
+            if cancelled and cancelled():
+                log("登录完成，但任务已取消，跳过复核")
+                return results
+            # Account TOS gate already runs inside the login mint browser
+            # before Grok Build OAuth「允许」. Do not open a second browser here.
             log("登录完成，开始复核新的 SSO 与 CPA token")
             reviews = self.inspect_accounts(
                 refreshed_ids,
@@ -698,6 +706,32 @@ class GrokManager:
                 )
             results = reviewed_results
         return results
+
+    def consent_accounts(
+        self,
+        account_ids: Iterable[int],
+        log=None,
+        progress=None,
+        cancelled=None,
+    ) -> List[ConsentResult]:
+        registration_config = self.reference.load_registration_config()
+        settings = ConsentSettings(
+            workers=max(1, min(int(self.config.login_workers or 1), 4)),
+            timeout_seconds=max(60, int(self.config.login_timeout_seconds or 300)),
+            proxy=str(
+                registration_config.get("cpa_proxy")
+                or registration_config.get("proxy")
+                or ""
+            ).strip(),
+            headless=bool(registration_config.get("cpa_headless", False)),
+        )
+        return self.consent.consent_accounts(
+            account_ids,
+            settings,
+            log=log,
+            progress=progress,
+            cancelled=cancelled,
+        )
 
     def reset_passwords(
         self,
