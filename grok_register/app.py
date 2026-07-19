@@ -321,9 +321,12 @@ DUCKMAIL_API_BASE = "https://api.duckmail.sbs"
 
 
 def get_proxies():
-    proxy = config.get("proxy", "")
-    if proxy:
-        return {"http": proxy, "https": proxy}
+    proxy = str(config.get("proxy", "") or "").strip()
+    # Ignore vault ciphertext leftovers and empty/invalid proxy values so admin
+    # and mail API recovery can still reach the temp-mail host directly.
+    if not proxy or proxy.startswith("gmv1:") or "://" not in proxy:
+        return {}
+    return {"http": proxy, "https": proxy}
     return {}
 
 
@@ -1270,15 +1273,32 @@ def _to_std_request_kwargs(kwargs):
     return std_kwargs
 
 
+def _should_retry_without_proxy(exc) -> bool:
+    err = str(exc or "")
+    lowered = err.lower()
+    markers = (
+        "127.0.0.1 port 7890",
+        "could not connect to server",
+        "unsupported proxy syntax",
+        "proxyerror",
+        "failed to perform, curl: (5)",
+        "failed to perform, curl: (7)",
+        "failed to perform, curl: (28)",
+        "tunnel connection failed",
+        "proxy connect aborted",
+        "gmv1:",
+    )
+    return any(marker in lowered or marker in err for marker in markers)
+
+
 def http_get(url, **kwargs):
     try:
         return curl_requests.get(url, **_build_request_kwargs(**kwargs))
     except Exception as exc:
-        err = str(exc)
         if _is_tls_backend_error(exc):
             return std_requests.get(url, **_to_std_request_kwargs(kwargs))
-        # 代理不可用时自动回退为直连，避免整个流程直接失败
-        if "127.0.0.1 port 7890" in err or "Could not connect to server" in err:
+        # 代理不可用/无效时自动回退为直连，避免整个流程直接失败
+        if _should_retry_without_proxy(exc):
             retry_kwargs = dict(kwargs)
             retry_kwargs["proxies"] = {}
             try:
@@ -1294,10 +1314,9 @@ def http_post(url, **kwargs):
     try:
         return curl_requests.post(url, **_build_request_kwargs(**kwargs))
     except Exception as exc:
-        err = str(exc)
         if _is_tls_backend_error(exc):
             return std_requests.post(url, **_to_std_request_kwargs(kwargs))
-        if "127.0.0.1 port 7890" in err or "Could not connect to server" in err:
+        if _should_retry_without_proxy(exc):
             retry_kwargs = dict(kwargs)
             retry_kwargs["proxies"] = {}
             try:
@@ -1313,10 +1332,9 @@ def http_put(url, **kwargs):
     try:
         return curl_requests.put(url, **_build_request_kwargs(**kwargs))
     except Exception as exc:
-        err = str(exc)
         if _is_tls_backend_error(exc):
             return std_requests.put(url, **_to_std_request_kwargs(kwargs))
-        if "127.0.0.1 port 7890" in err or "Could not connect to server" in err:
+        if _should_retry_without_proxy(exc):
             retry_kwargs = dict(kwargs)
             retry_kwargs["proxies"] = {}
             try:
