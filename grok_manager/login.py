@@ -1,26 +1,17 @@
 from __future__ import annotations
 
 import json
-import os
-import signal
-import subprocess
-import threading
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from .models import Account, AccountStatus, LoginResult
-from .paths import (
-    JOBS_DIR,
-    ensure_data_dirs,
-)
 from .reference import ReferenceProject
 from .store import AccountStore
+from .worker_runtime import BatchWorkerProcess, LogCallback
 
 
-LogCallback = Callable[[str], None]
-ProgressCallback = Callable[[LoginResult, int, int], None]
+ProgressCallback = Callable[[LoginResult, int, int], Optional[LoginResult]]
 
 
 @dataclass(frozen=True)
@@ -43,39 +34,19 @@ class BatchLoginService:
         self.store = store
         self.project = project
         self.python_executable = python_executable
-        self._lock = threading.Lock()
-        self._process: Optional[subprocess.Popen] = None
-        self._cleanup_stale_inputs()
-
-    @staticmethod
-    def _cleanup_stale_inputs() -> None:
-        ensure_data_dirs()
-        stale_before = time.time() - 24 * 60 * 60
-        for path in JOBS_DIR.glob("login-*/input.json"):
-            try:
-                if path.stat().st_mtime < stale_before:
-                    path.unlink()
-            except OSError:
-                pass
+        self._worker = BatchWorkerProcess(
+            project,
+            python_executable,
+            job_glob="login-*/input.json",
+            busy_error="已有批量登录任务正在运行",
+        )
 
     @property
     def running(self) -> bool:
-        with self._lock:
-            return self._process is not None and self._process.poll() is None
+        return self._worker.running
 
     def cancel(self) -> bool:
-        with self._lock:
-            process = self._process
-        if process is None or process.poll() is not None:
-            return False
-        if os.name != "nt":
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except (OSError, ProcessLookupError):
-                process.terminate()
-        else:
-            process.terminate()
-        return True
+        return self._worker.cancel()
 
     def login_accounts(
         self,
@@ -118,70 +89,19 @@ class BatchLoginService:
             },
             "accounts": [self._worker_account(account) for account in ready],
         }
-        process: Optional[subprocess.Popen] = None
-        worker_script = Path(__file__).with_name("reference_worker.py")
-        command = [
-            self.python_executable,
-            str(worker_script),
+        worker_results, parsed_ids, completed = self._worker.run(
             "batch-login",
-            "--input",
-            "-",
-        ]
-        env = self.project.environment()
-        env["PYTHONUNBUFFERED"] = "1"
-        parsed_ids = set()
-        try:
-            with self._lock:
-                if self._process is not None and self._process.poll() is None:
-                    raise RuntimeError("已有批量登录任务正在运行")
-                self._process = subprocess.Popen(
-                    command,
-                    cwd=str(self.project.work_dir),
-                    env=env,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    start_new_session=(os.name != "nt"),
-                )
-                process = self._process
-            if not hasattr(process, "stdin"):
-                pass
-            elif process.stdin is None:
-                raise OSError("批量登录 worker 未创建输入管道")
-            else:
-                process.stdin.write(json.dumps(document, ensure_ascii=False))
-                process.stdin.close()
-                process.stdin = None
-            if process.stdout is not None:
-                for line in process.stdout:
-                    text = line.rstrip("\r\n")
-                    if text.startswith("GM_LOG "):
-                        self._handle_log(text[7:], log)
-                    elif text.startswith("GM_RESULT "):
-                        result = self._handle_result(text[10:])
-                        results.append(result)
-                        parsed_ids.add(result.account_id)
-                        completed += 1
-                        if progress:
-                            progress(result, completed, total)
-                    elif text.startswith("GM_FATAL "):
-                        self._handle_log(text[9:], log)
-                        self._remove_transient_auth_file(result.auth_file)
-                    elif text:
-                        log(text)
-            return_code = process.wait()
-            if return_code not in (0, 2):
-                log("批量登录工作进程异常退出: %s" % return_code)
-        except OSError as exc:
-            log("批量登录进程无法启动: %s" % exc)
-        finally:
-            if process is not None and process.stdout is not None:
-                process.stdout.close()
-            with self._lock:
-                if self._process is process:
-                    self._process = None
+            document,
+            log=log,
+            parse_result=self._handle_result,
+            progress=progress,
+            completed=completed,
+            total=total,
+            stdin_missing_message="批量登录 worker 未创建输入管道",
+            start_failed_message="批量登录进程无法启动: %s",
+            exit_failed_message="批量登录工作进程异常退出: %s",
+        )
+        results.extend(worker_results)
 
         for account in ready:
             if account.id in parsed_ids:
@@ -212,16 +132,6 @@ class BatchLoginService:
             target.unlink(missing_ok=True)
         except (OSError, ValueError):
             pass
-
-    @staticmethod
-    def _handle_log(payload: str, log: LogCallback) -> None:
-        try:
-            value = json.loads(payload)
-            email = str(value.get("email") or "")
-            message = str(value.get("message") or value.get("error") or value)
-            log("[%s] %s" % (email, message) if email else message)
-        except (json.JSONDecodeError, AttributeError):
-            log(payload)
 
     def _handle_result(self, payload: str) -> LoginResult:
         try:
@@ -263,9 +173,16 @@ class BatchLoginService:
             except (OSError, json.JSONDecodeError, ValueError, AttributeError) as exc:
                 ok = False
                 detail = "登录成功但凭据回写失败: %s" % exc
+                self._remove_transient_auth_file(auth_file)
+                auth_file = ""
             if ok and not sso_token:
                 ok = False
                 detail = "CPA 凭据已刷新，但浏览器未返回新的 SSO cookie"
+                self._remove_transient_auth_file(auth_file)
+                auth_file = ""
+        elif auth_file:
+            self._remove_transient_auth_file(auth_file)
+            auth_file = ""
         if not ok and account_id:
             self.store.set_status([account_id], AccountStatus.ERROR.value, detail)
         return LoginResult(

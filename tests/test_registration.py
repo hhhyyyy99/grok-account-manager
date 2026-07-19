@@ -276,6 +276,126 @@ class RegistrationImportTests(unittest.TestCase):
                 ),
             )
 
+    def test_startup_encrypts_plaintext_registration_secrets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_file = root / "registration-config.json"
+            config_file.write_text(
+                json.dumps(
+                    {
+                        "proxy": "http://user:pass@example.test:8080",
+                        "cloudflare_api_key": "cloudflare-secret",
+                        "email_provider": "cloudflare",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manager = make_manager(root)
+            on_disk = json.loads(config_file.read_text(encoding="utf-8"))
+            loaded = manager.reference.load_registration_config()
+
+            self.assertTrue(
+                CredentialVault.is_encrypted(str(on_disk.get("proxy") or ""))
+            )
+            self.assertTrue(
+                CredentialVault.is_encrypted(
+                    str(on_disk.get("cloudflare_api_key") or "")
+                )
+            )
+            self.assertNotIn("cloudflare-secret", config_file.read_text(encoding="utf-8"))
+            self.assertEqual(
+                "http://user:pass@example.test:8080", loaded["proxy"]
+            )
+            self.assertEqual("cloudflare-secret", loaded["cloudflare_api_key"])
+
+    def test_partial_config_save_encrypts_retained_plaintext_secrets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = make_manager(root)
+            manager.reference.config_file.write_text(
+                json.dumps(
+                    {
+                        "proxy": "http://user:pass@example.test:8080",
+                        "cloudflare_api_key": "cloudflare-secret",
+                        "email_provider": "cloudflare",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manager.reference.save_registration_config(
+                {"email_provider": "duckmail"}
+            )
+            on_disk = json.loads(
+                manager.reference.config_file.read_text(encoding="utf-8")
+            )
+            loaded = manager.reference.load_registration_config()
+
+            self.assertTrue(
+                CredentialVault.is_encrypted(str(on_disk.get("proxy") or ""))
+            )
+            self.assertTrue(
+                CredentialVault.is_encrypted(
+                    str(on_disk.get("cloudflare_api_key") or "")
+                )
+            )
+            self.assertEqual("duckmail", loaded["email_provider"])
+            self.assertEqual(
+                "http://user:pass@example.test:8080", loaded["proxy"]
+            )
+
+    def test_import_does_not_delete_unrelated_auth_or_mail_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = make_manager(root)
+            output = manager.reference.output_dir / "out_batch"
+            output.mkdir(parents=True)
+            accounts_file = output / "accounts.txt"
+            accounts_file.write_text(
+                "first@example.com----password----first-sso\n",
+                encoding="utf-8",
+            )
+            first_auth = output / "xai-first@example.com.json"
+            first_auth.write_text(
+                json.dumps(
+                    {
+                        "email": "first@example.com",
+                        "access_token": "first-access",
+                        "refresh_token": "first-refresh",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            other_auth = output / "xai-other@example.com.json"
+            other_auth.write_text(
+                json.dumps(
+                    {
+                        "email": "other@example.com",
+                        "access_token": "other-access",
+                        "refresh_token": "other-refresh",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            mail_file = output / "mail_credentials.txt"
+            mail_file.write_text(
+                "first@example.com\tfirst-mail\n"
+                "other@example.com\tother-mail\n",
+                encoding="utf-8",
+            )
+
+            imported = manager.import_reference_accounts([accounts_file])
+            remaining_mail = mail_file.read_text(encoding="utf-8")
+
+            self.assertEqual(["first@example.com"], [item.email for item in imported])
+            self.assertFalse(first_auth.exists())
+            self.assertTrue(other_auth.exists())
+            self.assertNotIn("first@example.com", remaining_mail)
+            self.assertIn("other@example.com\tother-mail", remaining_mail)
+            self.assertEqual(
+                "first-mail",
+                manager.reference.find_mail_credential("first@example.com"),
+            )
+
 
 class Grok2ApiRemoteSyncTests(unittest.TestCase):
     @staticmethod
@@ -465,7 +585,7 @@ class Grok2ApiRemoteSyncTests(unittest.TestCase):
         )
         get.assert_not_called()
 
-    def test_relogin_keeps_local_pool_when_remote_update_fails(self) -> None:
+    def test_relogin_updates_local_pool_even_when_remote_update_fails(self) -> None:
         from grok_register.app import add_token_to_grok2api_pools
 
         settings = {
@@ -489,15 +609,16 @@ class Grok2ApiRemoteSyncTests(unittest.TestCase):
             "grok_register.app.add_token_to_grok2api_local_pool",
             side_effect=local,
         ):
-            add_token_to_grok2api_pools(
-                "fresh-sso",
-                email="same@example.com",
-                settings=settings,
-                replace_email=True,
-                previous_token="old-sso",
-            )
+            with self.assertRaisesRegex(RuntimeError, "remote unavailable"):
+                add_token_to_grok2api_pools(
+                    "fresh-sso",
+                    email="same@example.com",
+                    settings=settings,
+                    replace_email=True,
+                    previous_token="old-sso",
+                )
 
-        self.assertEqual(["remote"], events)
+        self.assertEqual(["local", "remote"], events)
 
 
 if __name__ == "__main__":

@@ -84,25 +84,79 @@ class GrokManager:
             if account_files is not None
             else self.reference.discover_account_files()
         )
-        auth_files = self.reference.discover_auth_files(extra_auth_dirs)
-        mail_files = self.reference.discover_mail_credential_files()
         drafts = self.reference.import_records(files, extra_auth_dirs)
+        imported_emails = set()
+        used_auth_files: set[str] = set()
         for draft in drafts:
+            imported_emails.add(str(draft.email or "").strip().lower())
+            if draft.auth_file:
+                try:
+                    used_auth_files.add(str(Path(draft.auth_file).expanduser().resolve()))
+                except OSError:
+                    pass
             self.reference.find_mail_credential(draft.email, draft.source)
         accounts = self.store.upsert_many(
             replace(draft, auth_file="") for draft in drafts
         )
-        for artifact in [*files, *auth_files, *mail_files]:
-            path = Path(artifact)
+        data_root = self.reference.data_root.resolve()
+        for artifact in files:
+            self._delete_data_root_artifact(artifact, data_root)
+        for auth_path in used_auth_files:
+            self._delete_data_root_artifact(auth_path, data_root)
+        self._prune_imported_mail_credentials(imported_emails, data_root)
+        return accounts
+
+    @staticmethod
+    def _delete_data_root_artifact(path: Path | str, data_root: Path) -> None:
+        target = Path(path)
+        try:
+            resolved = target.expanduser().resolve()
+            resolved.relative_to(data_root)
+        except (OSError, ValueError):
+            return
+        try:
+            resolved.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _prune_imported_mail_credentials(
+        self, imported_emails: set[str], data_root: Path
+    ) -> None:
+        if not imported_emails:
+            return
+        for path in self.reference.discover_mail_credential_files():
             try:
-                path.resolve().relative_to(self.reference.data_root.resolve())
+                resolved = Path(path).expanduser().resolve()
+                resolved.relative_to(data_root)
             except (OSError, ValueError):
                 continue
             try:
-                path.unlink(missing_ok=True)
+                lines = resolved.read_text(encoding="utf-8", errors="replace").splitlines()
             except OSError:
-                pass
-        return accounts
+                continue
+            remaining: List[str] = []
+            changed = False
+            for line in lines:
+                address, separator, _credential = line.partition("\t")
+                if separator and address.strip().casefold() in imported_emails:
+                    changed = True
+                    continue
+                remaining.append(line)
+            if not changed:
+                continue
+            if remaining:
+                try:
+                    resolved.write_text(
+                        "\n".join(remaining) + ("\n" if remaining else ""),
+                        encoding="utf-8",
+                    )
+                except OSError:
+                    pass
+            else:
+                try:
+                    resolved.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def import_account_text(self, text: str, source: str = "manual-import") -> List[Account]:
         auth_index = self.reference.build_auth_index()
@@ -165,32 +219,37 @@ class GrokManager:
 
     def _sync_relogin_credentials(self, result: LoginResult, log=None) -> None:
         try:
-            hotload_path = self.reference.sync_cpa_hotload(result.auth_file)
-        except Exception as exc:
-            if log:
-                log("[%s] CPA hotload 更新失败: %s" % (result.email, exc))
-        else:
+            try:
+                hotload_path = self.reference.sync_cpa_hotload(result.auth_file)
+            except Exception as exc:
+                if log:
+                    log("[%s] CPA hotload 更新失败: %s" % (result.email, exc))
+                raise
             if hotload_path is not None and log:
                 log("[%s] CPA hotload 已更新: %s" % (result.email, hotload_path))
 
-        account = self.store.get(result.account_id)
-        if account is None or not account.sso_token:
+            account = self.store.get(result.account_id)
+            if account is None or not account.sso_token:
+                message = "Grok2API 更新失败: 管理库没有新的 SSO token"
+                if log:
+                    log("[%s] %s" % (result.email, message))
+                raise RuntimeError(message)
+            grok_log = None
             if log:
-                log("[%s] Grok2API 更新失败: 管理库没有新的 SSO token" % result.email)
-            return
-        grok_log = None
-        if log:
-            grok_log = lambda message: log("[%s] %s" % (result.email, message))
-        try:
-            self.reference.sync_grok2api(
-                account.sso_token,
-                email=result.email,
-                log_callback=grok_log,
-                previous_token=result.previous_sso_token,
-            )
-        except Exception as exc:
-            if log:
-                log("[%s] Grok2API 更新失败: %s" % (result.email, exc))
+                grok_log = lambda message: log("[%s] %s" % (result.email, message))
+            try:
+                self.reference.sync_grok2api(
+                    account.sso_token,
+                    email=result.email,
+                    log_callback=grok_log,
+                    previous_token=result.previous_sso_token,
+                )
+            except Exception as exc:
+                if log:
+                    log("[%s] Grok2API 更新失败: %s" % (result.email, exc))
+                raise
+        finally:
+            self.login._remove_transient_auth_file(result.auth_file)
 
     @staticmethod
     def _is_wrong_password_login(result: LoginResult) -> bool:
@@ -309,11 +368,32 @@ class GrokManager:
             probe_after_login=False,
         )
 
-        def handle_result(result: LoginResult, completed: int, total: int) -> None:
+        def handle_result(result: LoginResult, completed: int, total: int):
+            final = result
             if result.ok and result.account_id:
-                self._sync_relogin_credentials(result, log=log)
+                try:
+                    self._sync_relogin_credentials(result, log=log)
+                    final = replace(result, auth_file="")
+                except Exception as exc:
+                    final = replace(
+                        result,
+                        ok=False,
+                        detail="登录成功但凭据同步失败: %s" % exc,
+                        auth_file="",
+                    )
+                    self.store.set_status(
+                        [result.account_id],
+                        AccountStatus.ERROR.value,
+                        final.detail,
+                    )
+                    if log:
+                        log("[%s] %s" % (result.email, final.detail))
+            elif result.auth_file:
+                self.login._remove_transient_auth_file(result.auth_file)
+                final = replace(result, auth_file="")
             if progress:
-                progress(result, completed, total)
+                progress(final, completed, total)
+            return final
 
         results = self.login.login_accounts(
             account_ids,

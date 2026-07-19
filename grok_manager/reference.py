@@ -247,22 +247,27 @@ class ReferenceProject:
             incoming = str(values.get(key) or "") if key in values else ""
             existing_raw = str(existing.get(key) or "")
             if key in values and not incoming and existing_raw:
-                document[key] = existing_raw
-                continue
-            raw = str(document.get(key) or "")
+                raw = existing_raw
+            else:
+                raw = str(document.get(key) or "")
             if not raw:
+                document[key] = ""
                 continue
             if vault is None or not vault.is_unlocked:
                 raise ReferenceProjectError("保存受保护注册配置前必须解锁保险库")
             if not vault.is_encrypted(raw):
                 document[key] = vault.encrypt_text(raw, "registration-config:%s" % key)
+            else:
+                document[key] = raw
         return write_private_text_atomic(
             self.config_file,
             json.dumps(document, ensure_ascii=False, indent=2) + "\n",
         )
+
     def ensure_registration_config(self) -> Path:
         if self.config_file.is_file():
-            return self.config_file
+            # Re-save so pre-vault plaintext secrets are encrypted in place.
+            return self.save_registration_config({})
         return self.save_registration_config(self.load_registration_config())
 
     def sync_cpa_hotload(self, auth_file: str | Path) -> Optional[Path]:

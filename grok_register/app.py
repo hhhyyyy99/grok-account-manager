@@ -816,20 +816,7 @@ def add_token_to_grok2api_pools(
     values = config if settings is None else settings
     remote_enabled = bool(values.get("grok2api_auto_add_remote", False))
     local_enabled = bool(values.get("grok2api_auto_add_local", True))
-    if replace_email and remote_enabled:
-        try:
-            add_token_to_grok2api_remote_pool(
-                raw_token,
-                email=email,
-                log_callback=log_callback,
-                settings=settings,
-                replace_email=True,
-                previous_token=previous_token,
-            )
-        except Exception as exc:
-            if log_callback:
-                log_callback(f"[Debug] 写入 grok2api 远端池失败: {exc}")
-            return
+    errors = []
     if local_enabled:
         try:
             add_token_to_grok2api_local_pool(
@@ -842,8 +829,9 @@ def add_token_to_grok2api_pools(
             )
         except Exception as exc:
             if log_callback:
-                log_callback(f"[Debug] 写入 grok2api 本地池失败: {exc}")
-    if remote_enabled and not replace_email:
+                log_callback(f"[!] 写入 grok2api 本地池失败: {exc}")
+            errors.append(exc)
+    if remote_enabled:
         try:
             add_token_to_grok2api_remote_pool(
                 raw_token,
@@ -854,8 +842,13 @@ def add_token_to_grok2api_pools(
                 previous_token=previous_token,
             )
         except Exception as exc:
+            prefix = "[!]" if replace_email else "[Debug]"
             if log_callback:
-                log_callback(f"[Debug] 写入 grok2api 远端池失败: {exc}")
+                log_callback(f"{prefix} 写入 grok2api 远端池失败: {exc}")
+            if replace_email:
+                errors.append(exc)
+    if errors:
+        raise errors[0]
 
 
 def append_mail_credential(email, credential):

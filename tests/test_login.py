@@ -352,7 +352,7 @@ class BatchLoginCredentialTests(unittest.TestCase):
                     return 0
 
             with patch(
-                "grok_manager.login.subprocess.Popen", return_value=FakeProcess()
+                "grok_manager.worker_runtime.subprocess.Popen", return_value=FakeProcess()
             ):
                 manager.login.login_accounts([account.id], LoginSettings())
 
@@ -506,6 +506,51 @@ class BatchLoginCredentialTests(unittest.TestCase):
                 previous_token="old-sso",
             )
 
+    def test_login_deletes_managed_auth_file_after_successful_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = make_manager(root)
+            install_fake_login_modules(manager.reference.root, "target@example.com")
+            account = manager.store.upsert(
+                AccountDraft(email="target@example.com", password="password")
+            )
+
+            result = manager.batch_login([account.id])[0]
+            auth_file = manager.reference.managed_auth_dir / "xai-target@example.com.json"
+
+            self.assertTrue(result.ok)
+            self.assertEqual("", result.auth_file)
+            self.assertFalse(auth_file.exists())
+
+    def test_login_marks_error_when_grok2api_sync_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = make_manager(root)
+            install_fake_login_modules(manager.reference.root, "target@example.com")
+            account = manager.store.upsert(
+                AccountDraft(
+                    email="target@example.com",
+                    password="password",
+                    sso_token="old-sso",
+                )
+            )
+            auth_file = manager.reference.managed_auth_dir / "xai-target@example.com.json"
+            logs = []
+
+            with patch.object(
+                manager.reference,
+                "sync_grok2api",
+                side_effect=RuntimeError("remote pool missing previous credential"),
+            ):
+                result = manager.batch_login([account.id], log=logs.append)[0]
+            stored = manager.store.get(account.id)
+
+            self.assertFalse(result.ok)
+            self.assertIn("凭据同步失败", result.detail)
+            self.assertEqual(AccountStatus.ERROR.value, stored.status if stored else "")
+            self.assertFalse(auth_file.exists())
+            self.assertTrue(any("Grok2API 更新失败" in line for line in logs))
+
     def test_login_syncs_cpa_and_grok2api_before_next_result(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -594,7 +639,7 @@ class BatchLoginCredentialTests(unittest.TestCase):
                     return 0
 
             with patch(
-                "grok_manager.login.subprocess.Popen", return_value=FakeProcess()
+                "grok_manager.worker_runtime.subprocess.Popen", return_value=FakeProcess()
             ):
                 results = manager.batch_login([account.id])
 
