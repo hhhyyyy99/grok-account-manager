@@ -7,7 +7,7 @@ import types
 import unittest
 import urllib.error
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import DrissionPage
 from grok_manager.login import LoginSettings
@@ -1320,6 +1320,7 @@ class BatchLoginCredentialTests(unittest.TestCase):
             first_fail = LoginResult(one.id, one.email, False, "邮箱或密码错误")
             second_fail = LoginResult(two.id, two.email, False, "邮箱或密码错误")
             second_ok = LoginResult(two.id, two.email, True, "批量登录成功")
+            reset_fail = PasswordResetResult(one.id, one.email, False, "reset worker boom")
             reset_ok = PasswordResetResult(two.id, two.email, True, "密码已重置")
             calls = {"login": 0}
 
@@ -1336,9 +1337,8 @@ class BatchLoginCredentialTests(unittest.TestCase):
                 return [second_ok]
 
             def fake_reset(ids, log=None, progress=None):
-                if list(ids) == [one.id]:
-                    raise RuntimeError("reset worker boom")
-                return [reset_ok]
+                self.assertEqual([one.id, two.id], list(ids))
+                return [reset_fail, reset_ok]
 
             with patch.object(manager.login, "login_accounts", side_effect=fake_login):
                 with patch.object(manager, "reset_passwords", side_effect=fake_reset):
@@ -1348,7 +1348,7 @@ class BatchLoginCredentialTests(unittest.TestCase):
 
             by_email = {item.email: item for item in results}
             self.assertFalse(by_email[one.email].ok)
-            self.assertIn("自动重置密码任务失败", by_email[one.email].detail)
+            self.assertIn("自动重置密码失败", by_email[one.email].detail)
             self.assertTrue(by_email[two.email].ok)
 
     def test_batch_login_ignores_non_canonical_password_error_messages(self) -> None:
@@ -1556,6 +1556,172 @@ class BatchLoginCredentialTests(unittest.TestCase):
                 "fresh-sso\nnewer-sso",
                 manager.vault.get_secret("pending-sso-replace:chain@example.com"),
             )
+
+    def test_batch_login_reports_missing_ids_and_preserves_request_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            first = manager.store.upsert(
+                AccountDraft(email="first@example.com", password="password")
+            )
+            second = manager.store.upsert(
+                AccountDraft(email="second@example.com", password="password")
+            )
+            first_result = LoginResult(first.id, first.email, True, "批量登录成功")
+            second_result = LoginResult(second.id, second.email, True, "批量登录成功")
+            progress_events = []
+
+            def fake_login(_ids, _settings, log=None, progress=None):
+                for index, result in enumerate((first_result, second_result), start=1):
+                    if progress:
+                        progress(result, index, 2)
+                return [first_result, second_result]
+
+            missing_id = 999999
+            with patch.object(manager.login, "login_accounts", side_effect=fake_login):
+                with patch.object(manager, "_sync_relogin_credentials", return_value=""):
+                    with patch.object(manager, "inspect_accounts", return_value=[]):
+                        results = manager.batch_login(
+                            [second.id, missing_id, first.id, second.id],
+                            progress=lambda result, completed, total: progress_events.append(
+                                (result.account_id, completed, total)
+                            ),
+                        )
+
+            self.assertEqual([second.id, missing_id, first.id], [item.account_id for item in results])
+            self.assertEqual([True, False, True], [item.ok for item in results])
+            self.assertEqual("账号不存在", results[1].detail)
+            self.assertEqual((3, 3), progress_events[-1][1:])
+
+    def test_wrong_password_recovery_uses_two_batch_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            one = manager.store.upsert(
+                AccountDraft(email="batch-one@example.com", password="old")
+            )
+            two = manager.store.upsert(
+                AccountDraft(email="batch-two@example.com", password="old")
+            )
+            failed = {
+                one.id: LoginResult(one.id, one.email, False, "邮箱或密码错误"),
+                two.id: LoginResult(two.id, two.email, False, "邮箱或密码错误"),
+            }
+            retried = {
+                one.id: LoginResult(one.id, one.email, True, "批量登录成功"),
+                two.id: LoginResult(two.id, two.email, True, "批量登录成功"),
+            }
+            login_calls = []
+
+            def fake_login(ids, _settings, log=None, progress=None):
+                requested = list(ids)
+                login_calls.append(requested)
+                source = failed if len(login_calls) == 1 else retried
+                values = [source[account_id] for account_id in requested]
+                for index, result in enumerate(values, start=1):
+                    if progress:
+                        progress(result, index, len(values))
+                return values
+
+            reset_results = [
+                PasswordResetResult(one.id, one.email, True, "密码已重置"),
+                PasswordResetResult(two.id, two.email, True, "密码已重置"),
+            ]
+            with patch.object(manager.login, "login_accounts", side_effect=fake_login):
+                with patch.object(manager, "reset_passwords", return_value=reset_results) as reset:
+                    with patch.object(manager, "_sync_relogin_credentials", return_value=""):
+                        with patch.object(manager, "inspect_accounts", return_value=[]):
+                            results = manager.batch_login([two.id, one.id])
+
+            self.assertEqual([[two.id, one.id], [two.id, one.id]], login_calls)
+            reset.assert_called_once_with([two.id, one.id], log=ANY)
+            self.assertEqual([two.id, one.id], [item.account_id for item in results])
+            self.assertTrue(all(item.ok for item in results))
+
+    def test_stale_auth_file_is_not_published_to_hotload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            account = manager.store.upsert(
+                AccountDraft(
+                    email="stale-publish@example.com",
+                    access_token="current-access",
+                    refresh_token="current-refresh",
+                )
+            )
+            auth_path = manager.reference.managed_auth_dir / "xai-stale-publish@example.com.json"
+            auth_path.parent.mkdir(parents=True, exist_ok=True)
+            auth_path.write_text(
+                json.dumps(
+                    {
+                        "email": account.email,
+                        "access_token": "stale-access",
+                        "refresh_token": "stale-refresh",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.object(manager.reference, "sync_cpa_hotload") as sync:
+                hotload_path = manager._sync_hotload_path(auth_path, account.id)
+
+            self.assertIsNone(hotload_path)
+            sync.assert_not_called()
+            manager._remove_managed_auth_file(auth_path)
+
+
+    def test_remint_success_discards_result_after_concurrent_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            account = manager.store.upsert(
+                AccountDraft(
+                    email="remint-cas@example.com",
+                    access_token="old-access",
+                    refresh_token="stable-refresh",
+                )
+            )
+            snapshot = manager.store.get(account.id)
+            manager.login._remint_expected_snapshot = {
+                account.id: {
+                    "access": snapshot.access_token if snapshot else "",
+                    "refresh": snapshot.refresh_token if snapshot else "",
+                    "cpa_updated_at": snapshot.cpa_updated_at if snapshot else "",
+                }
+            }
+            auth_path = manager.reference.managed_auth_dir / "xai-remint-cas@example.com.json"
+            auth_path.parent.mkdir(parents=True, exist_ok=True)
+            auth_path.write_text(
+                json.dumps(
+                    {
+                        "email": account.email,
+                        "access_token": "stale-remint-access",
+                        "refresh_token": "stale-remint-refresh",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manager.store.apply_cpa_credentials(
+                account.id,
+                "concurrent-access",
+                "stable-refresh",
+                "2099-01-01T00:00:00Z",
+                "",
+            )
+
+            result = manager.login._handle_remint_result(
+                json.dumps(
+                    {
+                        "id": account.id,
+                        "email": account.email,
+                        "ok": True,
+                        "path": str(auth_path),
+                    }
+                )
+            )
+
+            stored = manager.store.get(account.id)
+            self.assertTrue(result.ok)
+            self.assertIn("并发任务更新", result.detail)
+            self.assertEqual("concurrent-access", stored.access_token if stored else "")
+            self.assertFalse(auth_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

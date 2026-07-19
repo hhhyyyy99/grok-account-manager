@@ -9,7 +9,7 @@ import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator, Mapping, Optional
+from typing import Callable, Iterator, Mapping, Optional
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -105,6 +105,7 @@ def interprocess_lock(
     data_root: Path | None = None,
     *,
     timeout_seconds: float = 300.0,
+    cancelled: Optional[Callable[[], bool]] = None,
 ) -> Iterator[None]:
     """Cross-process exclusive lock for CPA sync/guardian (Unix fcntl / Windows msvcrt)."""
     import time
@@ -134,6 +135,8 @@ def interprocess_lock(
                     locked = True
                     break
                 except OSError:
+                    if cancelled and cancelled():
+                        raise InterruptedError("获取跨进程锁已取消: %s" % lock_path)
                     if time.monotonic() >= deadline:
                         raise TimeoutError("获取跨进程锁超时: %s" % lock_path)
                     time.sleep(0.05)
@@ -146,6 +149,8 @@ def interprocess_lock(
                     locked = True
                     break
                 except BlockingIOError:
+                    if cancelled and cancelled():
+                        raise InterruptedError("获取跨进程锁已取消: %s" % lock_path)
                     if time.monotonic() >= deadline:
                         raise TimeoutError("获取跨进程锁超时: %s" % lock_path)
                     time.sleep(0.05)

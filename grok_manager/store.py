@@ -500,38 +500,31 @@ class AccountStore:
     def mark_cpa_expired_if_refresh_unchanged(
         self,
         account_id: int,
-        expected_refresh: str,
+        expected_refresh: Optional[str],
         detail: str = "CPA 凭据已过期",
         *,
-        expected_access: str = "",
-        expected_cpa_updated_at: str = "",
+        expected_access: Optional[str] = None,
+        expected_cpa_updated_at: Optional[str] = None,
     ) -> bool:
-        """Atomically expire only when CPA material still matches the expected snapshot.
+        """Expire only when every provided CPA snapshot field still matches.
 
-        Empty expected_refresh only expires accounts that still lack a refresh token.
-        When expected_access / expected_cpa_updated_at are provided, any concurrent
-        rotation that changed those fields also aborts the expire.
+        None means the field was not included in the snapshot. An empty string is an
+        explicit snapshot value and must compare equal exactly.
         """
         with self.account_lock(account_id):
             account = self.get(account_id)
             if account is None:
                 return False
             current_refresh = str(account.refresh_token or "").strip()
-            expected_refresh = str(expected_refresh or "").strip()
-            if expected_refresh:
-                if current_refresh and current_refresh != expected_refresh:
-                    return False
-            elif current_refresh:
+            if expected_refresh is not None and current_refresh != str(expected_refresh).strip():
                 return False
-            expected_access = str(expected_access or "").strip()
-            if expected_access:
+            if expected_access is not None:
                 current_access = str(account.access_token or "").strip()
-                if current_access and current_access != expected_access:
+                if current_access != str(expected_access).strip():
                     return False
-            expected_stamp = str(expected_cpa_updated_at or "").strip()
-            if expected_stamp:
+            if expected_cpa_updated_at is not None:
                 current_stamp = str(account.cpa_updated_at or "").strip()
-                if current_stamp and current_stamp != expected_stamp:
+                if current_stamp != str(expected_cpa_updated_at).strip():
                     return False
             self._mark_cpa_expired_unlocked(account_id, detail)
             return True
@@ -581,8 +574,14 @@ class AccountStore:
             observed_cpa_updated = str(
                 getattr(result, "observed_cpa_updated_at", "") or ""
             ).strip()
+            observed_sso = str(getattr(result, "observed_sso_token", "") or "").strip()
+            observed_last_login = str(
+                getattr(result, "observed_last_login_at", "") or ""
+            ).strip()
             current_access = str(current.access_token or "").strip()
             current_stamp = str(current.cpa_updated_at or "").strip()
+            current_sso = str(current.sso_token or "").strip()
+            current_last_login = str(current.last_login_at or "").strip()
             if bool(getattr(result, "cpa_snapshot", False)):
                 # Empty observation means the probe saw no CPA material; refuse to
                 # overwrite an account that gained CPA credentials after the probe.
@@ -606,6 +605,14 @@ class AccountStore:
                     and current_stamp
                     and observed_cpa_updated != current_stamp
                 ):
+                    return
+            if bool(getattr(result, "sso_snapshot", False)):
+                if observed_sso != current_sso or observed_last_login != current_last_login:
+                    return
+            elif observed_sso or observed_last_login:
+                if observed_sso and observed_sso != current_sso:
+                    return
+                if observed_last_login and observed_last_login != current_last_login:
                     return
             with self._connect() as conn:
                 conn.execute(

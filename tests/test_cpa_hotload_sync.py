@@ -722,5 +722,86 @@ class CpaHotloadSyncTests(unittest.TestCase):
             )
 
 
+    def test_empty_snapshot_fields_reject_concurrent_cpa_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            account = manager.store.upsert(
+                AccountDraft(
+                    email="empty-cas@example.com",
+                    refresh_token="stable-refresh",
+                )
+            )
+            with manager.store._connect() as conn:
+                conn.execute(
+                    "UPDATE accounts SET access_token = '', cpa_updated_at = '' WHERE id = ?",
+                    (account.id,),
+                )
+            snapshot = manager.store.get(account.id)
+            manager.store.apply_cpa_credentials(
+                account.id,
+                "new-access",
+                "stable-refresh",
+                _future_iso(9000),
+                "",
+            )
+
+            marked = manager.store.mark_cpa_expired_if_refresh_unchanged(
+                account.id,
+                snapshot.refresh_token if snapshot else "",
+                "stale failure",
+                expected_access=snapshot.access_token if snapshot else "",
+                expected_cpa_updated_at=snapshot.cpa_updated_at if snapshot else "",
+            )
+
+            stored = manager.store.get(account.id)
+            self.assertFalse(marked)
+            self.assertEqual("new-access", stored.access_token if stored else "")
+            self.assertNotEqual(
+                AccountStatus.EXPIRED.value,
+                stored.cpa_status if stored else AccountStatus.EXPIRED.value,
+            )
+
+    def test_stale_inspection_does_not_overwrite_new_sso_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            account = manager.store.upsert(
+                AccountDraft(
+                    email="stale-sso-inspect@example.com",
+                    password="password",
+                    sso_token="old-sso",
+                    source_modified_at=_past_iso(100),
+                )
+            )
+            snapshot = manager.store.get(account.id)
+            manager.store.upsert(
+                AccountDraft(
+                    email=account.email,
+                    sso_token="new-sso",
+                    source_modified_at=_future_iso(100),
+                )
+            )
+
+            manager.store.apply_inspection(
+                InspectionResult(
+                    account_id=account.id,
+                    status=AccountStatus.EXPIRED.value,
+                    detail="stale SSO probe",
+                    checked_at=_future_iso(0),
+                    sso_status=AccountStatus.EXPIRED.value,
+                    sso_detail="expired",
+                    observed_sso_token=snapshot.sso_token if snapshot else "",
+                    observed_last_login_at=snapshot.last_login_at if snapshot else "",
+                    sso_snapshot=True,
+                )
+            )
+
+            stored = manager.store.get(account.id)
+            self.assertEqual("new-sso", stored.sso_token if stored else "")
+            self.assertNotEqual(
+                AccountStatus.EXPIRED.value,
+                stored.sso_status if stored else AccountStatus.EXPIRED.value,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

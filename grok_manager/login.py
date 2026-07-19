@@ -35,7 +35,7 @@ class BatchLoginService:
         self.store = store
         self.project = project
         self.python_executable = python_executable
-        self._remint_expected_snapshot: Dict[int, Dict[str, str]] = {}
+        self._remint_expected_snapshot: Dict[int, Dict[str, Optional[str]]] = {}
         self._worker = BatchWorkerProcess(
             project,
             python_executable,
@@ -58,7 +58,16 @@ class BatchLoginService:
         progress: Optional[ProgressCallback] = None,
     ) -> List[LoginResult]:
         log = log or (lambda _: None)
-        accounts = self.store.get_many(list(account_ids))
+        requested_ids: List[int] = []
+        seen_ids: set[int] = set()
+        for value in account_ids:
+            account_id = int(value or 0)
+            if account_id > 0 and account_id not in seen_ids:
+                seen_ids.add(account_id)
+                requested_ids.append(account_id)
+        fetched = self.store.get_many(requested_ids)
+        by_id = {account.id: account for account in fetched}
+        accounts = [by_id[account_id] for account_id in requested_ids if account_id in by_id]
         if not accounts:
             return []
         ready = [account for account in accounts if account.has_login_credentials]
@@ -114,8 +123,8 @@ class BatchLoginService:
             completed += 1
             if progress:
                 progress(result, completed, total)
-        results.sort(key=lambda item: item.account_id)
-        return results
+        results_by_id = {result.account_id: result for result in results}
+        return [results_by_id[account_id] for account_id in requested_ids if account_id in results_by_id]
 
     def remint_cpa_via_sso(
         self,
@@ -126,7 +135,16 @@ class BatchLoginService:
     ) -> List[CpaRefreshResult]:
         """Remint CPA tokens by injecting a live SSO cookie into device OAuth."""
         log = log or (lambda _: None)
-        accounts = self.store.get_many(list(account_ids))
+        requested_ids: List[int] = []
+        seen_ids: set[int] = set()
+        for value in account_ids:
+            account_id = int(value or 0)
+            if account_id > 0 and account_id not in seen_ids:
+                seen_ids.add(account_id)
+                requested_ids.append(account_id)
+        fetched = self.store.get_many(requested_ids)
+        by_id = {account.id: account for account in fetched}
+        accounts = [by_id[account_id] for account_id in requested_ids if account_id in by_id]
         if not accounts:
             return []
         ready = [account for account in accounts if str(account.sso_token or "").strip()]
@@ -212,8 +230,8 @@ class BatchLoginService:
             completed += 1
             if progress:
                 progress(result, completed, total)
-        results.sort(key=lambda item: item.account_id)
-        return results
+        results_by_id = {result.account_id: result for result in results}
+        return [results_by_id[account_id] for account_id in requested_ids if account_id in results_by_id]
 
     def _worker_account(self, account: Account) -> Dict[str, Any]:
         return {
@@ -317,9 +335,9 @@ class BatchLoginService:
             or ("通过 SSO 重新签发 CPA 凭据" if ok else "SSO 续期失败")
         )
         expected = (getattr(self, "_remint_expected_snapshot", {}) or {}).get(account_id) or {}
-        expected_refresh = str(expected.get("refresh") or "")
-        expected_access = str(expected.get("access") or "")
-        expected_cpa_updated_at = str(expected.get("cpa_updated_at") or "")
+        expected_refresh = expected.get("refresh") if expected else None
+        expected_access = expected.get("access") if expected else None
+        expected_cpa_updated_at = expected.get("cpa_updated_at") if expected else None
         if ok:
             try:
                 account = self.store.get(account_id)
@@ -327,6 +345,20 @@ class BatchLoginService:
                     raise ValueError("SSO 续期结果对应的账号不存在")
                 if account.email.casefold() != email.strip().casefold():
                     raise ValueError("SSO 续期结果邮箱与账号不匹配")
+                if expected is not None:
+                    current_snapshot = {
+                        "refresh": str(account.refresh_token or "").strip(),
+                        "access": str(account.access_token or "").strip(),
+                        "cpa_updated_at": str(getattr(account, "cpa_updated_at", "") or "").strip(),
+                    }
+                    if current_snapshot != expected:
+                        self._remove_transient_auth_file(auth_file)
+                        return CpaRefreshResult(
+                            account_id,
+                            email,
+                            True,
+                            "凭据已由并发任务更新，丢弃本次旧 SSO 续期结果",
+                        )
                 auth = json.loads(Path(auth_file).read_text(encoding="utf-8-sig"))
                 auth_email = str(auth.get("email") or "").strip()
                 if auth_email and account.email.casefold() != auth_email.casefold():

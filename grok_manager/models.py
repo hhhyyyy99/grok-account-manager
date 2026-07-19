@@ -129,6 +129,10 @@ class InspectionResult:
     observed_cpa_updated_at: str = ""
     # True when TokenInspector recorded a CPA snapshot for CAS on apply.
     cpa_snapshot: bool = False
+    # Snapshot of SSO material used for this probe; apply is skipped if changed.
+    observed_sso_token: str = ""
+    observed_last_login_at: str = ""
+    sso_snapshot: bool = False
 
 
 @dataclass(frozen=True)
