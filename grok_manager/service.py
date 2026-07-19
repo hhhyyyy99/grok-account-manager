@@ -555,68 +555,6 @@ class GrokManager:
         finally:
             self.login._remove_transient_auth_file(result.auth_file)
 
-    @staticmethod
-    def _is_wrong_password_login(result: LoginResult) -> bool:
-        if result.ok:
-            return False
-        # Only the canonical browser signal may trigger auto password reset.
-        detail = str(result.detail or "").strip()
-        return detail == "邮箱或密码错误" or detail.endswith("邮箱或密码错误")
-
-    def _reset_and_relogin_wrong_password(
-        self,
-        result: LoginResult,
-        *,
-        log,
-        cancelled=None,
-    ) -> LoginResult:
-        """Reset + re-login one wrong-password account to a final settled result."""
-        log = log or (lambda _message: None)
-        account_id = int(result.account_id or 0)
-        if cancelled and cancelled():
-            return replace(result, detail="%s；任务已取消，跳过自动恢复" % result.detail)
-        if not account_id:
-            return result
-        log("[%s] 登录密码错误，开始自动重置密码" % result.email)
-        try:
-            reset_results = self.reset_passwords([account_id], log=log)
-        except Exception as exc:
-            log("[%s] 自动重置密码任务失败: %s" % (result.email, exc))
-            return replace(
-                result,
-                detail="%s；自动重置密码任务失败：%s" % (result.detail, exc),
-            )
-        reset_result = reset_results[0] if reset_results else None
-        if reset_result is None:
-            return replace(result, detail="%s；自动重置密码未返回结果" % result.detail)
-        if not reset_result.ok:
-            return replace(
-                result,
-                detail="%s；自动重置密码失败：%s" % (result.detail, reset_result.detail),
-            )
-        log("[%s] 密码已重置，开始使用新密码重新登录" % result.email)
-        if cancelled and cancelled():
-            return replace(result, detail="密码已重置，但任务已取消，跳过重新登录")
-        try:
-            retries = self.batch_login(
-                [account_id],
-                log=log,
-                progress=None,
-                auto_reset_password=False,
-                _skip_review=True,
-                cancelled=cancelled,
-            )
-        except Exception as exc:
-            log("[%s] 自动重置后重新登录失败: %s" % (result.email, exc))
-            return replace(
-                result,
-                detail="密码已重置，但重新登录失败：%s" % exc,
-            )
-        retry = retries[0] if retries else None
-        if retry is None:
-            return replace(result, detail="密码已重置，但重新登录未返回结果")
-        return replace(retry, detail="自动重置密码后：%s" % retry.detail)
-
     def batch_login(
         self,
         account_ids: Iterable[int],
@@ -644,7 +582,6 @@ class GrokManager:
         ]
         total_accounts = len(requested_ids)
         settled = {"count": 0}
-        pending_reset: Dict[int, LoginResult] = {}
         if not requested_ids:
             return []
         if cancelled and cancelled():
@@ -664,6 +601,9 @@ class GrokManager:
         if not ids:
             return missing_results
         registration_config = self.reference.load_registration_config()
+        # Wrong-password recovery runs inline in the login worker thread so a password
+        # error starts reset immediately without waiting for the rest of the batch,
+        # and without nesting another BatchWorkerProcess.
         settings = LoginSettings(
             workers=self.config.login_workers,
             timeout_seconds=self.config.login_timeout_seconds,
@@ -674,6 +614,7 @@ class GrokManager:
                 or "https://cli-chat-proxy.grok.com/v1"
             ),
             probe_after_login=False,
+            auto_reset_password=bool(auto_reset_password),
         )
 
         def handle_result(result: LoginResult, _completed: int, _total: int):
@@ -700,17 +641,6 @@ class GrokManager:
                 self.login._remove_transient_auth_file(result.auth_file)
                 final = replace(result, auth_file="")
 
-            if auto_reset_password and self._is_wrong_password_login(final):
-                # Keep progress below N/N until reset+relogin settles this account.
-                pending_reset[int(final.account_id)] = final
-                if progress:
-                    progress(
-                        replace(final, detail="邮箱或密码错误，等待自动重置密码"),
-                        settled["count"],
-                        total_accounts or 1,
-                    )
-                return final
-
             settled["count"] += 1
             if progress:
                 progress(final, settled["count"], total_accounts or 1)
@@ -722,100 +652,16 @@ class GrokManager:
             log=log,
             progress=handle_result,
         )
-
-        if auto_reset_password and pending_reset:
-            by_id = {
-                int(result.account_id): result
-                for result in results
-                if int(result.account_id or 0)
-            }
-            pending_ids = [account_id for account_id in ids if account_id in pending_reset]
-            reset_results: List[PasswordResetResult] = []
-            reset_by_id: Dict[int, PasswordResetResult] = {}
-            retry_results: List[LoginResult] = []
-            if cancelled and cancelled():
-                log("任务已取消，跳过 %s 个密码错误账号的自动重置" % len(pending_ids))
-            else:
-                log(
-                    "检测到 %s 个账号邮箱或密码错误，开始批量自动重置密码并重新登录"
-                    % len(pending_ids)
-                )
-                try:
-                    reset_results = self.reset_passwords(pending_ids, log=log)
-                except Exception as exc:
-                    log("自动批量重置密码任务失败: %s" % exc)
-                reset_by_id = {int(item.account_id): item for item in reset_results}
-                retry_ids = [
-                    account_id
-                    for account_id in pending_ids
-                    if reset_by_id.get(account_id) is not None
-                    and reset_by_id[account_id].ok
-                ]
-                if retry_ids and not (cancelled and cancelled()):
-                    try:
-                        retry_results = self.batch_login(
-                            retry_ids,
-                            log=log,
-                            progress=None,
-                            auto_reset_password=False,
-                            _skip_review=True,
-                            cancelled=cancelled,
-                        )
-                    except Exception as exc:
-                        log("自动批量重置后重新登录失败: %s" % exc)
-            retry_by_id = {int(item.account_id): item for item in retry_results}
-            for account_id, failed in pending_reset.items():
-                if cancelled and cancelled():
-                    settled_result = replace(
-                        failed,
-                        detail="%s；任务已取消，跳过自动恢复" % failed.detail,
-                    )
-                elif not reset_results and account_id not in reset_by_id:
-                    settled_result = replace(
-                        failed,
-                        detail="%s；自动批量重置密码任务失败或未返回结果" % failed.detail,
-                    )
-                else:
-                    reset_result = reset_by_id.get(account_id)
-                    if reset_result is None:
-                        settled_result = replace(
-                            failed,
-                            detail="%s；自动重置密码未返回结果" % failed.detail,
-                        )
-                    elif not reset_result.ok:
-                        settled_result = replace(
-                            failed,
-                            detail="%s；自动重置密码失败：%s"
-                            % (failed.detail, reset_result.detail),
-                        )
-                    else:
-                        retry = retry_by_id.get(account_id)
-                        if retry is None:
-                            settled_result = replace(
-                                failed,
-                                detail="密码已重置，但重新登录未返回结果",
-                            )
-                        else:
-                            settled_result = replace(
-                                retry,
-                                detail="自动重置密码后：%s" % retry.detail,
-                            )
-                by_id[account_id] = settled_result
-                settled["count"] += 1
-                if progress:
-                    progress(settled_result, settled["count"], total_accounts or 1)
-            results = [
-                by_id[account_id]
-                for account_id in requested_ids
-                if account_id in by_id
-            ]
-        else:
-            by_id = {int(result.account_id): result for result in results if int(result.account_id or 0)}
-            results = [
-                by_id[account_id]
-                for account_id in requested_ids
-                if account_id in by_id
-            ]
+        by_id = {
+            int(result.account_id): result
+            for result in results
+            if int(result.account_id or 0)
+        }
+        results = [
+            by_id[account_id]
+            for account_id in requested_ids
+            if account_id in by_id
+        ]
 
         if _skip_review:
             return results

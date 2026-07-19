@@ -7,11 +7,11 @@ import types
 import unittest
 import urllib.error
 from pathlib import Path
-from unittest.mock import ANY, patch
+from unittest.mock import patch
 
 import DrissionPage
 from grok_manager.login import LoginSettings
-from grok_manager.models import AccountDraft, AccountStatus, LoginResult, PasswordResetResult
+from grok_manager.models import AccountDraft, AccountStatus, LoginResult
 from grok_manager.paths import MANAGED_AUTH_DIR
 from grok_register.cpa_xai import browser_confirm, oauth_device
 from grok_register.paths import TURNSTILE_DIR
@@ -1187,49 +1187,47 @@ class BatchLoginCredentialTests(unittest.TestCase):
             reset_passwords.assert_not_called()
             self.assertEqual((False, "安全验证未完成"), (result.ok, result.detail))
 
-    def test_batch_login_auto_resets_wrong_password_and_retries_once(self) -> None:
+    def test_batch_login_enables_worker_auto_reset_settings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = make_manager(Path(directory))
             account = manager.store.upsert(
                 AccountDraft(email="wrong-password@example.com", password="old-password")
             )
-            first = LoginResult(account.id, account.email, False, "邮箱或密码错误")
-            retried = LoginResult(account.id, account.email, True, "批量登录成功")
-            reset = PasswordResetResult(account.id, account.email, True, "密码已重置")
-            calls = []
+            recovered = LoginResult(
+                account.id,
+                account.email,
+                True,
+                "自动重置密码后：批量登录成功",
+            )
+            captured = {}
             progress_events = []
 
-            def fake_login(_ids, _settings, log=None, progress=None):
-                calls.append(list(_ids))
-                result = first if len(calls) == 1 else retried
+            def fake_login(ids, settings, log=None, progress=None):
+                captured["ids"] = list(ids)
+                captured["settings"] = settings
                 if progress:
-                    progress(result, 1, 1)
-                return [result]
+                    progress(recovered, 1, 1)
+                return [recovered]
 
-            logs = []
             with patch.object(manager.login, "login_accounts", side_effect=fake_login):
-                with patch.object(manager, "reset_passwords", return_value=[reset]) as reset_passwords:
-                    with patch.object(manager, "_sync_relogin_credentials"):
+                with patch.object(manager, "reset_passwords") as reset_passwords:
+                    with patch.object(manager, "_sync_relogin_credentials", return_value=""):
                         with patch.object(manager, "inspect_accounts", return_value=[]):
                             results = manager.batch_login(
                                 [account.id],
-                                log=logs.append,
                                 progress=lambda result, completed, total: progress_events.append(
                                     (completed, total, result.detail, result.ok)
                                 ),
                             )
 
-            self.assertEqual(2, len(calls))
-            self.assertEqual([[account.id], [account.id]], calls)
-            reset_passwords.assert_called_once_with([account.id], log=logs.append)
-            self.assertEqual(True, results[0].ok)
+            self.assertEqual([account.id], captured["ids"])
+            self.assertTrue(captured["settings"].auto_reset_password)
+            reset_passwords.assert_not_called()
+            self.assertTrue(results[0].ok)
             self.assertIn("自动重置密码后", results[0].detail)
-            self.assertTrue(any("邮箱或密码错误" in line for line in logs))
-            # Wrong-password result must not advance to 1/1 before reset+relogin settles.
-            self.assertTrue(any(item[0] == 0 for item in progress_events))
             self.assertEqual((1, 1, True), (progress_events[-1][0], progress_events[-1][1], progress_events[-1][3]))
 
-    def test_batch_login_wrong_password_does_not_mark_batch_complete_early(self) -> None:
+    def test_batch_login_worker_settled_recovery_advances_progress_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = make_manager(Path(directory))
             good = manager.store.upsert(
@@ -1239,27 +1237,24 @@ class BatchLoginCredentialTests(unittest.TestCase):
                 AccountDraft(email="bad@example.com", password="old-password")
             )
             good_result = LoginResult(good.id, good.email, True, "批量登录成功")
-            bad_result = LoginResult(bad.id, bad.email, False, "邮箱或密码错误")
-            retried = LoginResult(bad.id, bad.email, True, "批量登录成功")
-            reset = PasswordResetResult(bad.id, bad.email, True, "密码已重置")
+            recovered = LoginResult(
+                bad.id, bad.email, True, "自动重置密码后：批量登录成功"
+            )
             progress_events = []
             login_calls = []
 
-            def fake_login(ids, _settings, log=None, progress=None):
+            def fake_login(ids, settings, log=None, progress=None):
                 login_calls.append(list(ids))
-                if login_calls and len(login_calls) == 1 and set(ids) == {good.id, bad.id}:
-                    # Emulate worker completing both accounts in order.
-                    if progress:
-                        progress(good_result, 1, 2)
-                        progress(bad_result, 2, 2)
-                    return [good_result, bad_result]
+                self.assertTrue(settings.auto_reset_password)
+                # Worker emits only final settled results; recovery is internal.
                 if progress:
-                    progress(retried, 1, 1)
-                return [retried]
+                    progress(good_result, 1, 2)
+                    progress(recovered, 2, 2)
+                return [good_result, recovered]
 
             with patch.object(manager.login, "login_accounts", side_effect=fake_login):
-                with patch.object(manager, "reset_passwords", return_value=[reset]):
-                    with patch.object(manager, "_sync_relogin_credentials"):
+                with patch.object(manager, "reset_passwords") as reset_passwords:
+                    with patch.object(manager, "_sync_relogin_credentials", return_value=""):
                         with patch.object(manager, "inspect_accounts", return_value=[]):
                             results = manager.batch_login(
                                 [good.id, bad.id],
@@ -1268,31 +1263,21 @@ class BatchLoginCredentialTests(unittest.TestCase):
                                 ),
                             )
 
-            # After first-pass good login, progress is 1/2 — never jumps to 2/2 on bad password.
-            first_pass_counts = [item[0] for item in progress_events if item[1] == 2]
-            self.assertIn(1, first_pass_counts)
-            self.assertNotIn(2, first_pass_counts[:2])
-            # Final settled progress reaches 2/2 only after reset+relogin.
+            reset_passwords.assert_not_called()
+            self.assertEqual(1, len(login_calls))
             self.assertEqual(2, progress_events[-1][0])
             self.assertEqual(2, progress_events[-1][1])
             self.assertTrue(all(item.ok for item in results))
-            self.assertEqual(2, len(login_calls))
 
-    def test_batch_login_skips_auto_reset_when_cancelled(self) -> None:
+    def test_batch_login_skips_worker_when_cancelled(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = make_manager(Path(directory))
             account = manager.store.upsert(
                 AccountDraft(email="cancel-reset@example.com", password="old-password")
             )
-            failed = LoginResult(account.id, account.email, False, "邮箱或密码错误")
             progress_events = []
 
-            def fake_login(_ids, _settings, log=None, progress=None):
-                if progress:
-                    progress(failed, 1, 1)
-                return [failed]
-
-            with patch.object(manager.login, "login_accounts", side_effect=fake_login):
+            with patch.object(manager.login, "login_accounts") as login_accounts:
                 with patch.object(manager, "reset_passwords") as reset_passwords:
                     with patch.object(manager, "inspect_accounts", return_value=[]):
                         results = manager.batch_login(
@@ -1303,12 +1288,13 @@ class BatchLoginCredentialTests(unittest.TestCase):
                             cancelled=lambda: True,
                         )
 
+            login_accounts.assert_not_called()
             reset_passwords.assert_not_called()
             self.assertFalse(results[0].ok)
             self.assertIn("任务已取消", results[0].detail)
             self.assertEqual(1, progress_events[-1][0])
 
-    def test_batch_login_relogin_exception_does_not_abort_batch(self) -> None:
+    def test_batch_login_preserves_mixed_worker_recovery_results(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = make_manager(Path(directory))
             one = manager.store.upsert(
@@ -1317,63 +1303,66 @@ class BatchLoginCredentialTests(unittest.TestCase):
             two = manager.store.upsert(
                 AccountDraft(email="two@example.com", password="old")
             )
-            first_fail = LoginResult(one.id, one.email, False, "邮箱或密码错误")
-            second_fail = LoginResult(two.id, two.email, False, "邮箱或密码错误")
-            second_ok = LoginResult(two.id, two.email, True, "批量登录成功")
-            reset_fail = PasswordResetResult(one.id, one.email, False, "reset worker boom")
-            reset_ok = PasswordResetResult(two.id, two.email, True, "密码已重置")
-            calls = {"login": 0}
+            first_fail = LoginResult(
+                one.id,
+                one.email,
+                False,
+                "邮箱或密码错误；自动重置密码失败：reset worker boom",
+            )
+            second_ok = LoginResult(
+                two.id, two.email, True, "自动重置密码后：批量登录成功"
+            )
 
-            def fake_login(ids, _settings, log=None, progress=None):
-                calls["login"] += 1
-                if calls["login"] == 1:
+            def fake_login(ids, settings, log=None, progress=None):
+                self.assertTrue(settings.auto_reset_password)
+                values = [first_fail, second_ok]
+                for index, result in enumerate(values, start=1):
                     if progress:
-                        progress(first_fail, 1, 2)
-                        progress(second_fail, 2, 2)
-                    return [first_fail, second_fail]
-                # Second login batch is for a single recovered account.
-                if progress:
-                    progress(second_ok, 1, 1)
-                return [second_ok]
-
-            def fake_reset(ids, log=None, progress=None):
-                self.assertEqual([one.id, two.id], list(ids))
-                return [reset_fail, reset_ok]
+                        progress(result, index, 2)
+                return values
 
             with patch.object(manager.login, "login_accounts", side_effect=fake_login):
-                with patch.object(manager, "reset_passwords", side_effect=fake_reset):
-                    with patch.object(manager, "_sync_relogin_credentials"):
+                with patch.object(manager, "reset_passwords") as reset_passwords:
+                    with patch.object(manager, "_sync_relogin_credentials", return_value=""):
                         with patch.object(manager, "inspect_accounts", return_value=[]):
                             results = manager.batch_login([one.id, two.id])
 
+            reset_passwords.assert_not_called()
             by_email = {item.email: item for item in results}
             self.assertFalse(by_email[one.email].ok)
             self.assertIn("自动重置密码失败", by_email[one.email].detail)
             self.assertTrue(by_email[two.email].ok)
 
-    def test_batch_login_ignores_non_canonical_password_error_messages(self) -> None:
+    def test_batch_login_disables_auto_reset_when_requested(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = make_manager(Path(directory))
             account = manager.store.upsert(
                 AccountDraft(email="variant@example.com", password="old-password")
             )
-            # Only the canonical browser signal may trigger auto-reset.
             first = LoginResult(
                 account.id,
                 account.email,
                 False,
                 "The email or password you entered is incorrect.",
             )
-            logs = []
-            with patch.object(manager.login, "login_accounts", return_value=[first]):
+            captured = {}
+            with patch.object(
+                manager.login,
+                "login_accounts",
+                side_effect=lambda ids, settings, log=None, progress=None: (
+                    captured.update({"settings": settings}) or [first]
+                ),
+            ):
                 with patch.object(manager, "reset_passwords") as reset_passwords:
                     with patch.object(manager, "inspect_accounts", return_value=[]):
-                        results = manager.batch_login([account.id], log=logs.append)
+                        results = manager.batch_login(
+                            [account.id], auto_reset_password=False
+                        )
 
+            self.assertFalse(captured["settings"].auto_reset_password)
             reset_passwords.assert_not_called()
             self.assertFalse(results[0].ok)
             self.assertEqual(first.detail, results[0].detail)
-            self.assertFalse(any("自动重置密码" in line for line in logs))
 
     def test_pending_sso_replace_is_remembered_across_sync_failures(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1592,7 +1581,7 @@ class BatchLoginCredentialTests(unittest.TestCase):
             self.assertEqual("账号不存在", results[1].detail)
             self.assertEqual((3, 3), progress_events[-1][1:])
 
-    def test_wrong_password_recovery_uses_two_batch_workers(self) -> None:
+    def test_wrong_password_recovery_is_delegated_to_single_login_worker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = make_manager(Path(directory))
             one = manager.store.upsert(
@@ -1601,38 +1590,34 @@ class BatchLoginCredentialTests(unittest.TestCase):
             two = manager.store.upsert(
                 AccountDraft(email="batch-two@example.com", password="old")
             )
-            failed = {
-                one.id: LoginResult(one.id, one.email, False, "邮箱或密码错误"),
-                two.id: LoginResult(two.id, two.email, False, "邮箱或密码错误"),
-            }
-            retried = {
-                one.id: LoginResult(one.id, one.email, True, "批量登录成功"),
-                two.id: LoginResult(two.id, two.email, True, "批量登录成功"),
+            recovered = {
+                one.id: LoginResult(
+                    one.id, one.email, True, "自动重置密码后：批量登录成功"
+                ),
+                two.id: LoginResult(
+                    two.id, two.email, True, "自动重置密码后：批量登录成功"
+                ),
             }
             login_calls = []
 
-            def fake_login(ids, _settings, log=None, progress=None):
+            def fake_login(ids, settings, log=None, progress=None):
                 requested = list(ids)
                 login_calls.append(requested)
-                source = failed if len(login_calls) == 1 else retried
-                values = [source[account_id] for account_id in requested]
+                self.assertTrue(settings.auto_reset_password)
+                values = [recovered[account_id] for account_id in requested]
                 for index, result in enumerate(values, start=1):
                     if progress:
                         progress(result, index, len(values))
                 return values
 
-            reset_results = [
-                PasswordResetResult(one.id, one.email, True, "密码已重置"),
-                PasswordResetResult(two.id, two.email, True, "密码已重置"),
-            ]
             with patch.object(manager.login, "login_accounts", side_effect=fake_login):
-                with patch.object(manager, "reset_passwords", return_value=reset_results) as reset:
+                with patch.object(manager, "reset_passwords") as reset:
                     with patch.object(manager, "_sync_relogin_credentials", return_value=""):
                         with patch.object(manager, "inspect_accounts", return_value=[]):
                             results = manager.batch_login([two.id, one.id])
 
-            self.assertEqual([[two.id, one.id], [two.id, one.id]], login_calls)
-            reset.assert_called_once_with([two.id, one.id], log=ANY)
+            self.assertEqual([[two.id, one.id]], login_calls)
+            reset.assert_not_called()
             self.assertEqual([two.id, one.id], [item.account_id for item in results])
             self.assertTrue(all(item.ok for item in results))
 
@@ -1721,6 +1706,143 @@ class BatchLoginCredentialTests(unittest.TestCase):
             self.assertIn("并发任务更新", result.detail)
             self.assertEqual("concurrent-access", stored.access_token if stored else "")
             self.assertFalse(auth_path.exists())
+
+
+
+class ImmediateWrongPasswordRecoveryTests(unittest.TestCase):
+    def test_is_wrong_password_error_only_canonical(self) -> None:
+        from grok_manager.reference_worker import is_wrong_password_error
+
+        self.assertTrue(is_wrong_password_error("邮箱或密码错误"))
+        self.assertTrue(is_wrong_password_error("前缀：邮箱或密码错误"))
+        self.assertFalse(is_wrong_password_error("The email or password you entered is incorrect."))
+        self.assertFalse(is_wrong_password_error("安全验证未完成"))
+
+    def test_recover_wrong_password_resets_then_relogins_once(self) -> None:
+        from grok_manager import reference_worker
+
+        item = {
+            "id": 7,
+            "email": "bad@example.com",
+            "password": "old",
+            "mail_credential": "jwt",
+            "auth_dir": "/tmp",
+        }
+        settings = {"default_auth_dir": "/tmp", "timeout_seconds": 60}
+        calls = {"login": 0, "reset": 0}
+        events = []
+
+        def fake_emit(prefix, payload):
+            events.append((prefix.strip(), dict(payload)))
+
+        def fake_reset(item_arg, settings_arg, log):
+            calls["reset"] += 1
+            self.assertEqual("jwt", item_arg["mail_credential"])
+            return {"ok": True, "password": "new-secret-password"}
+
+        def fake_login(item_arg, settings_arg, mint_and_export, log=None):
+            calls["login"] += 1
+            self.assertEqual("new-secret-password", item_arg["password"])
+            return {
+                "ok": True,
+                "id": item_arg["id"],
+                "email": item_arg["email"],
+                "path": "/tmp/auth.json",
+                "sso_token": "sso",
+            }
+
+        with patch.object(reference_worker, "emit", side_effect=fake_emit):
+            with patch.object(reference_worker, "password_reset_core", side_effect=fake_reset):
+                with patch.object(reference_worker, "login_item_core", side_effect=fake_login):
+                    result = reference_worker.recover_wrong_password_item(
+                        item, settings, mint_and_export=object()
+                    )
+
+        self.assertEqual(1, calls["reset"])
+        self.assertEqual(1, calls["login"])
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["recovered_from_wrong_password"])
+        self.assertEqual("new-secret-password", result["password"])
+        self.assertIn("自动重置密码后", result["detail"])
+        logs = [
+            payload.get("message")
+            for prefix, payload in events
+            if prefix == "GM_LOG"
+        ]
+        self.assertTrue(any("开始自动重置密码" in str(message) for message in logs))
+        self.assertTrue(any("开始使用新密码重新登录" in str(message) for message in logs))
+
+    def test_run_login_batch_recovers_wrong_password_inline(self) -> None:
+        from grok_manager import reference_worker
+
+        item = {
+            "id": 3,
+            "email": "bad@example.com",
+            "password": "old",
+            "mail_credential": "jwt",
+            "auth_dir": "/tmp",
+        }
+        settings = {"default_auth_dir": "/tmp"}
+        emitted = []
+        recover_calls = []
+
+        def fake_login(item_arg, settings_arg, mint_and_export, log=None):
+            return {"ok": False, "error": "邮箱或密码错误", "id": 3, "email": "bad@example.com"}
+
+        def fake_recover(item_arg, settings_arg, mint_and_export):
+            recover_calls.append(item_arg["id"])
+            return {
+                "ok": True,
+                "id": 3,
+                "email": "bad@example.com",
+                "detail": "自动重置密码后：批量登录成功",
+                "recovered_from_wrong_password": True,
+                "password": "new-secret",
+            }
+
+        with patch.object(reference_worker, "login_item_core", side_effect=fake_login):
+            with patch.object(reference_worker, "recover_wrong_password_item", side_effect=fake_recover):
+                with patch.object(reference_worker, "emit", side_effect=lambda p, v: emitted.append((p, v))):
+                    with patch.object(reference_worker, "shutdown_thread_browsers"):
+                        results = reference_worker.run_login_batch(
+                            [item],
+                            settings,
+                            mint_and_export=object(),
+                            auto_reset_password=True,
+                        )
+
+        self.assertEqual([3], recover_calls)
+        self.assertEqual(1, len(results))
+        self.assertTrue(results[0]["ok"])
+        self.assertTrue(any(prefix.startswith("GM_RESULT") for prefix, _ in emitted))
+
+    def test_login_payload_includes_mail_credential_when_auto_reset_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            account = manager.store.upsert(
+                AccountDraft(email="mail@example.com", password="password", source="src")
+            )
+            captured = {}
+
+            def fake_run(command, document, **kwargs):
+                captured["document"] = document
+                return [], set(), 0
+
+            with patch.object(manager.login._worker, "run", side_effect=fake_run):
+                with patch.object(
+                    manager.login.project,
+                    "find_mail_credential",
+                    return_value="mail-jwt",
+                ):
+                    manager.login.login_accounts(
+                        [account.id],
+                        LoginSettings(auto_reset_password=True),
+                    )
+
+            settings = captured["document"]["settings"]
+            account_payload = captured["document"]["accounts"][0]
+            self.assertTrue(settings["auto_reset_password"])
+            self.assertEqual("mail-jwt", account_payload["mail_credential"])
 
 
 if __name__ == "__main__":

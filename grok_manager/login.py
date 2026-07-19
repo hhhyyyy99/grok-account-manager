@@ -23,6 +23,7 @@ class LoginSettings:
     headless: bool = False
     base_url: str = "https://cli-chat-proxy.grok.com/v1"
     probe_after_login: bool = False
+    auto_reset_password: bool = False
 
 
 class BatchLoginService:
@@ -86,6 +87,7 @@ class BatchLoginService:
             return results
 
         self.project.validate()
+        auto_reset = bool(settings.auto_reset_password)
         document = {
             "settings": {
                 "workers": max(1, min(int(settings.workers), 10)),
@@ -97,8 +99,12 @@ class BatchLoginService:
                 "reuse_browser": True,
                 "recycle_every": 10,
                 "default_auth_dir": str(self.project.managed_auth_dir),
+                "auto_reset_password": auto_reset,
             },
-            "accounts": [self._worker_account(account) for account in ready],
+            "accounts": [
+                self._worker_account(account, include_mail_credential=auto_reset)
+                for account in ready
+            ],
         }
         worker_results, parsed_ids, completed = self._worker.run(
             "batch-login",
@@ -233,13 +239,52 @@ class BatchLoginService:
         results_by_id = {result.account_id: result for result in results}
         return [results_by_id[account_id] for account_id in requested_ids if account_id in results_by_id]
 
-    def _worker_account(self, account: Account) -> Dict[str, Any]:
-        return {
+    def _worker_account(
+        self,
+        account: Account,
+        *,
+        include_mail_credential: bool = False,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
             "id": account.id,
             "email": account.email,
             "password": account.password,
             "auth_dir": str(self.project.managed_auth_dir),
         }
+        if include_mail_credential:
+            # Prefer local credential; fall back to admin recovery so wrong-password
+            # accounts can reset without a second orchestration pass.
+            credential = self.project.find_mail_credential(account.email, account.source)
+            if not credential:
+                credential = self.project.recover_mail_credential_via_admin(account.email)
+            payload["mail_credential"] = str(credential or "")
+        return payload
+
+    def _persist_recovered_password(
+        self,
+        account_id: int,
+        email: str,
+        password: str,
+    ) -> None:
+        password = str(password or "").strip()
+        if not account_id or not password:
+            return
+        try:
+            account = self.store.get(account_id)
+            if account is None:
+                return
+            if email and account.email.casefold() != email.strip().casefold():
+                return
+            self.store.apply_password_reset(account_id, password)
+            try:
+                self.project.persist_account_password(
+                    account.email, password, account.source
+                )
+            except Exception:
+                # DB already has the password; artifact write is best-effort.
+                pass
+        except Exception:
+            pass
 
     def _worker_remint_account(self, account: Account) -> Dict[str, Any]:
         return {
@@ -266,8 +311,16 @@ class BatchLoginService:
         ok = bool(value.get("ok"))
         auth_file = str(value.get("path") or "")
         sso_token = str(value.get("sso_token") or "").strip()
-        detail = str(value.get("error") or ("批量登录成功" if ok else "批量登录失败"))
+        recovered = bool(value.get("recovered_from_wrong_password"))
+        new_password = str(value.get("password") or "").strip()
+        detail = str(
+            value.get("detail")
+            or value.get("error")
+            or ("批量登录成功" if ok else "批量登录失败")
+        )
         previous_sso_token = ""
+        if new_password and account_id:
+            self._persist_recovered_password(account_id, email, new_password)
         if ok:
             try:
                 account = self.store.get(account_id)
@@ -298,9 +351,13 @@ class BatchLoginService:
                     detail="SSO 与 CPA 凭据已刷新",
                     sso_token=sso_token,
                 )
+                if recovered and not detail.startswith("自动重置密码后"):
+                    detail = "自动重置密码后：%s" % (detail or "批量登录成功")
             except (OSError, json.JSONDecodeError, ValueError, AttributeError) as exc:
                 ok = False
                 detail = "登录成功但凭据回写失败: %s" % exc
+                if recovered:
+                    detail = "自动重置密码后：%s" % detail
                 self._remove_transient_auth_file(auth_file)
                 auth_file = ""
                 sso_token = ""
