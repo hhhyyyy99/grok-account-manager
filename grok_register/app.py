@@ -535,6 +535,76 @@ def _normalize_sso_token(raw_token):
     return token
 
 
+def _normalize_grok2api_remote_pool(pool_name):
+    value = str(pool_name or "").strip() or "ssoBasic"
+    mapping = {
+        "ssoBasic": "basic",
+        "ssoSuper": "super",
+        "basic": "basic",
+        "super": "super",
+    }
+    return mapping.get(value, value.lower())
+
+
+def _local_grok2api_pool_name(remote_pool):
+    value = str(remote_pool or "").strip().lower() or "basic"
+    mapping = {
+        "basic": "ssoBasic",
+        "super": "ssoSuper",
+        "ssobasic": "ssoBasic",
+        "ssosuper": "ssoSuper",
+    }
+    return mapping.get(value, value)
+
+
+def _coerce_grok2api_token_pools(payload, preferred_pool="ssoBasic"):
+    """Normalize GET /tokens payload into {local_pool_name: [items]}."""
+    if not isinstance(payload, dict):
+        return None
+    tokens = payload.get("tokens", payload)
+    if isinstance(tokens, dict):
+        pools = {}
+        for key, items in tokens.items():
+            pools[_local_grok2api_pool_name(key)] = list(items or [])
+        return pools
+    if isinstance(tokens, list):
+        pools = {}
+        for item in tokens:
+            if isinstance(item, dict):
+                local_name = _local_grok2api_pool_name(item.get("pool") or preferred_pool)
+                pools.setdefault(local_name, []).append(item)
+            elif isinstance(item, str):
+                token = _normalize_sso_token(item)
+                if token:
+                    pools.setdefault(preferred_pool, []).append({"token": token})
+        return pools
+    return None
+
+
+def _remote_pool_save_payload(pools):
+    """Convert local pool map into remote save payload keyed by basic/super."""
+    payload = {}
+    for local_name, items in (pools or {}).items():
+        remote_name = _normalize_grok2api_remote_pool(local_name)
+        cleaned = []
+        for item in items or []:
+            if isinstance(item, dict):
+                token = _normalize_sso_token(item.get("token", ""))
+                if not token:
+                    continue
+                entry = {"token": token}
+                tags = item.get("tags")
+                if tags:
+                    entry["tags"] = tags
+                cleaned.append(entry)
+            else:
+                token = _normalize_sso_token(item)
+                if token:
+                    cleaned.append(token)
+        payload[remote_name] = cleaned
+    return payload
+
+
 def _upsert_grok2api_pool(pool, token, email="", replace_email=False):
     items = list(pool) if isinstance(pool, list) else []
     target_email = str(email or "").strip().casefold() if replace_email else ""
@@ -701,9 +771,50 @@ def add_token_to_grok2api_remote_pool(
         return False
     headers = {"Content-Type": "application/json"}
     query = {"app_key": app_key}
-    pool_map = {"ssoBasic": "basic", "ssoSuper": "super"}
-    remote_pool = pool_map.get(pool_name, "basic")
+    remote_pool = _normalize_grok2api_remote_pool(pool_name)
     api_bases = get_grok2api_remote_api_bases(base)
+    old_token = _normalize_sso_token(previous_token)
+
+    # Modern grok2api exposes PUT /tokens/edit for single-token replace.
+    # Prefer it on relogin so we do not rewrite multi-thousand token pools.
+    if replace_email and old_token:
+        if old_token == token:
+            if log_callback:
+                log_callback(f"[*] grok2api 远端池 token 未变化: {pool_name}")
+            return True
+        edit_errors = []
+        for api_base in api_bases:
+            endpoint = f"{api_base}/tokens/edit"
+            try:
+                resp_edit = http_put(
+                    endpoint,
+                    headers=headers,
+                    params=query,
+                    json={
+                        "old_token": old_token,
+                        "token": token,
+                        "pool": remote_pool,
+                    },
+                    timeout=30,
+                    proxies={},
+                )
+                if resp_edit.status_code in (404, 405):
+                    edit_errors.append(f"{endpoint}: HTTP {resp_edit.status_code}")
+                    continue
+                resp_edit.raise_for_status()
+                if log_callback:
+                    log_callback(
+                        f"[+] 已更新 grok2api 远端池: {pool_name} ({endpoint})"
+                    )
+                return True
+            except Exception as edit_exc:
+                edit_errors.append(f"{endpoint}: {edit_exc}")
+        if log_callback:
+            log_callback(
+                "[Debug] /tokens/edit 替换失败，尝试 /tokens 全量模式: "
+                + "; ".join(edit_errors)
+            )
+
     if not replace_email:
         add_errors = []
         add_payload = {
@@ -753,9 +864,12 @@ def add_token_to_grok2api_remote_pool(
                 read_errors.append(f"{endpoint}: HTTP {resp.status_code}")
                 continue
             payload = resp.json()
-            candidate = payload.get("tokens") if isinstance(payload, dict) else None
+            candidate = _coerce_grok2api_token_pools(payload, preferred_pool=pool_name)
             if not isinstance(candidate, dict):
-                read_errors.append(f"{endpoint}: 响应缺少 tokens 对象")
+                read_errors.append(
+                    f"{endpoint}: 响应 tokens 格式不受支持 "
+                    f"({type((payload or {}).get('tokens') if isinstance(payload, dict) else payload).__name__})"
+                )
                 continue
             current = candidate
             fallback_base = api_base
@@ -789,6 +903,7 @@ def add_token_to_grok2api_remote_pool(
             log_callback(f"[*] grok2api 远端池已存在 token: {pool_name}")
         return True
     current[pool_name] = pool
+    save_payload = _remote_pool_save_payload(current)
     save_errors = []
     save_bases = []
     for item in [fallback_base, *(api_bases or [base])]:
@@ -796,7 +911,14 @@ def add_token_to_grok2api_remote_pool(
             save_bases.append(item)
     for api_base in save_bases:
         try:
-            resp2 = http_post(f"{api_base}/tokens", headers=headers, params=query, json=current, timeout=30, proxies={})
+            resp2 = http_post(
+                f"{api_base}/tokens",
+                headers=headers,
+                params=query,
+                json=save_payload,
+                timeout=30,
+                proxies={},
+            )
             resp2.raise_for_status()
             if log_callback:
                 action = "已更新" if replace_email else "已写入"
@@ -975,6 +1097,25 @@ def http_post(url, **kwargs):
             except Exception as retry_exc:
                 if _is_tls_backend_error(retry_exc):
                     return std_requests.post(url, **_to_std_request_kwargs(retry_kwargs))
+                raise
+        raise
+
+
+def http_put(url, **kwargs):
+    try:
+        return curl_requests.put(url, **_build_request_kwargs(**kwargs))
+    except Exception as exc:
+        err = str(exc)
+        if _is_tls_backend_error(exc):
+            return std_requests.put(url, **_to_std_request_kwargs(kwargs))
+        if "127.0.0.1 port 7890" in err or "Could not connect to server" in err:
+            retry_kwargs = dict(kwargs)
+            retry_kwargs["proxies"] = {}
+            try:
+                return curl_requests.put(url, **_build_request_kwargs(**retry_kwargs))
+            except Exception as retry_exc:
+                if _is_tls_backend_error(retry_exc):
+                    return std_requests.put(url, **_to_std_request_kwargs(retry_kwargs))
                 raise
         raise
 
