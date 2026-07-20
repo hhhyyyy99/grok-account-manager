@@ -375,7 +375,12 @@ class GrokWebApplication:
 
         def worker() -> None:
             def log(message: str) -> None:
-                print("[cpa-guard] %s" % message, flush=True)
+                # Interpreter shutdown can race daemon prints and crash with
+                # "_enter_buffered_busy". Swallow IO errors once exit starts.
+                try:
+                    print("[cpa-guard] %s" % message, flush=True)
+                except Exception:
+                    pass
 
             try:
                 self.manager.run_cpa_guard_loop(
@@ -387,8 +392,16 @@ class GrokWebApplication:
                 )
             except Exception as exc:
                 # KeyboardInterrupt is process-wide; daemon exit should stay quiet.
-                if not isinstance(exc, KeyboardInterrupt):
+                if isinstance(exc, KeyboardInterrupt):
+                    return
+                from .vault import VaultLockedError
+
+                if isinstance(exc, VaultLockedError) and self._cpa_guard_stop.is_set():
+                    return
+                try:
                     print("[cpa-guard] 守护线程异常退出: %s" % exc, flush=True)
+                except Exception:
+                    pass
 
         self._cpa_guard_thread = threading.Thread(
             target=worker,
@@ -398,7 +411,7 @@ class GrokWebApplication:
         self._cpa_guard_thread.start()
         return True
 
-    def stop_cpa_guard(self, timeout: float = 1.5) -> None:
+    def stop_cpa_guard(self, timeout: float = 3.0) -> None:
         """Signal the guard to stop; never block shutdown on a second Ctrl+C."""
         self._cpa_guard_stop.set()
         thread = self._cpa_guard_thread
@@ -411,7 +424,10 @@ class GrokWebApplication:
             # User hit Ctrl+C again while we waited for the daemon guard.
             return
         if thread.is_alive():
-            print("[cpa-guard] 守护线程仍在收尾，随进程退出", flush=True)
+            try:
+                print("[cpa-guard] 守护线程仍在收尾，随进程退出", flush=True)
+            except Exception:
+                pass
 
     @staticmethod
     def account_json(account: Account) -> Dict[str, Any]:
@@ -1206,7 +1222,8 @@ class GrokWebApplication:
             print("\n正在停止管理端…", flush=True)
         finally:
             try:
-                self.stop_cpa_guard(timeout=1.0)
+                # Prefer a clean guard exit before the CLI locks the vault.
+                self.stop_cpa_guard(timeout=5.0)
             except KeyboardInterrupt:
                 pass
             try:

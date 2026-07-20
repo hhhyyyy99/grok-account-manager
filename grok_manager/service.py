@@ -1680,20 +1680,29 @@ class GrokManager:
         from grok_register.cpa_xai.schema import DEFAULT_BASE_URL
 
         log = log or (lambda _message: None)
+        if cancelled and cancelled():
+            return []
         # Pull newer tokens from deployment hotload before deciding who needs refresh.
         # This avoids marking accounts expired when CLIProxyAPI already renewed them.
+        # Scope to active CPA accounts (or the explicit id set) so shutdown can cancel
+        # without decrypting the entire account table.
         if account_ids is None:
-            sync_ids = None
+            sync_ids = self.active_cpa_account_ids()
         else:
             sync_ids = [int(value) for value in account_ids]
         try:
-            sync_results = self.sync_cpa_hotload_accounts(
-                sync_ids,
-                log=log,
-                cancelled=cancelled,
-                push_when_manager_newer=True,
-                reinspect=False,
-            )
+            if sync_ids:
+                sync_results = self.sync_cpa_hotload_accounts(
+                    sync_ids,
+                    log=log,
+                    cancelled=cancelled,
+                    push_when_manager_newer=True,
+                    reinspect=False,
+                )
+            else:
+                sync_results = []
+            if cancelled and cancelled():
+                return []
             pulled_ids = [
                 item.account_id
                 for item in sync_results
@@ -1704,10 +1713,16 @@ class GrokManager:
                 self.inspect_accounts(
                     pulled_ids, live=self.config.live_probe, cancelled=cancelled
                 )
+        except VaultLockedError:
+            if cancelled and cancelled():
+                return []
+            raise
         except Exception as exc:
             log("CPA 守护：hotload 同步阶段异常: %s" % exc)
             return []
 
+        if cancelled and cancelled():
+            return []
         candidates = self.cpa_accounts_needing_refresh(
             lead_seconds=lead_seconds,
             account_ids=account_ids,
@@ -1863,6 +1878,9 @@ class GrokManager:
             if cancelled and cancelled():
                 log("CPA 守护进程已停止")
                 return
+            if not getattr(self.store.vault, "is_unlocked", False):
+                log("CPA 守护：保险库已锁定，停止")
+                return
             try:
                 results = self.guard_cpa_tokens(
                     lead_seconds=lead,
@@ -1878,7 +1896,16 @@ class GrokManager:
             except KeyboardInterrupt:
                 log("CPA 守护进程已停止")
                 return
+            except VaultLockedError:
+                # Main thread may lock the vault during process exit while this
+                # daemon is still finishing a round. Exit quietly.
+                if cancelled and cancelled():
+                    return
+                log("CPA 守护：保险库已锁定，停止")
+                return
             except Exception as exc:
+                if cancelled and cancelled():
+                    return
                 log("CPA 守护本轮异常: %s" % exc)
             if once:
                 return

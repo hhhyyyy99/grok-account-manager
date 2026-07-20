@@ -2,6 +2,8 @@ import json
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -173,6 +175,37 @@ class LanAccessTests(unittest.TestCase):
                 self.assertFalse(application.start_cpa_guard())  # already running
                 application.stop_cpa_guard(timeout=1.0)
             self.assertEqual(1, started["count"])
+
+    def test_cpa_guard_stops_quietly_when_vault_locks_during_shutdown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            manager.config.cpa_guard_enabled = True
+            application = GrokWebApplication(manager)
+            release = threading.Event()
+            entered = threading.Event()
+
+            def fake_loop(**kwargs):
+                entered.set()
+                # Simulate a long hotload sync that still checks cancelled frequently.
+                while not kwargs["cancelled"]():
+                    time.sleep(0.01)
+                # After stop is requested, main may already lock the vault.
+                try:
+                    manager.store.vault.lock()
+                except Exception:
+                    pass
+                # One more vault-backed call would raise VaultLockedError previously.
+                try:
+                    manager.store.list_accounts()
+                except Exception:
+                    pass
+                release.set()
+
+            with patch.object(manager, "run_cpa_guard_loop", side_effect=fake_loop):
+                self.assertTrue(application.start_cpa_guard())
+                self.assertTrue(entered.wait(1.0))
+                application.stop_cpa_guard(timeout=1.0)
+            self.assertTrue(release.wait(1.0))
 
     def test_web_app_skips_cpa_guard_when_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

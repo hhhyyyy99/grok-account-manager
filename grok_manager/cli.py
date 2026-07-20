@@ -478,6 +478,11 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             return command_ui(args)
         return int(args.handler(args))
     finally:
+        # Serve already stops the CPA guard. Only lock after handlers return so a
+        # still-finishing daemon cannot race decrypts against a locked vault.
         if _CURRENT_VAULT is not None:
-            _CURRENT_VAULT.lock()
+            try:
+                _CURRENT_VAULT.lock()
+            except Exception:
+                pass
         _CURRENT_VAULT = None

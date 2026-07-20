@@ -403,6 +403,25 @@ class CpaGuardTests(unittest.TestCase):
             guard.assert_called_once()
             self.assertTrue(any("CPA 守护进程启动" in line for line in logs))
 
+    def test_guard_loop_exits_quietly_when_vault_locks(self) -> None:
+        from grok_manager.vault import VaultLockedError
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            logs = []
+
+            def boom(**_kwargs):
+                raise VaultLockedError("凭据保险库已锁定")
+
+            with patch.object(manager, "guard_cpa_tokens", side_effect=boom):
+                manager.run_cpa_guard_loop(
+                    interval_seconds=30,
+                    lead_seconds=600,
+                    once=False,
+                    log=logs.append,
+                )
+            self.assertTrue(any("保险库已锁定" in line for line in logs))
+
     def test_oauth_error_bodies_are_redacted(self) -> None:
         body = {
             "error": "invalid_grant",
