@@ -158,6 +158,124 @@ class CpaGuardTests(unittest.TestCase):
             auth_files = list(manager.reference.managed_auth_dir.glob("xai-*.json"))
             self.assertEqual([], auth_files)
 
+    def test_silent_refresh_updates_local_sub2api_exports(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = make_manager(root)
+            export_dir = root / "output" / "sub2api_exports"
+            combined = export_dir / "sub2api-accounts.json"
+            export_dir.mkdir(parents=True, exist_ok=True)
+            combined.write_text(
+                json.dumps(
+                    {
+                        "exported_at": "2020-01-01T00:00:00Z",
+                        "proxies": [],
+                        "accounts": [
+                            {
+                                "name": "other@example.com",
+                                "platform": "grok",
+                                "type": "oauth",
+                                "credentials": {
+                                    "access_token": "other-access",
+                                    "refresh_token": "other-refresh",
+                                    "email": "other@example.com",
+                                },
+                                "extra": {
+                                    "email": "other@example.com",
+                                    "email_key": "other_example_com",
+                                },
+                            },
+                            {
+                                "name": "refresh@example.com",
+                                "platform": "grok",
+                                "type": "oauth",
+                                "credentials": {
+                                    "access_token": "stale-access",
+                                    "refresh_token": "stale-refresh",
+                                    "email": "refresh@example.com",
+                                },
+                                "extra": {
+                                    "email": "refresh@example.com",
+                                    "email_key": "refresh_example_com",
+                                },
+                            },
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            manager.reference.config_file.write_text(
+                json.dumps(
+                    {
+                        "sub2api_export_enabled": True,
+                        "sub2api_export_dir": str(export_dir),
+                        "sub2api_combined_file": str(combined),
+                        "cpa_base_url": "http://127.0.0.1:8317/v1",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            account = manager.store.upsert(
+                AccountDraft(
+                    email="refresh@example.com",
+                    access_token="stale-access",
+                    refresh_token="stale-refresh",
+                    token_expires_at=_future_iso(300),
+                )
+            )
+            _mark_cpa(
+                manager,
+                account.id,
+                cpa_status=AccountStatus.ACTIVE.value,
+                expires_at=_future_iso(300),
+            )
+
+            def fake_refresh(refresh_token, **_kwargs):
+                self.assertEqual("stale-refresh", refresh_token)
+                return oauth_device.TokenResult(
+                    access_token="renewed-access",
+                    refresh_token="renewed-refresh",
+                    id_token=None,
+                    token_type="Bearer",
+                    expires_in=21600,
+                    raw={},
+                )
+
+            with patch.object(
+                oauth_device, "refresh_access_token", side_effect=fake_refresh
+            ), patch.object(manager, "inspect_accounts", return_value=[]):
+                results = manager.guard_cpa_tokens(lead_seconds=1800)
+
+            self.assertTrue(any(item.ok and item.account_id == account.id for item in results))
+            single = export_dir / "sub2api-xai-refresh@example.com.json"
+            self.assertTrue(single.is_file())
+            single_doc = json.loads(single.read_text(encoding="utf-8"))
+            self.assertEqual(
+                "renewed-access",
+                single_doc["accounts"][0]["credentials"]["access_token"],
+            )
+            combined_doc = json.loads(combined.read_text(encoding="utf-8"))
+            by_email = {
+                str(item.get("credentials", {}).get("email") or ""): item
+                for item in combined_doc["accounts"]
+            }
+            self.assertEqual(
+                {"other@example.com", "refresh@example.com"},
+                set(by_email),
+            )
+            self.assertEqual(
+                "renewed-access",
+                by_email["refresh@example.com"]["credentials"]["access_token"],
+            )
+            self.assertEqual(
+                "other-access",
+                by_email["other@example.com"]["credentials"]["access_token"],
+            )
+            self.assertEqual([], list(manager.reference.managed_auth_dir.glob("xai-*.json")))
+
     def test_guard_push_does_not_drop_active_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

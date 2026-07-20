@@ -802,6 +802,64 @@ class GrokManager:
 
         remove_managed_auth_file(auth_file, self.reference.managed_auth_dir)
 
+    def _resolve_registration_path(self, value: str, fallback: Path) -> Path:
+        text = str(value or "").strip()
+        if not text:
+            return Path(fallback).expanduser().resolve()
+        path = Path(text).expanduser()
+        if not path.is_absolute():
+            path = self.reference.data_root / path
+        return path.resolve()
+
+    def _sync_sub2api_from_cpa_path(
+        self,
+        auth_path: str | Path | None,
+        *,
+        log=None,
+        registration_config: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Keep local Sub2API exports in sync after manager CPA refresh/remint."""
+        if not auth_path:
+            return None
+        log = log or (lambda _message: None)
+        path = Path(auth_path).expanduser().resolve()
+        if not path.is_file():
+            return None
+        try:
+            config = dict(registration_config or self.reference.load_registration_config())
+        except Exception as exc:
+            log("Sub2API 同步跳过：注册配置读取失败: %s" % exc)
+            return None
+        if not bool(config.get("sub2api_export_enabled", True)):
+            return None
+        from grok_register.cpa_to_sub2api import sync_from_cpa_path
+
+        export_dir = self._resolve_registration_path(
+            str(config.get("sub2api_export_dir") or ""),
+            self.reference.data_root / "output" / "sub2api_exports",
+        )
+        combined = self._resolve_registration_path(
+            str(config.get("sub2api_combined_file") or ""),
+            export_dir / "sub2api-accounts.json",
+        )
+        config = {
+            **config,
+            "sub2api_export_dir": str(export_dir),
+            "sub2api_combined_file": str(combined),
+        }
+        try:
+            result = sync_from_cpa_path(path, config=config, log_callback=log)
+        except Exception as exc:
+            log("Sub2API 同步失败: %s" % exc)
+            return "Sub2API 未同步: %s" % exc
+        if result.get("skipped"):
+            return None
+        if not result.get("ok"):
+            note = "Sub2API 未同步: %s" % (result.get("error") or "unknown")
+            log(note)
+            return note
+        return None
+
     def _silent_refresh_cpa_account(
         self,
         account: Account,
@@ -895,6 +953,12 @@ class GrokManager:
                                     "[%s] CPA hotload 已更新: %s"
                                     % (fresh.email, hotload_path)
                                 )
+                        sub2api_note = self._sync_sub2api_from_cpa_path(
+                            auth_path,
+                            log=log,
+                        )
+                        if sub2api_note:
+                            detail = "%s；%s" % (detail, sub2api_note)
                 log("[%s] CPA silent refresh 成功" % fresh.email)
                 return CpaRefreshResult(
                     fresh.id,
@@ -929,16 +993,20 @@ class GrokManager:
     ) -> CpaRefreshResult:
         if not result.ok or not result.auth_file:
             return result
+        detail = result.detail
         try:
             hotload_path = self._sync_hotload_path(result.auth_file, result.account_id)
         except Exception as exc:
             note = "CPA hotload 未同步: %s" % exc
             log("[%s] %s" % (result.email, note))
-            final = replace(result, detail="%s；%s" % (result.detail, note), auth_file="")
+            detail = "%s；%s" % (detail, note)
         else:
             if hotload_path is not None:
                 log("[%s] CPA hotload 已更新: %s" % (result.email, hotload_path))
-            final = replace(result, auth_file="")
+        sub2api_note = self._sync_sub2api_from_cpa_path(result.auth_file, log=log)
+        if sub2api_note:
+            detail = "%s；%s" % (detail, sub2api_note)
+        final = replace(result, detail=detail, auth_file="")
         self._remove_managed_auth_file(result.auth_file)
         return final
 

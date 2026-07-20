@@ -134,6 +134,88 @@ def rebuild_combined(cpa_dir: str | Path, out_file: str | Path) -> Path:
     return out_file
 
 
+def _account_email_key(account: dict[str, Any]) -> str:
+    extra = account.get("extra") if isinstance(account.get("extra"), dict) else {}
+    key = str(extra.get("email_key") or "").strip().lower()
+    if key:
+        return key
+    email = str(
+        extra.get("email")
+        or account.get("credentials", {}).get("email")
+        or account.get("name")
+        or ""
+    ).strip().lower()
+    return _email_key(email)
+
+
+def upsert_combined_account(account: dict[str, Any], out_file: str | Path) -> Path:
+    """Merge one Sub2API account into the combined file by email key."""
+    out_file = Path(out_file).expanduser().resolve()
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    accounts: list[dict[str, Any]] = []
+    if out_file.is_file():
+        try:
+            existing = json.loads(out_file.read_text(encoding="utf-8-sig"))
+            if isinstance(existing, dict) and isinstance(existing.get("accounts"), list):
+                accounts = [item for item in existing["accounts"] if isinstance(item, dict)]
+        except Exception:
+            accounts = []
+    target_key = _account_email_key(account)
+    merged: list[dict[str, Any]] = []
+    replaced = False
+    for item in accounts:
+        if target_key and _account_email_key(item) == target_key:
+            merged.append(account)
+            replaced = True
+        else:
+            merged.append(item)
+    if not replaced:
+        merged.append(account)
+    out_file.write_text(
+        json.dumps(build_sub2api_document(merged), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return out_file
+
+
+def sync_from_cpa_path(
+    cpa_path: str | Path,
+    config: dict[str, Any] | None = None,
+    log_callback=None,
+) -> dict[str, Any]:
+    """Update single-account + combined Sub2API files from one CPA auth file.
+
+    Unlike export_after_cpa_result, this does not rebuild the combined file from a
+    CPA directory. Manager refresh only keeps temporary auth files, so a full
+    rebuild would wipe other accounts from the local Sub2API export.
+    """
+    cfg = config or {}
+    log = log_callback or (lambda m: None)
+    if not cfg.get("sub2api_export_enabled", True):
+        return {"ok": False, "skipped": True, "reason": "disabled"}
+    path = Path(cpa_path).expanduser().resolve()
+    if not path.is_file():
+        return {"ok": False, "error": "missing cpa path"}
+    from grok_register.paths import OUTPUT_DIR
+
+    out_dir = Path(cfg.get("sub2api_export_dir") or (OUTPUT_DIR / "sub2api_exports"))
+    if not out_dir.is_absolute():
+        out_dir = out_dir.expanduser().resolve()
+    combined_path = Path(cfg.get("sub2api_combined_file") or (out_dir / "sub2api-accounts.json"))
+    if not combined_path.is_absolute():
+        combined_path = combined_path.expanduser().resolve()
+    with _export_lock:
+        single_path, doc = convert_cpa_file(path, out_dir=out_dir)
+        accounts = doc.get("accounts") if isinstance(doc, dict) else None
+        account = accounts[0] if isinstance(accounts, list) and accounts else None
+        if not isinstance(account, dict):
+            return {"ok": False, "error": "invalid sub2api account"}
+        combined_path = upsert_combined_account(account, combined_path)
+    log(f"[sub2api] export -> {single_path}")
+    log(f"[sub2api] combined -> {combined_path}")
+    return {"ok": True, "path": str(single_path), "combined_path": str(combined_path)}
+
+
 def export_after_cpa_result(result: dict[str, Any], config: dict[str, Any] | None = None, log_callback=None) -> dict[str, Any]:
     cfg = config or {}
     log = log_callback or (lambda m: None)
