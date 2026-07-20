@@ -210,6 +210,101 @@ class AccountImportQueryTests(unittest.TestCase):
                     migrated.status_detail if migrated else "",
                 ),
             )
+            self.assertTrue(migrated.enabled if migrated else False)
+
+    def test_store_migrates_pre_enabled_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "accounts.sqlite3"
+            vault = CredentialVault(
+                database.with_name("credentials.vault.json"),
+                kdf_parameters=KdfParameters(memory_cost=8 * 1024, iterations=1, lanes=1),
+            )
+            vault.initialize("test vault password 123")
+            connection = sqlite3.connect(str(database))
+            try:
+                connection.executescript(
+                    """
+                    CREATE TABLE accounts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        email TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                        password TEXT NOT NULL DEFAULT '',
+                        sso_token TEXT NOT NULL DEFAULT '',
+                        access_token TEXT NOT NULL DEFAULT '',
+                        refresh_token TEXT NOT NULL DEFAULT '',
+                        token_expires_at TEXT NOT NULL DEFAULT '',
+                        auth_file TEXT NOT NULL DEFAULT '',
+                        source TEXT NOT NULL DEFAULT '',
+                        status TEXT NOT NULL DEFAULT 'unknown',
+                        status_detail TEXT NOT NULL DEFAULT '',
+                        last_checked_at TEXT NOT NULL DEFAULT '',
+                        last_login_at TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    INSERT INTO accounts (
+                        email, password, created_at, updated_at
+                    ) VALUES (
+                        'legacy@example.com', 'password',
+                        '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z'
+                    );
+                    """
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            store = AccountStore(database, vault=vault)
+            account = store.get_by_email("legacy@example.com")
+
+            self.assertIsNotNone(account)
+            self.assertTrue(account.enabled if account else False)
+            self.assertEqual(1, store.stats()["enabled"])
+            self.assertEqual(0, store.stats()["disabled"])
+
+    def test_account_enabled_toggle_and_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            manager.import_account_text(
+                "alice@example.com----password\n"
+                "bob@example.com----password\n"
+                "carol@example.com----password"
+            )
+            accounts = manager.store.list_accounts()
+            self.assertTrue(all(account.enabled for account in accounts))
+
+            updated = manager.store.set_enabled([accounts[0].id, accounts[1].id], False)
+            self.assertEqual(2, updated)
+            disabled = manager.store.list_accounts(enabled=False)
+            enabled = manager.store.list_accounts(enabled=True)
+            self.assertEqual(
+                sorted([accounts[0].id, accounts[1].id]),
+                sorted([account.id for account in disabled]),
+            )
+            self.assertEqual([accounts[2].id], [account.id for account in enabled])
+
+            ordered = manager.store.list_accounts()
+            self.assertTrue(ordered[0].enabled)
+            self.assertFalse(any(account.enabled for account in ordered[1:]))
+
+            application = GrokWebApplication(manager)
+            state = application.state_json(
+                {"enabled": ["disabled"], "page": ["1"], "page_size": ["50"]}
+            )
+            stats = manager.store.stats()
+            self.assertEqual(2, state["pagination"]["total"])
+            self.assertFalse(state["accounts"][0]["enabled"])
+            self.assertEqual(
+                {"total": 3, "enabled": 1, "disabled": 2},
+                {
+                    "total": stats["total"],
+                    "enabled": stats["enabled"],
+                    "disabled": stats["disabled"],
+                },
+            )
+
+            restored = manager.store.set_enabled([accounts[0].id], True)
+            self.assertEqual(1, restored)
+            self.assertTrue(manager.store.get(accounts[0].id).enabled)
 
 
 if __name__ == "__main__":

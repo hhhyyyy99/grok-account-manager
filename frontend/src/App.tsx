@@ -23,6 +23,12 @@ const STATUS_OPTIONS = [
   ["error", "巡检异常"],
 ] as const;
 
+const ENABLED_OPTIONS = [
+  ["", "全部开关"],
+  ["enabled", "已启用"],
+  ["disabled", "已禁用"],
+] as const;
+
 const NAV_ITEMS: Array<{ name: ViewName; label: string; glyph: string }> = [
   { name: "accounts", label: "账号", glyph: "◎" },
   { name: "registration", label: "注册", glyph: "+" },
@@ -32,7 +38,11 @@ const NAV_ITEMS: Array<{ name: ViewName; label: string; glyph: string }> = [
 const TERMINAL_STATES = new Set(["succeeded", "partial", "failed", "cancelled"]);
 
 export function orderAccountsById(accounts: Account[]): Account[] {
-  return [...accounts].sort((left, right) => Number(right.id) - Number(left.id));
+  return [...accounts].sort((left, right) => {
+    const enabledDelta = Number(right.enabled) - Number(left.enabled);
+    if (enabledDelta !== 0) return enabledDelta;
+    return Number(right.id) - Number(left.id);
+  });
 }
 
 function useDebouncedValue<T>(value: T, delay: number): T {
@@ -134,7 +144,13 @@ function restoreWindowScroll(scrollY: number) {
   requestAnimationFrame(apply);
 }
 
-function useManagerState(search: string, status: string, page: number, pageSize: number) {
+function useManagerState(
+  search: string,
+  status: string,
+  enabled: string,
+  page: number,
+  pageSize: number,
+) {
   const [state, setState] = useState<StatePayload>({
     accounts: [],
     pagination: { page: 1, pageSize, total: 0, totalPages: 1 },
@@ -173,7 +189,7 @@ function useManagerState(search: string, status: string, page: number, pageSize:
     }
     if (!silent) setRefreshing(true);
     try {
-      const next = await getState({ search, status, page, pageSize });
+      const next = await getState({ search, status, enabled, page, pageSize });
       if (requestId !== requestSequence.current) return;
       hasRunningTasks.current = next.tasks.some(isRunning);
       setState(next);
@@ -195,7 +211,7 @@ function useManagerState(search: string, status: string, page: number, pageSize:
         if (!silent) setRefreshing(false);
       }
     }
-  }, [search, status, page, pageSize]);
+  }, [search, status, enabled, page, pageSize]);
 
   refreshRef.current = refresh;
 
@@ -237,6 +253,7 @@ export function App() {
   const [searchInput, setSearchInput] = useState("");
   const search = useDebouncedValue(searchInput, 260);
   const [status, setStatus] = useState("");
+  const [enabledFilter, setEnabledFilter] = useState("");
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(50);
   const [selected, setSelected] = useState<Set<number>>(new Set());
@@ -248,7 +265,7 @@ export function App() {
   const [noticeError, setNoticeError] = useState(false);
   const [activeAction, setActiveAction] = useState("");
   const noticeTimer = useRef<number | null>(null);
-  const manager = useManagerState(search, status, page, pageSize);
+  const manager = useManagerState(search, status, enabledFilter, page, pageSize);
   const accounts = orderAccountsById(manager.state.accounts);
   const selectedTask = manager.state.tasks.find((task) => task.id === selectedTaskId);
   const runningTasks = manager.state.tasks.filter(isRunning);
@@ -271,7 +288,7 @@ export function App() {
   useEffect(() => {
     setSelected(new Set());
     setPage(1);
-  }, [search, status]);
+  }, [search, status, enabledFilter]);
 
   useEffect(() => () => {
     if (noticeTimer.current !== null) window.clearTimeout(noticeTimer.current);
@@ -333,7 +350,7 @@ export function App() {
 
   const selectFiltered = async () => {
     try {
-      const result = await getSelection({ search, status });
+      const result = await getSelection({ search, status, enabled: enabledFilter });
       setSelected(new Set(result.ids));
       flash(`已选择 ${result.ids.length} 个筛选结果`);
     } catch (reason) {
@@ -343,7 +360,7 @@ export function App() {
 
   const exportAccounts = async (format: string) => {
     try {
-      await downloadExport({ format, ids: selectedIds, search, status });
+      await downloadExport({ format, ids: selectedIds, search, status, enabled: enabledFilter });
       flash("导出已开始下载");
     } catch (reason) {
       flash(reason instanceof Error ? reason.message : String(reason), true);
@@ -414,6 +431,7 @@ export function App() {
             pagination={manager.state.pagination}
             search={searchInput}
             status={status}
+            enabledFilter={enabledFilter}
             pageSize={pageSize}
             selected={selected}
             allPageSelected={allPageSelected}
@@ -421,13 +439,14 @@ export function App() {
             busy={Boolean(activeAction)}
             onSearch={setSearchInput}
             onStatus={setStatus}
+            onEnabledFilter={setEnabledFilter}
             onPage={setPage}
             onPageSize={changePageSize}
             onSelect={toggleAccount}
             onSelectPage={selectPage}
             onSelectFiltered={selectFiltered}
             onClearSelection={() => setSelected(new Set())}
-            onClearFilters={() => { setSearchInput(""); setStatus(""); }}
+            onClearFilters={() => { setSearchInput(""); setStatus(""); setEnabledFilter(""); }}
             onAction={runAction}
             onExport={exportAccounts}
             onImportFile={importFile}
@@ -483,6 +502,7 @@ interface AccountsViewProps {
   pagination: StatePayload["pagination"];
   search: string;
   status: string;
+  enabledFilter: string;
   pageSize: number;
   selected: Set<number>;
   allPageSelected: boolean;
@@ -490,6 +510,7 @@ interface AccountsViewProps {
   busy: boolean;
   onSearch: (value: string) => void;
   onStatus: (value: string) => void;
+  onEnabledFilter: (value: string) => void;
   onPage: (value: number) => void;
   onPageSize: (value: string) => void;
   onSelect: (id: number) => void;
@@ -505,15 +526,15 @@ interface AccountsViewProps {
 
 function AccountsView(props: AccountsViewProps) {
   const {
-    accounts, stats, pagination, search, status, pageSize, selected, allPageSelected,
-    loading, busy, onSearch, onStatus, onPage, onPageSize, onSelect, onSelectPage,
+    accounts, stats, pagination, search, status, enabledFilter, pageSize, selected, allPageSelected,
+    loading, busy, onSearch, onStatus, onEnabledFilter, onPage, onPageSize, onSelect, onSelectPage,
     onSelectFiltered, onClearSelection, onClearFilters, onAction, onExport,
     onImportFile, onImportHistory,
   } = props;
   const [exportFormat, setExportFormat] = useState("cpa");
   const [confirmDelete, setConfirmDelete] = useState(false);
   const ids = [...selected];
-  const hasFilters = Boolean(search || status);
+  const hasFilters = Boolean(search || status || enabledFilter);
   const requireSelection = (endpoint: string, label: string, extra: Record<string, unknown> = {}) => {
     if (!ids.length || busy) return;
     void onAction(endpoint, { ids, ...extra }, label);
@@ -544,41 +565,52 @@ function AccountsView(props: AccountsViewProps) {
 
       <div className="react-metrics" aria-label="账号概况">
         <Metric label="全部账号" value={stats.total ?? 0} tone="total" />
-        <Metric label="状态正常" value={stats.active ?? 0} tone="success" />
+        <Metric label="已启用" value={stats.enabled ?? 0} tone="success" />
+        <Metric label="已禁用" value={stats.disabled ?? 0} tone="neutral" />
         <Metric label="需要处理" value={(stats.expired ?? 0) + (stats.invalid ?? 0) + (stats.error ?? 0) + (stats.needs_login ?? 0)} tone="danger" />
-        <Metric label="尚未巡检" value={stats.unknown ?? 0} tone="neutral" />
       </div>
 
       <section className="react-panel account-panel">
         <div className="react-toolbar">
-          <label className="search-control">
-            <span>搜索邮箱</span>
-            <span className="input-frame">
-              <i aria-hidden="true">⌕</i>
-              <input type="search" value={search} placeholder="name@example.com" onChange={(event) => onSearch(event.target.value)} />
-              {search && <button type="button" title="清除搜索" aria-label="清除搜索" onClick={() => onSearch("")}>×</button>}
-            </span>
-          </label>
-          <label>
-            <span>账号状态</span>
-            <select value={status} onChange={(event) => onStatus(event.target.value)}>
-              {STATUS_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-            </select>
-          </label>
-          <span className="filter-result"><strong>{pagination.total.toLocaleString("zh-CN")}</strong> 个结果</span>
-          <div className="filter-actions">
-            <button className="button quiet" type="button" disabled={!accounts.length || loading} onClick={onSelectPage}>
-              {allPageSelected ? "取消本页" : "选择本页"}
-            </button>
-            <button className="button quiet" type="button" disabled={!pagination.total || loading} onClick={onSelectFiltered}>
-              全选筛选结果
-            </button>
+          <div className="toolbar-filters">
+            <label className="search-control">
+              <span>搜索邮箱</span>
+              <span className="input-frame">
+                <i aria-hidden="true">⌕</i>
+                <input type="search" value={search} placeholder="name@example.com" onChange={(event) => onSearch(event.target.value)} />
+                {search && <button type="button" title="清除搜索" aria-label="清除搜索" onClick={() => onSearch("")}>×</button>}
+              </span>
+            </label>
+            <label className="filter-field">
+              <span>账号状态</span>
+              <select value={status} onChange={(event) => onStatus(event.target.value)}>
+                {STATUS_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+              </select>
+            </label>
+            <label className="filter-field">
+              <span>启用状态</span>
+              <select value={enabledFilter} onChange={(event) => onEnabledFilter(event.target.value)}>
+                {ENABLED_OPTIONS.map(([value, label]) => <option key={value || "all"} value={value}>{label}</option>)}
+              </select>
+            </label>
+          </div>
+          <div className="toolbar-meta">
+            <div className="filter-actions">
+              <button className="button quiet" type="button" disabled={!accounts.length || loading} onClick={onSelectPage}>
+                {allPageSelected ? "取消本页" : "选择本页"}
+              </button>
+              <button className="button quiet" type="button" disabled={!pagination.total || loading} onClick={onSelectFiltered}>
+                全选筛选结果
+              </button>
+            </div>
           </div>
         </div>
 
         <div className={`react-selection-bar ${selected.size ? "active" : ""}`} aria-live="polite">
           <div className="selection-summary"><strong>{selected.size}</strong><span>已选择</span></div>
           <div className="selection-actions">
+            <button type="button" disabled={!selected.size || busy} onClick={() => requireSelection("/api/accounts/enable", "已启用所选账号")}><span aria-hidden="true">●</span>启用</button>
+            <button type="button" disabled={!selected.size || busy} onClick={() => requireSelection("/api/accounts/disable", "已禁用所选账号")}><span aria-hidden="true">○</span>禁用</button>
             <button type="button" disabled={!selected.size || busy} onClick={() => requireSelection("/api/inspect", "巡检任务已创建")}><span aria-hidden="true">↻</span>巡检</button>
             <button type="button" disabled={!selected.size || busy} onClick={() => requireSelection("/api/refresh-cpa", "CPA 续期任务已创建")}><span aria-hidden="true">⟳</span>CPA 续期</button>
             <button type="button" disabled={!selected.size || busy} onClick={() => requireSelection("/api/login", "登录任务已创建", { requireAccountGates: false })} title="只重新登录，不处理 TOS 门禁"><span aria-hidden="true">→</span>登录</button>
@@ -611,14 +643,27 @@ function AccountsView(props: AccountsViewProps) {
             <thead>
               <tr>
                 <th><input type="checkbox" checked={allPageSelected} onChange={onSelectPage} aria-label="选择本页" /></th>
-                <th>账号</th><th>总状态</th><th>SSO</th><th>CPA</th><th>最后巡检</th><th>操作</th>
+                <th>账号</th><th>开关</th><th>总状态</th><th>SSO</th><th>CPA</th><th>最后巡检</th>
               </tr>
             </thead>
             <tbody>
               {loading
                 ? <TableSkeleton />
                 : accounts.map((account) => (
-                    <AccountRow account={account} selected={selected.has(account.id)} onSelect={onSelect} onAction={onAction} key={account.id} />
+                    <AccountRow
+                      account={account}
+                      selected={selected.has(account.id)}
+                      busy={busy}
+                      onSelect={onSelect}
+                      onToggleEnabled={(id, nextEnabled) => {
+                        void onAction(
+                          nextEnabled ? "/api/accounts/enable" : "/api/accounts/disable",
+                          { ids: [id] },
+                          nextEnabled ? "账号已启用" : "账号已禁用",
+                        );
+                      }}
+                      key={account.id}
+                    />
                   ))}
             </tbody>
           </table>
@@ -678,32 +723,43 @@ function TableSkeleton() {
           <td><span className="skeleton-chip" /></td>
           <td><span className="skeleton-chip" /></td>
           <td><span className="skeleton-chip" /></td>
+          <td><span className="skeleton-chip" /></td>
           <td><span className="skeleton-line medium" /></td>
-          <td><span className="skeleton-check" /></td>
         </tr>
       ))}
     </>
   );
 }
 
-function AccountRow({ account, selected, onSelect, onAction }: {
+function AccountRow({ account, selected, busy, onSelect, onToggleEnabled }: {
   account: Account;
   selected: boolean;
+  busy: boolean;
   onSelect: (id: number) => void;
-  onAction: AccountsViewProps["onAction"];
+  onToggleEnabled: (id: number, nextEnabled: boolean) => void;
 }) {
   return (
-    <tr className={selected ? "selected-row" : ""}>
+    <tr className={`${selected ? "selected-row" : ""} ${account.enabled ? "" : "disabled-row"}`.trim()}>
       <td><input type="checkbox" checked={selected} onChange={() => onSelect(account.id)} aria-label={`选择 ${account.email}`} /></td>
       <td><strong title={account.email}>{account.email}</strong><small title={account.source}>#{account.id} · {sourceLabel(account.source)}</small></td>
+      <td>
+        <button
+          className={`account-switch ${account.enabled ? "on" : "off"}`}
+          type="button"
+          role="switch"
+          aria-checked={account.enabled}
+          aria-label={`${account.enabled ? "禁用" : "启用"} ${account.email}`}
+          disabled={busy}
+          onClick={() => onToggleEnabled(account.id, !account.enabled)}
+        >
+          <span className="account-switch-track" aria-hidden="true"><i /></span>
+          <span>{account.enabled ? "启用" : "禁用"}</span>
+        </button>
+      </td>
       <td><span className={`react-status ${statusClass(account.status)}`}>{account.statusLabel}</span><small title={account.detail}>{account.detail || "-"}</small></td>
       <td><span className={`react-status ${statusClass(account.ssoStatus)}`}>{account.ssoStatusLabel}</span><small>{account.hasSso ? "已配置" : "缺少 cookie"}</small></td>
       <td><span className={`react-status ${statusClass(account.cpaStatus)}`}>{account.cpaStatusLabel}</span><small>{account.hasAccessToken ? "access token" : "缺少 token"}</small></td>
       <td><small>{formatTime(account.lastCheckedAt)}</small></td>
-      <td className="row-actions">
-        <button className="icon-action" type="button" title="巡检账号" aria-label={`巡检 ${account.email}`} onClick={() => void onAction("/api/inspect", { ids: [account.id] }, "巡检任务已创建")}>↻</button>
-        <button className="icon-action" type="button" title="授权确认（TOS）" aria-label={`授权确认 ${account.email}`} onClick={() => void onAction("/api/consent", { ids: [account.id] }, "授权确认任务已创建")}>✓</button>
-      </td>
     </tr>
   );
 }

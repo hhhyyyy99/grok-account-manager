@@ -78,6 +78,7 @@ class Account:
     created_at: str
     updated_at: str
     cpa_updated_at: str = ""
+    enabled: bool = True
 
     @classmethod
     def from_row(cls, row: Mapping[str, Any]) -> "Account":
@@ -86,8 +87,14 @@ class Account:
         for field in cls.__dataclass_fields__:
             if field in keys:
                 values[field] = row[field]
+            elif field == "id":
+                values[field] = 0
+            elif field == "enabled":
+                values[field] = True
             else:
-                values[field] = 0 if field == "id" else ""
+                values[field] = ""
+        if "enabled" in values:
+            values["enabled"] = bool(int(values["enabled"])) if values["enabled"] is not None else True
         return cls(**values)
 
     @property

@@ -3,6 +3,7 @@ export type ViewName = "accounts" | "registration" | "settings";
 export interface Account {
   id: number;
   email: string;
+  enabled: boolean;
   status: string;
   statusLabel: string;
   detail: string;
@@ -32,6 +33,8 @@ export interface Pagination {
 
 export interface Stats {
   total: number;
+  enabled?: number;
+  disabled?: number;
   active?: number;
   unknown?: number;
   expired?: number;

@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     cpa_updated_at TEXT NOT NULL DEFAULT '',
     last_checked_at TEXT NOT NULL DEFAULT '',
     last_login_at TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -52,6 +53,7 @@ MIGRATION_COLUMNS = {
     "cpa_detail": "TEXT NOT NULL DEFAULT ''",
     "cpa_updated_at": "TEXT NOT NULL DEFAULT ''",
     "source_modified_at": "TEXT NOT NULL DEFAULT ''",
+    "enabled": "INTEGER NOT NULL DEFAULT 1",
 }
 
 
@@ -92,7 +94,10 @@ class AccountStore:
                 "UPDATE accounts SET status = 'unknown', status_detail = '' "
                 "WHERE status = 'logging_in'"
             )
-            conn.execute("PRAGMA user_version = 4")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_accounts_enabled ON accounts(enabled)"
+            )
+            conn.execute("PRAGMA user_version = 5")
         if self._migrate_plaintext_credentials():
             self._compact_after_migration()
         try:
@@ -424,12 +429,13 @@ class AccountStore:
         self,
         search: str = "",
         status: str = "",
+        enabled: Optional[bool] = None,
         limit: Optional[int] = None,
         offset: int = 0,
     ) -> List[Account]:
-        where_sql, params = self._account_filter(search, status)
+        where_sql, params = self._account_filter(search, status, enabled)
         sql = "SELECT * FROM accounts" + where_sql
-        sql += " ORDER BY id DESC"
+        sql += " ORDER BY enabled DESC, id DESC"
         clean_offset = max(0, int(offset))
         if limit is not None:
             sql += " LIMIT ? OFFSET ?"
@@ -441,16 +447,25 @@ class AccountStore:
             rows = conn.execute(sql, params).fetchall()
         return [self._decrypt_row(row) for row in rows]
 
-    def count_accounts(self, search: str = "", status: str = "") -> int:
-        where_sql, params = self._account_filter(search, status)
+    def count_accounts(
+        self,
+        search: str = "",
+        status: str = "",
+        enabled: Optional[bool] = None,
+    ) -> int:
+        where_sql, params = self._account_filter(search, status, enabled)
         with self._connect() as conn:
             row = conn.execute("SELECT COUNT(*) FROM accounts" + where_sql, params).fetchone()
         return int(row[0])
 
     @staticmethod
-    def _account_filter(search: str, status: str) -> Tuple[str, List[str]]:
+    def _account_filter(
+        search: str,
+        status: str,
+        enabled: Optional[bool] = None,
+    ) -> Tuple[str, List[Any]]:
         clauses = []
-        params: List[str] = []
+        params: List[Any] = []
         if search.strip():
             escaped_search = (
                 search.strip()
@@ -466,6 +481,9 @@ class AccountStore:
         elif clean_status:
             clauses.append("status = ?")
             params.append(clean_status)
+        if enabled is not None:
+            clauses.append("enabled = ?")
+            params.append(1 if enabled else 0)
         return (" WHERE " + " AND ".join(clauses) if clauses else "", params)
 
     def ids_for_statuses(self, statuses: Sequence[str]) -> List[int]:
@@ -814,10 +832,30 @@ class AccountStore:
             cursor = conn.execute("DELETE FROM accounts WHERE id IN (%s)" % placeholders, ids)
             return int(cursor.rowcount)
 
+    def set_enabled(self, account_ids: Sequence[int], enabled: bool) -> int:
+        ids = [int(value) for value in account_ids]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        params: List[Any] = [1 if enabled else 0, utc_now_iso()] + ids
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE accounts SET enabled = ?, updated_at = ? "
+                "WHERE id IN (%s)" % placeholders,
+                params,
+            )
+            return int(cursor.rowcount)
+
     def stats(self) -> Dict[str, int]:
-        values = {"total": 0}
+        values = {"total": 0, "enabled": 0, "disabled": 0}
         with self._connect() as conn:
             values["total"] = int(conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0])
+            values["enabled"] = int(
+                conn.execute("SELECT COUNT(*) FROM accounts WHERE enabled = 1").fetchone()[0]
+            )
+            values["disabled"] = int(
+                conn.execute("SELECT COUNT(*) FROM accounts WHERE enabled = 0").fetchone()[0]
+            )
             rows = conn.execute("SELECT status, COUNT(*) count FROM accounts GROUP BY status").fetchall()
         for row in rows:
             values[str(row["status"])] = int(row["count"])

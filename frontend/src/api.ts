@@ -27,12 +27,14 @@ export async function api<T>(
 export function getState(params: {
   search: string;
   status: string;
+  enabled: string;
   page: number;
   pageSize: number;
 }): Promise<StatePayload> {
   const query = new URLSearchParams({
     search: params.search,
     status: params.status,
+    enabled: params.enabled,
     page: String(params.page),
     page_size: String(params.pageSize),
   });
@@ -41,8 +43,16 @@ export function getState(params: {
 
 export const getConfig = () => api<ConfigPayload>("/api/config");
 export const getTask = (id: string) => api<Task>(`/api/tasks/${encodeURIComponent(id)}`);
-export function getSelection(params: { search: string; status: string }): Promise<{ ids: number[]; total: number }> {
-  const query = new URLSearchParams({ search: params.search, status: params.status });
+export function getSelection(params: {
+  search: string;
+  status: string;
+  enabled: string;
+}): Promise<{ ids: number[]; total: number }> {
+  const query = new URLSearchParams({
+    search: params.search,
+    status: params.status,
+    enabled: params.enabled,
+  });
   return api<{ ids: number[]; total: number }>("/api/accounts/selection?" + query.toString());
 }
 export const post = <T>(path: string, body: unknown) =>

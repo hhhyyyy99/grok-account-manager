@@ -423,6 +423,7 @@ class GrokWebApplication:
         return {
             "id": account.id,
             "email": safe_visible(account.email),
+            "enabled": bool(account.enabled),
             "status": account.status,
             "statusLabel": account.status_label,
             "detail": safe_visible(account.status_detail),
@@ -445,9 +446,19 @@ class GrokWebApplication:
             "source": safe_visible(account.source),
         }
 
+    @staticmethod
+    def _enabled_filter(raw: str) -> Optional[bool]:
+        value = (raw or "").strip().lower()
+        if value in ("1", "true", "enabled", "yes"):
+            return True
+        if value in ("0", "false", "disabled", "no"):
+            return False
+        return None
+
     def state_json(self, query: Dict[str, List[str]]) -> Dict[str, Any]:
         search = (query.get("search") or [""])[0]
         status = (query.get("status") or [""])[0]
+        enabled = self._enabled_filter((query.get("enabled") or [""])[0])
         try:
             requested_page = max(1, int((query.get("page") or ["1"])[0]))
         except (TypeError, ValueError):
@@ -456,12 +467,13 @@ class GrokWebApplication:
             page_size = max(1, min(200, int((query.get("page_size") or ["50"])[0])))
         except (TypeError, ValueError):
             page_size = 50
-        total = self.manager.store.count_accounts(search=search, status=status)
+        total = self.manager.store.count_accounts(search=search, status=status, enabled=enabled)
         total_pages = max(1, (total + page_size - 1) // page_size)
         page = min(requested_page, total_pages)
         accounts = self.manager.store.list_accounts(
             search=search,
             status=status,
+            enabled=enabled,
             limit=page_size,
             offset=(page - 1) * page_size,
         )
@@ -480,10 +492,11 @@ class GrokWebApplication:
     def selection_json(self, query: Dict[str, List[str]]) -> Dict[str, Any]:
         search = (query.get("search") or [""])[0]
         status = (query.get("status") or [""])[0]
-        total = self.manager.store.count_accounts(search=search, status=status)
+        enabled = self._enabled_filter((query.get("enabled") or [""])[0])
+        total = self.manager.store.count_accounts(search=search, status=status, enabled=enabled)
         if total > 10000:
             raise ValueError("单次最多选择 10000 个账号，请先缩小筛选范围")
-        accounts = self.manager.store.list_accounts(search=search, status=status)
+        accounts = self.manager.store.list_accounts(search=search, status=status, enabled=enabled)
         return {
             "ids": [account.id for account in accounts],
             "total": total,
@@ -1106,6 +1119,22 @@ class GrokWebApplication:
                     elif parsed.path == "/api/accounts/delete":
                         ids = application._ids(payload)
                         self._json({"deleted": application.manager.store.delete(ids)})
+                    elif parsed.path == "/api/accounts/enable":
+                        ids = application._ids(payload)
+                        self._json(
+                            {
+                                "updated": application.manager.store.set_enabled(ids, True),
+                                "enabled": True,
+                            }
+                        )
+                    elif parsed.path == "/api/accounts/disable":
+                        ids = application._ids(payload)
+                        self._json(
+                            {
+                                "updated": application.manager.store.set_enabled(ids, False),
+                                "enabled": False,
+                            }
+                        )
                     elif parsed.path == "/api/accounts/export":
                         exported = application.export_accounts(payload)
                         self._bytes(

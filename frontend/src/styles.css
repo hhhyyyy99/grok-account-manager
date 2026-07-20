@@ -303,14 +303,29 @@ button:active:not(:disabled), .button:active:not(:disabled) { transform: transla
 .react-panel { border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
 .account-panel { overflow: clip; }
 .react-toolbar {
+  display: flex;
+  min-height: 78px;
+  align-items: end;
+  justify-content: space-between;
+  gap: 16px 20px;
+  padding: 14px 16px 15px;
+  border-bottom: 1px solid #e9ece7;
+  background: linear-gradient(180deg, #fcfdfb 0%, var(--surface) 100%);
+}
+.toolbar-filters {
   display: grid;
-  min-height: 76px;
-  grid-template-columns: minmax(220px, 1fr) minmax(150px, .42fr) auto auto;
+  min-width: 0;
+  flex: 1 1 auto;
+  grid-template-columns: minmax(240px, 1.6fr) minmax(132px, .7fr) minmax(118px, .58fr);
+  align-items: end;
+  gap: 10px 12px;
+}
+.toolbar-meta {
+  display: flex;
+  flex: 0 0 auto;
   align-items: end;
   gap: 12px;
-  padding: 13px 15px 14px;
-  border-bottom: 1px solid #e9ece7;
-  background: var(--surface);
+  padding-bottom: 1px;
 }
 .react-toolbar label, .react-panel label {
   display: grid;
@@ -320,13 +335,26 @@ button:active:not(:disabled), .button:active:not(:disabled) { transform: transla
   font-size: 10px;
   font-weight: 650;
 }
+.react-toolbar .filter-field select {
+  min-width: 0;
+  padding-right: 1.7rem;
+  background-image:
+    linear-gradient(45deg, transparent 50%, #7d867e 50%),
+    linear-gradient(135deg, #7d867e 50%, transparent 50%);
+  background-position:
+    calc(100% - 12px) calc(50% - 1px),
+    calc(100% - 8px) calc(50% - 1px);
+  background-size: 4px 4px, 4px 4px;
+  background-repeat: no-repeat;
+  appearance: none;
+}
 .react-toolbar input, .react-toolbar select, .react-panel input, .react-panel select {
   min-height: 36px;
   min-width: 0;
   border: 1px solid var(--line-strong);
   border-radius: 4px;
   padding: 0 10px;
-  background: var(--surface);
+  background-color: var(--surface);
   color: #273028;
   font-size: 11px;
 }
@@ -359,9 +387,24 @@ button:active:not(:disabled), .button:active:not(:disabled) { transform: transla
   font-size: 15px;
 }
 .input-frame button:hover { background: var(--surface-strong); color: var(--ink); }
-.filter-result { align-self: center; color: var(--muted); font-size: 10px; white-space: nowrap; }
-.filter-result strong { color: var(--ink-soft); font: 700 12px/1 "Noto Sans Mono", monospace; font-variant-numeric: tabular-nums; }
-.filter-actions { display: flex; align-items: center; justify-content: flex-end; gap: 7px; }
+.filter-actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.filter-actions .button {
+  min-height: 36px;
+  padding: 0 12px;
+  border-color: #d5dbd3;
+  background: #f4f6f2;
+  color: #465048;
+  font-size: 10px;
+  font-weight: 650;
+}
+.filter-actions .button:hover:not(:disabled) {
+  border-color: #bcc5b8;
+  background: #ebefe6;
+}
 
 .react-selection-bar {
   position: relative;
@@ -478,13 +521,51 @@ button:active:not(:disabled), .button:active:not(:disabled) { transform: transla
 }
 .react-table th:first-child, .react-table td:first-child { width: 44px; text-align: center; }
 .react-table th:nth-child(2) { width: 28%; }
-.react-table th:nth-child(3), .react-table th:nth-child(4), .react-table th:nth-child(5) { width: 13%; }
-.react-table th:nth-child(6) { width: 15%; }
-.react-table th:last-child, .react-table td:last-child { width: 64px; text-align: center; }
+.react-table th:nth-child(3) { width: 12%; }
+.react-table th:nth-child(4), .react-table th:nth-child(5), .react-table th:nth-child(6) { width: 13%; }
+.react-table th:nth-child(7) { width: 16%; }
 .react-table th, .react-table td { padding: 0 12px; border-bottom: 1px solid #ecefeb; }
 .react-table tbody tr { height: 70px; transition: background-color 160ms ease, box-shadow 160ms ease; }
 .react-table tbody tr:hover:not(.skeleton-row) { background: #fafbf8; box-shadow: inset 2px 0 #c8d581; }
 .react-table tbody tr.selected-row { background: #f5f8e9; box-shadow: inset 3px 0 var(--accent-strong); }
+.react-table tbody tr.disabled-row { opacity: .72; }
+.react-table tbody tr.disabled-row td > strong { color: #6f796f; }
+.account-switch {
+  display: inline-flex;
+  min-height: 30px;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid #d7ddd6;
+  border-radius: 999px;
+  padding: 0 10px 0 6px;
+  background: #f7f8f5;
+  color: #59645c;
+  font: 600 10px/1 "Noto Sans", system-ui, sans-serif;
+  cursor: pointer;
+}
+.account-switch:hover:not(:disabled) { border-color: #bcc7b9; background: #fff; }
+.account-switch:disabled { opacity: .55; cursor: not-allowed; }
+.account-switch.on { border-color: #c8d9b4; background: #f3f8ea; color: #3f6a2d; }
+.account-switch.off { border-color: #e1e4e0; background: #f4f5f3; color: #7a847c; }
+.account-switch-track {
+  display: inline-flex;
+  width: 28px;
+  height: 16px;
+  align-items: center;
+  border-radius: 999px;
+  background: #c7cdc5;
+  padding: 0 2px;
+  transition: background-color 140ms ease;
+}
+.account-switch.on .account-switch-track { background: #7fad55; justify-content: flex-end; }
+.account-switch.off .account-switch-track { justify-content: flex-start; }
+.account-switch-track i {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(40, 52, 42, .18);
+}
 .react-table td { overflow: hidden; color: #354037; font-size: 11px; vertical-align: middle; }
 .react-table td > strong {
   display: block;
@@ -530,12 +611,6 @@ button:active:not(:disabled), .button:active:not(:disabled) { transform: transla
 .react-status.checking::before, .react-status.running::before { background: var(--warning); animation: state-pulse 900ms ease-in-out infinite; }
 .react-status.needs_login, .react-status.unknown, .react-status.queued, .react-status.limited { border-color: #d5dfe5; background: var(--info-soft); color: var(--info); }
 .react-status.needs_login::before, .react-status.unknown::before, .react-status.queued::before, .react-status.limited::before { background: var(--info); }
-.row-actions {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  white-space: nowrap;
-}
 .icon-action {
   display: inline-grid;
   width: 31px;
@@ -928,8 +1003,18 @@ button:active:not(:disabled), .button:active:not(:disabled) { transform: transla
 @media (max-width: 1100px) {
   .topbar-inner { gap: 20px; padding: 0 22px; }
   .react-brand { min-width: auto; }
-  .react-toolbar { grid-template-columns: minmax(220px, 1fr) minmax(150px, .5fr) auto; }
-  .filter-actions { grid-column: 1 / -1; justify-content: flex-start; }
+  .react-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .toolbar-filters {
+    grid-template-columns: minmax(0, 1.4fr) minmax(140px, .7fr) minmax(120px, .6fr);
+  }
+  .toolbar-meta {
+    justify-content: space-between;
+    width: 100%;
+  }
   .selection-actions { overflow-x: auto; padding-bottom: 2px; }
   .react-form-grid, .settings-grid { grid-template-columns: minmax(240px, .72fr) minmax(0, 1.28fr); }
 }
@@ -958,9 +1043,14 @@ button:active:not(:disabled), .button:active:not(:disabled) { transform: transla
   .react-metric { min-height: 82px; border-bottom: 1px solid #e7eae5; }
   .react-metric:nth-child(2) { border-right: 0; }
   .react-metric:nth-child(3), .react-metric:nth-child(4) { border-bottom: 0; }
-  .react-toolbar { grid-template-columns: 1fr; align-items: stretch; }
-  .filter-result { align-self: center; }
-  .filter-actions { grid-column: auto; overflow-x: auto; }
+  .react-toolbar { align-items: stretch; flex-direction: column; }
+  .toolbar-filters { grid-template-columns: 1fr; }
+  .toolbar-meta {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .filter-actions { overflow-x: auto; }
   .react-selection-bar { align-items: flex-start; gap: 9px; }
   .selection-summary { min-width: 55px; padding-top: 7px; }
   .selection-actions { padding-bottom: 5px; }
