@@ -78,6 +78,7 @@ class AccountExportTests(unittest.TestCase):
                 "fresh-access",
                 sub2api["accounts"][0]["credentials"]["access_token"],
             )
+            self.assertNotIn("base_url", sub2api["accounts"][0]["credentials"])
 
             grok2api_export = exporter.export([exportable, missing], "grok2api")
             grok2api = json.loads(grok2api_export.body)

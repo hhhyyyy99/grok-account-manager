@@ -59,7 +59,6 @@ def cpa_xai_to_sub2api_account(cpa: dict[str, Any], *, source: str = "cpa_xai") 
     refresh_token = str(cpa.get("refresh_token") or "")
     email = str(cpa.get("email") or "")
     sub = str(cpa.get("sub") or "")
-    base_url = str(cpa.get("base_url") or "https://cli-chat-proxy.grok.com/v1")
     expired = str(cpa.get("expired") or "")
     expires_at = _expires_at_ms(access_token, expired)
     name = email or sub or "xAI Account"
@@ -80,7 +79,6 @@ def cpa_xai_to_sub2api_account(cpa: dict[str, Any], *, source: str = "cpa_xai") 
             "expired": expired,
             "email": email,
             "sub": sub,
-            "base_url": base_url,
             "token_endpoint": cpa.get("token_endpoint") or "https://auth.x.ai/oauth2/token",
             "redirect_uri": cpa.get("redirect_uri") or "http://127.0.0.1:56121/callback",
             "headers": cpa.get("headers") or {},
