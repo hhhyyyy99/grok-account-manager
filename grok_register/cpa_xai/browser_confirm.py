@@ -1123,8 +1123,45 @@ def _raise_for_login_error(visible_text: str) -> None:
         raise BrowserConfirmError("邮箱或密码错误")
 
 
-def _wait_turnstile(page: Any, log: LogFn, timeout: float = 45.0) -> bool:
-    """Wait/click Cloudflare Turnstile on the mint browser page."""
+def _turnstile_present(page: Any) -> bool:
+    """Best-effort check that a Turnstile widget/token field exists on the page."""
+    try:
+        if page.ele("@name=cf-turnstile-response", timeout=0.15) is not None:
+            return True
+    except Exception:
+        pass
+    try:
+        found = page.run_js(
+            """
+try {
+  if (document.querySelector('input[name="cf-turnstile-response"]')) return true;
+  if (document.querySelector('.cf-turnstile, iframe[src*="turnstile"], iframe[src*="challenges.cloudflare"]')) return true;
+  if (window.turnstile) return true;
+  return false;
+} catch (e) { return false; }
+            """
+        )
+        return bool(found)
+    except Exception:
+        return False
+
+
+def _wait_turnstile(
+    page: Any,
+    log: LogFn,
+    timeout: float = 45.0,
+    stop_event: threading.Event | None = None,
+) -> bool:
+    """Wait/click Cloudflare Turnstile on the mint browser page.
+
+    On slow networks the widget may never appear. Fail faster when:
+    - stop_event is set / overall budget is exhausted
+    - no Turnstile widget is observed for a short while
+    """
+    budget = max(3.0, float(timeout or 0.0))
+    deadline = time.time() + budget
+    no_widget_limit = min(12.0, max(5.0, budget * 0.45))
+    no_widget_deadline = time.time() + no_widget_limit
     try:
         reset = page.run_js(
             """
@@ -1140,9 +1177,22 @@ return false;
     except Exception:
         pass
 
-    deadline = time.time() + timeout
     clicked = False
+    saw_widget = False
     while time.time() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            log("turnstile wait interrupted by stop_event")
+            return False
+        if not saw_widget:
+            saw_widget = _turnstile_present(page)
+            if saw_widget:
+                log("turnstile widget detected")
+            elif time.time() >= no_widget_deadline:
+                log(
+                    "turnstile widget missing after %.0fs — likely network/CF stall"
+                    % no_widget_limit
+                )
+                return False
         try:
             token = page.run_js(
                 """
@@ -1168,6 +1218,7 @@ try {
         try:
             challenge_input = page.ele("@name=cf-turnstile-response", timeout=0.2)
             if challenge_input is not None:
+                saw_widget = True
                 wrapper = challenge_input.parent()
                 iframe = None
                 try:
@@ -1703,13 +1754,20 @@ def _prepare_password_login(
     email: str,
     password: str,
     log: LogFn,
+    timeout: float = 45.0,
+    stop_event: threading.Event | None = None,
 ) -> bool:
     _fill(page, "css:input[type='email']", email, log, "email")
     if not _fill(
         page, PASSWORD_SELECTOR, password, log, "password"
     ):
         return False
-    return _wait_turnstile(page, log, 45)
+    return _wait_turnstile(
+        page,
+        log,
+        timeout=max(3.0, float(timeout or 0.0)),
+        stop_event=stop_event,
+    )
 
 
 def approve_device_code(
@@ -1931,6 +1989,13 @@ def approve_device_code(
             if allow_passwordless and not password:
                 raise BrowserConfirmError("SSO 会话不足，设备授权仍要求登录")
             phase = "password"
+            remaining = max(0.0, deadline - time.time())
+            if remaining < 8.0:
+                _raise_for_login_error(_visible_text(page))
+                raise BrowserConfirmError(
+                    "浏览器登录未完成: phase=password remaining=%.0fs login_attempts=%s"
+                    % (remaining, login_attempts)
+                )
             if login_attempts >= 5:
                 # Only auto-reset when the page explicitly reports bad credentials.
                 _raise_for_login_error(_visible_text(page))
@@ -1939,8 +2004,32 @@ def approve_device_code(
                 )
             login_attempts += 1
             log(f"login attempt {login_attempts}")
-            if not _prepare_password_login(page, email, password, log):
-                log("login submit deferred until turnstile is ready")
+            # Cap per-attempt turnstile wait so a dead CF widget cannot burn the
+            # whole browser_timeout, especially on slow/broken networks.
+            turnstile_budget = min(20.0, max(6.0, remaining - 5.0))
+            if not _prepare_password_login(
+                page,
+                email,
+                password,
+                log,
+                timeout=turnstile_budget,
+                stop_event=stop_event,
+            ):
+                if stop_event is not None and stop_event.is_set():
+                    log("login interrupted while waiting for turnstile")
+                    return gate_state or None
+                log(
+                    "login submit deferred: turnstile not ready "
+                    "(budget=%.0fs remaining=%.0fs) — reloading sign-in"
+                    % (turnstile_budget, remaining)
+                )
+                # Network stalls often leave a blank challenge slot above the
+                # login button. Reload the password page instead of spinning.
+                try:
+                    page.get(verification_uri_complete)
+                except Exception as e:
+                    log(f"reload device uri after turnstile stall failed: {e}")
+                _sleep(1.2)
                 continue
             # REAL click login helps form submit
             if not _click_exact(page, ["登录", "Sign in", "Log in"], log, real=True):
@@ -1953,8 +2042,9 @@ def approve_device_code(
                         log("clicked login submit real")
                 except Exception as e:
                     log(f"login submit fail: {e}")
-            # wait navigation / credential error
-            for _ in range(30):
+            # wait navigation / credential error — bound by remaining budget
+            post_deadline = min(deadline, time.time() + 15.0)
+            while time.time() < post_deadline:
                 if stop_event is not None and stop_event.is_set():
                     return gate_state or None
                 _sleep(0.5)

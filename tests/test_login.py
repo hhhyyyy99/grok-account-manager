@@ -193,15 +193,15 @@ class BatchLoginCredentialTests(unittest.TestCase):
             selectors[field_name] = _selector
             return True
 
-        def fake_wait(_page, _log, timeout):
-            events.append(("turnstile", timeout))
+        def fake_wait(_page, _log, timeout, stop_event=None):
+            events.append(("turnstile", timeout, stop_event is not None))
             return True
 
         with patch.object(browser_confirm, "_fill", side_effect=fake_fill), patch.object(
             browser_confirm, "_wait_turnstile", side_effect=fake_wait
         ):
             ready = browser_confirm._prepare_password_login(
-                object(), "email", "password", lambda _: None
+                object(), "email", "password", lambda _: None, timeout=12.0
             )
 
         self.assertTrue(ready)
@@ -209,11 +209,121 @@ class BatchLoginCredentialTests(unittest.TestCase):
             [
                 ("fill", "email"),
                 ("fill", "password"),
-                ("turnstile", 45),
+                ("turnstile", 12.0, False),
             ],
             events,
         )
         self.assertIn("input[name='password']", selectors["password"])
+
+    def test_wait_turnstile_fails_fast_when_widget_never_appears(self) -> None:
+        sleeps = []
+        now = {"t": 1000.0}
+
+        class FakePage:
+            def ele(self, _selector, timeout=0):
+                return None
+
+            def run_js(self, _script):
+                return False
+
+        def fake_sleep(sec):
+            sleeps.append(sec)
+            now["t"] += float(sec)
+
+        with patch.object(browser_confirm, "_sleep", side_effect=fake_sleep), patch.object(
+            browser_confirm.time, "time", side_effect=lambda: now["t"]
+        ):
+            ready = browser_confirm._wait_turnstile(
+                FakePage(),
+                lambda _message: None,
+                timeout=20.0,
+            )
+
+        self.assertFalse(ready)
+        # Fail before burning the full 20s when no widget is observed.
+        self.assertLess(sum(sleeps), 12.0)
+        self.assertGreaterEqual(sum(sleeps), 5.0)
+
+    def test_password_step_caps_turnstile_wait_and_reloads_on_stall(self) -> None:
+        class FakeElement:
+            def __init__(self):
+                self.value = ""
+
+            def clear(self, by_js=False):
+                self.value = ""
+
+            def input(self, value):
+                self.value = str(value)
+
+            def click(self, by_js=False):
+                return None
+
+        class FakePage:
+            def __init__(self):
+                self.gets = []
+
+            def ele(self, selector, timeout=0):
+                text = str(selector)
+                if "user_code" in text or "continue-with-email" in text:
+                    return None
+                if "type='email'" in text or 'type="email"' in text:
+                    return FakeElement()
+                if "password" in text:
+                    return FakeElement()
+                if "submit" in text or "sign-in-submit" in text:
+                    return FakeElement()
+                return None
+
+            def eles(self, _selector):
+                return []
+
+            def get(self, url, timeout=None):
+                self.gets.append(url)
+                return None
+
+            def run_js(self, script):
+                if "innerText" in str(script):
+                    return "使用您的邮箱登录"
+                return ""
+
+        page = FakePage()
+        logs = []
+        wait_timeouts = []
+        now = {"t": 0.0}
+
+        def fake_wait(_page, _log, timeout, stop_event=None):
+            wait_timeouts.append(timeout)
+            now["t"] += float(timeout)
+            return False
+
+        def fake_sleep(sec):
+            now["t"] += float(sec)
+
+        with patch.object(browser_confirm, "_wait_turnstile", side_effect=fake_wait), patch.object(
+            browser_confirm, "_click_exact", return_value=False
+        ), patch.object(browser_confirm, "_sleep", side_effect=fake_sleep), patch.object(
+            browser_confirm.time, "time", side_effect=lambda: now["t"]
+        ), patch.object(
+            browser_confirm, "_page_url", return_value="https://accounts.x.ai/sign-in"
+        ), patch.object(browser_confirm, "_click_email_login_chooser", return_value=False):
+            with self.assertRaisesRegex(
+                browser_confirm.BrowserConfirmError,
+                r"浏览器登录未完成|密码页多次提交仍未通过",
+            ):
+                browser_confirm.approve_device_code(
+                    page,
+                    verification_uri_complete="https://accounts.x.ai/oauth2/device?user_code=ABCD",
+                    email="target@example.com",
+                    password="password",
+                    user_code="ABCD",
+                    timeout_sec=25,
+                    log=logs.append,
+                )
+
+        self.assertTrue(wait_timeouts)
+        self.assertTrue(all(value <= 20.0 for value in wait_timeouts))
+        self.assertTrue(any("reloading sign-in" in line for line in logs))
+        self.assertGreaterEqual(len(page.gets), 2)
 
     def test_password_step_preserves_existing_readonly_email(self) -> None:
         class FakeElement:
