@@ -1191,7 +1191,7 @@ function ManagerConfigPanel({ values, onChange, saving, onSave }: { values: Conf
 
 function RegistrationConfigPanel({ values, secrets, onChange, saving, onSave }: { values: ConfigDraft; secrets: Record<string, boolean>; onChange: (name: string, value: unknown) => void; saving: boolean; onSave: () => Promise<void> }) {
   return <ConfigPanel title="注册基础" kicker="注册运行时" index="02" footer={<button className="button primary" type="button" disabled={saving} onClick={() => void onSave()}>{saving ? "保存中" : "保存注册基础"}</button>}>
-    <ConfigGroup title="网络与浏览器"><div className="config-grid two"><ConfigField values={values} secrets={secrets} name="proxy" label="注册代理" secret onChange={onChange} placeholder="http://user:pass@host:port" /><ConfigField values={values} name="thread_start_interval" label="线程启动间隔（秒）" type="number" min={0} step={0.1} onChange={onChange} /><ConfigField values={values} name="user_agent" label="浏览器 User-Agent" wide onChange={onChange} /></div><div className="toggle-grid"><ConfigToggle values={values} name="enable_nsfw" label="注册后启用 NSFW" onChange={onChange} /></div></ConfigGroup>
+    <ConfigGroup title="网络与浏览器"><div className="config-grid two"><ConfigField values={values} name="proxy" label="注册代理" onChange={onChange} placeholder="http://user:pass@host:port" /><ConfigField values={values} name="thread_start_interval" label="线程启动间隔（秒）" type="number" min={0} step={0.1} onChange={onChange} /><ConfigField values={values} name="user_agent" label="浏览器 User-Agent" wide onChange={onChange} /></div><div className="toggle-grid"><ConfigToggle values={values} name="enable_nsfw" label="注册后启用 NSFW" onChange={onChange} /></div></ConfigGroup>
   </ConfigPanel>;
 }
 

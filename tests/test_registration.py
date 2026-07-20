@@ -294,7 +294,10 @@ class RegistrationImportTests(unittest.TestCase):
             on_disk = json.loads(config_file.read_text(encoding="utf-8"))
             loaded = manager.reference.load_registration_config()
 
-            self.assertTrue(
+            self.assertEqual(
+                "http://user:pass@example.test:8080", str(on_disk.get("proxy") or "")
+            )
+            self.assertFalse(
                 CredentialVault.is_encrypted(str(on_disk.get("proxy") or ""))
             )
             self.assertTrue(
@@ -330,7 +333,10 @@ class RegistrationImportTests(unittest.TestCase):
             )
             loaded = manager.reference.load_registration_config()
 
-            self.assertTrue(
+            self.assertEqual(
+                "http://user:pass@example.test:8080", str(on_disk.get("proxy") or "")
+            )
+            self.assertFalse(
                 CredentialVault.is_encrypted(str(on_disk.get("proxy") or ""))
             )
             self.assertTrue(

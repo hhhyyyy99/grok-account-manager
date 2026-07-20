@@ -367,9 +367,12 @@ process.stdout.write(JSON.stringify(orderAccountsById(accounts).map((item) => it
             )
             application = GrokWebApplication(manager)
             response = application.config_json()
-            self.assertEqual("", response["registration"]["proxy"])
+            self.assertEqual(
+                "http://user:pass@example.test:8080",
+                response["registration"]["proxy"],
+            )
             self.assertEqual("", response["registration"]["cloudflare_api_key"])
-            self.assertTrue(response["registrationSecrets"]["proxy"])
+            self.assertNotIn("proxy", response["registrationSecrets"])
             self.assertTrue(response["registrationSecrets"]["cloudflare_api_key"])
 
             application.save_reference_config(
@@ -384,7 +387,7 @@ process.stdout.write(JSON.stringify(orderAccountsById(accounts).map((item) => it
             self.assertEqual("duckmail", loaded["email_provider"])
             self.assertEqual("https://cpa.example.test/v2", loaded["cpa_base_url"])
 
-            application.save_reference_config({"proxy": None})
+            application.save_reference_config({"proxy": ""})
             self.assertEqual("", manager.reference.load_registration_config()["proxy"])
 
 if __name__ == "__main__":

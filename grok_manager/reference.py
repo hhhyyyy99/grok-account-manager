@@ -39,7 +39,6 @@ SENSITIVE_CONFIG_KEYS = frozenset(
     {
         "duckmail_api_key",
         "cloudflare_api_key",
-        "proxy",
         "yyds_api_key",
         "yyds_jwt",
         "grok2api_remote_app_key",
@@ -47,6 +46,9 @@ SENSITIVE_CONFIG_KEYS = frozenset(
         "cpa_cloud_management_key",
     }
 )
+
+# Proxy used to be vault-encrypted; still decrypt legacy ciphertext on load.
+LEGACY_ENCRYPTED_CONFIG_KEYS = frozenset({"proxy"})
 
 
 def _is_supported_python(version_text: str) -> bool:
@@ -210,7 +212,7 @@ class ReferenceProject:
                 raise ReferenceProjectError("注册配置必须是 JSON 对象")
             base.update(local)
         vault = self.credential_vault
-        for key in SENSITIVE_CONFIG_KEYS:
+        for key in SENSITIVE_CONFIG_KEYS | LEGACY_ENCRYPTED_CONFIG_KEYS:
             raw = str(base.get(key) or "")
             if not raw:
                 continue
@@ -240,6 +242,16 @@ class ReferenceProject:
         document = dict(existing)
         document.update(values)
         vault = self.credential_vault
+        for key in LEGACY_ENCRYPTED_CONFIG_KEYS:
+            raw = str(document.get(key) or "")
+            if not raw or not CredentialVault.is_encrypted(raw):
+                continue
+            if vault is None or not vault.is_unlocked:
+                raise ReferenceProjectError("读取受保护注册配置前必须解锁保险库")
+            try:
+                document[key] = vault.decrypt_text(raw, "registration-config:%s" % key)
+            except Exception as exc:
+                raise ReferenceProjectError("注册配置密文无法解密: %s" % key) from exc
         for key in SENSITIVE_CONFIG_KEYS:
             if key in values and values.get(key) is None:
                 document[key] = ""
