@@ -259,16 +259,87 @@ def command_delete(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_cpa_guard(args: argparse.Namespace) -> int:
+    manager = _manager()
+    interval = (
+        int(args.interval)
+        if args.interval is not None
+        else int(manager.config.cpa_guard_interval_seconds)
+    )
+    lead = (
+        int(args.lead)
+        if args.lead is not None
+        else int(manager.config.cpa_guard_lead_seconds)
+    )
+    once = bool(args.once)
+    stop = {"value": False}
+
+    def cancelled() -> bool:
+        return bool(stop["value"])
+
+    def log(message: str) -> None:
+        print("[cpa-guard] %s" % message, flush=True)
+
+    try:
+        manager.run_cpa_guard_loop(
+            interval_seconds=interval,
+            lead_seconds=lead,
+            once=once,
+            log=log,
+            cancelled=cancelled,
+        )
+    except KeyboardInterrupt:
+        stop["value"] = True
+        log("收到中断，正在退出")
+        return 130
+    return 0
+
+
+def command_cpa_sync(args: argparse.Namespace) -> int:
+    manager = _manager()
+    ids = _selected_ids(manager, getattr(args, "ids", ""), bool(getattr(args, "all", False)))
+    if getattr(args, "ids", "") and not ids:
+        print("没有匹配的账号 ID", file=sys.stderr)
+        return 2
+    selected = ids or None
+
+    def log(message: str) -> None:
+        print("[cpa-sync] %s" % message, flush=True)
+
+    results = manager.sync_cpa_hotload_accounts(
+        selected,
+        log=log,
+        push_when_manager_newer=not bool(getattr(args, "pull_only", False)),
+        reinspect=not bool(getattr(args, "no_inspect", False)),
+    )
+    pulled = sum(1 for item in results if item.action == "pull")
+    pushed = sum(1 for item in results if item.action == "push")
+    failed = sum(1 for item in results if not item.ok)
+    print(
+        "CPA hotload 同步完成：处理 %s，回灌 %s，推送 %s，失败 %s"
+        % (len(results), pulled, pushed, failed)
+    )
+    return 1 if failed else 0
+
+
 def command_ui(args: argparse.Namespace) -> int:
     from .web import GrokWebApplication
 
     application = GrokWebApplication(_manager())
+    cpa_guard: Optional[bool]
+    if bool(getattr(args, "no_cpa_guard", False)):
+        cpa_guard = False
+    elif bool(getattr(args, "cpa_guard", False)):
+        cpa_guard = True
+    else:
+        cpa_guard = None
     try:
         application.serve(
             host=getattr(args, "host", "127.0.0.1"),
             port=getattr(args, "port", 8787),
             open_browser=not getattr(args, "no_browser", False),
             allow_lan=bool(getattr(args, "lan", False)),
+            cpa_guard=cpa_guard,
         )
         return 0
     except (OSError, ValueError) as exc:
@@ -293,6 +364,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="允许局域网访问（默认绑定 0.0.0.0，并放宽 Host 校验）",
     )
     ui.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
+    ui.add_argument(
+        "--cpa-guard",
+        action="store_true",
+        help="强制随管理端启动 CPA 守护（覆盖配置关闭）",
+    )
+    ui.add_argument(
+        "--no-cpa-guard",
+        action="store_true",
+        help="不随管理端启动 CPA 守护（覆盖配置开启）",
+    )
     ui.set_defaults(handler=command_ui)
 
     listing = subparsers.add_parser("list", help="列出管理库账号")
@@ -339,6 +420,47 @@ def build_parser() -> argparse.ArgumentParser:
     delete = subparsers.add_parser("delete", help="仅从管理库删除账号")
     delete.add_argument("--ids", required=True)
     delete.set_defaults(handler=command_delete)
+
+    guard = subparsers.add_parser(
+        "cpa-guard",
+        help="CPA access_token 守护进程：临近过期时 silent refresh，refresh 失效则标记 CPA 过期",
+    )
+    guard.add_argument(
+        "--interval",
+        type=int,
+        default=None,
+        help="轮询间隔秒数（默认读取配置 cpa_guard_interval_seconds，通常 300）",
+    )
+    guard.add_argument(
+        "--lead",
+        type=int,
+        default=None,
+        help="提前续期秒数（默认读取配置 cpa_guard_lead_seconds，通常 1800）",
+    )
+    guard.add_argument(
+        "--once",
+        action="store_true",
+        help="只跑一轮后退出（方便 cron / 测试）",
+    )
+    guard.set_defaults(handler=command_cpa_guard)
+
+    sync = subparsers.add_parser(
+        "cpa-sync",
+        help="管理库与 CPA hotload 双向同步（以新为准）",
+    )
+    sync.add_argument("--ids", default="", help="逗号分隔账号 ID；默认全部相关账号")
+    sync.add_argument("--all", action="store_true", help="同步全部账号")
+    sync.add_argument(
+        "--pull-only",
+        action="store_true",
+        help="只从 hotload 回灌，不把管理库更新的凭据推回去",
+    )
+    sync.add_argument(
+        "--no-inspect",
+        action="store_true",
+        help="同步后不自动复核",
+    )
+    sync.set_defaults(handler=command_cpa_sync)
     return parser
 
 

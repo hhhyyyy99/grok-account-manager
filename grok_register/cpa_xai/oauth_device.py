@@ -6,6 +6,7 @@ Endpoints from https://auth.x.ai/.well-known/openid-configuration
 from __future__ import annotations
 
 import json
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -101,7 +102,89 @@ class TokenResult:
 
 
 class OAuthDeviceError(RuntimeError):
-    pass
+    """OAuth device/token errors.
+
+    retryable=True means the failure is transient (network/timeout/proxy) and
+    must not permanently invalidate a refresh_token.
+    """
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = bool(retryable)
+
+
+def _is_sensitive_oauth_key(key: str) -> bool:
+    lowered = re.sub(r"[\s_\-]+", "", str(key or "").lower())
+    if not lowered:
+        return False
+    if lowered in {
+        "accesstoken",
+        "refreshtoken",
+        "idtoken",
+        "devicecode",
+        "usercode",
+        "clientsecret",
+        "password",
+        "sso",
+        "token",
+    }:
+        return True
+    return "token" in lowered or "secret" in lowered or "password" in lowered
+
+
+def _redact_oauth_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if _is_sensitive_oauth_key(key_text):
+                redacted[key_text] = "***"
+            else:
+                redacted[key_text] = _redact_oauth_value(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_oauth_value(item) for item in value]
+    if isinstance(value, str):
+        return _redact_oauth_text(value)
+    return value
+
+
+def _redact_oauth_text(text: str) -> str:
+    """Redact secrets that leak into free-form OAuth error strings."""
+    value = str(text or "")
+    if not value:
+        return value
+    # snake_case, spaced words, camelCase, kebab-case, quoted JSON, Bearer, JWT.
+    patterns = (
+        r"(?i)\b((?:access|refresh|id)[_\-\s]?token|device[_\-\s]?code|user[_\-\s]?code|client[_\-\s]?secret|password|sso)\s*[:=]\s*([^\s,;]+)",
+        r"(?i)\b((?:access|refresh|id)Token|deviceCode|userCode|clientSecret)\s*[:=]\s*([^\s,;]+)",
+        r'(?i)("(?:access[_-]?token|refresh[_-]?token|id[_-]?token|device[_-]?code|client[_-]?secret|password|accessToken|refreshToken|idToken)"\s*:\s*")([^"]+)(")',
+        r"(?i)\b(bearer)\s+([A-Za-z0-9\-._~+/]+=*)",
+    )
+    redacted = value
+    redacted = re.sub(patterns[0], r"\1=***", redacted)
+    redacted = re.sub(patterns[1], r"\1=***", redacted)
+    redacted = re.sub(patterns[2], r"\1***\3", redacted)
+    redacted = re.sub(patterns[3], r"\1 ***", redacted)
+    if redacted.count(".") >= 2 and len(redacted) > 40 and " " not in redacted.strip():
+        return "***"
+    redacted = re.sub(
+        r"\beyJ[A-Za-z0-9_\-]+=*\.[A-Za-z0-9_\-]+=*\.[A-Za-z0-9_\-+=]*\b",
+        "***",
+        redacted,
+    )
+    return redacted
+
+
+def _format_oauth_body(body: Any) -> str:
+    return repr(_redact_oauth_value(body))
+
+
+def _format_oauth_text(value: Any) -> str:
+    """Format any error/error_description payload with recursive redaction."""
+    if isinstance(value, (dict, list)):
+        return _format_oauth_body(value)
+    return _redact_oauth_text(str(value or ""))
 
 
 def request_device_code(
@@ -118,11 +201,15 @@ def request_device_code(
         proxy=proxy,
     )
     if status != 200 or not isinstance(body, dict):
-        raise OAuthDeviceError(f"device code request failed HTTP {status}: {body!r}")
+        raise OAuthDeviceError(
+            f"device code request failed HTTP {status}: {_format_oauth_body(body)}"
+        )
     device_code = str(body.get("device_code") or "").strip()
     user_code = str(body.get("user_code") or "").strip()
     if not device_code or not user_code:
-        raise OAuthDeviceError(f"device code response missing fields: {body}")
+        raise OAuthDeviceError(
+            f"device code response missing fields: {_format_oauth_body(body)}"
+        )
     vuri = str(body.get("verification_uri") or "https://accounts.x.ai/oauth2/device").strip()
     vcomplete = str(
         body.get("verification_uri_complete") or f"{vuri}?user_code={user_code}"
@@ -136,6 +223,29 @@ def request_device_code(
         verification_uri_complete=vcomplete,
         expires_in=expires_in,
         interval=interval,
+        raw=body,
+    )
+
+
+def _token_result_from_body(
+    body: dict[str, Any],
+    *,
+    fallback_refresh_token: str = "",
+) -> TokenResult:
+    access = str(body.get("access_token") or "").strip()
+    if not access:
+        raise OAuthDeviceError(
+            f"token response missing access_token: {_format_oauth_body(body)}"
+        )
+    refresh = str(body.get("refresh_token") or fallback_refresh_token or "").strip()
+    if not refresh:
+        raise OAuthDeviceError("token response missing refresh_token")
+    return TokenResult(
+        access_token=access,
+        refresh_token=refresh,
+        id_token=(str(body["id_token"]).strip() if body.get("id_token") else None),
+        token_type=str(body.get("token_type") or "Bearer"),
+        expires_in=int(body.get("expires_in") or 21600),
         raw=body,
     )
 
@@ -174,23 +284,16 @@ def poll_device_token(
             time.sleep(sleep_for)
             continue
         if status == 200 and isinstance(body, dict) and body.get("access_token"):
-            access = str(body["access_token"]).strip()
-            refresh = str(body.get("refresh_token") or "").strip()
-            if not refresh:
-                raise OAuthDeviceError("token response missing refresh_token")
-            return TokenResult(
-                access_token=access,
-                refresh_token=refresh,
-                id_token=(str(body["id_token"]).strip() if body.get("id_token") else None),
-                token_type=str(body.get("token_type") or "Bearer"),
-                expires_in=int(body.get("expires_in") or 21600),
-                raw=body,
-            )
+            return _token_result_from_body(body)
         err = ""
         desc = ""
+        err_display = ""
         if isinstance(body, dict):
-            err = str(body.get("error") or "")
-            desc = str(body.get("error_description") or "")
+            raw_err = body.get("error")
+            # Keep raw string codes for control flow; only redacted text leaves.
+            err = str(raw_err or "") if not isinstance(raw_err, (dict, list)) else ""
+            err_display = _format_oauth_text(raw_err)
+            desc = _format_oauth_text(body.get("error_description") or "")
         if err in ("authorization_pending", "slow_down"):
             if err == "slow_down":
                 sleep_for = min(sleep_for + 5, 30)
@@ -198,9 +301,62 @@ def poll_device_token(
             time.sleep(sleep_for)
             continue
         if err in ("expired_token", "access_denied"):
-            raise OAuthDeviceError(f"device auth failed: {err}: {desc}")
-        if status == 400 and err:
-            raise OAuthDeviceError(f"device auth token error: {err}: {desc or body}")
-        log(f"oauth poll unexpected HTTP {status}: {body!r}")
+            raise OAuthDeviceError(f"device auth failed: {err_display}: {desc}")
+        if status == 400 and (err or err_display):
+            raise OAuthDeviceError(
+                f"device auth token error: {err_display}: {desc or _format_oauth_body(body)}"
+            )
+        log(f"oauth poll unexpected HTTP {status}: {_format_oauth_body(body)}")
         time.sleep(sleep_for)
     raise OAuthDeviceError("device auth timed out waiting for user approval")
+
+
+def refresh_access_token(
+    refresh_token: str,
+    *,
+    client_id: str = CLIENT_ID,
+    timeout: float = 30.0,
+    proxy: str | None = None,
+) -> TokenResult:
+    """Exchange a refresh_token for a new access_token (and possibly rotated refresh)."""
+    refresh_token = (refresh_token or "").strip()
+    if not refresh_token:
+        raise OAuthDeviceError("refresh_token is required")
+    try:
+        status, body = _post_form(
+            TOKEN_URL,
+            {
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": client_id,
+            },
+            timeout=timeout,
+            proxy=proxy,
+        )
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise OAuthDeviceError(
+            f"refresh token network error: {type(e).__name__}: {e}",
+            retryable=True,
+        ) from e
+    if status == 200 and isinstance(body, dict):
+        return _token_result_from_body(body, fallback_refresh_token=refresh_token)
+    err = ""
+    desc = ""
+    err_display = ""
+    if isinstance(body, dict):
+        raw_err = body.get("error")
+        err = str(raw_err or "") if not isinstance(raw_err, (dict, list)) else ""
+        err_display = _format_oauth_text(raw_err)
+        desc = _format_oauth_text(body.get("error_description") or "")
+    if err or err_display or status >= 400:
+        # 5xx and transport-adjacent failures are transient; 4xx grant errors are not.
+        retryable = status >= 500 or status == 429
+        raise OAuthDeviceError(
+            f"refresh token failed HTTP {status}: {err_display or _format_oauth_body(body)}"
+            + (f": {desc}" if desc else ""),
+            retryable=retryable,
+        )
+    raise OAuthDeviceError(
+        f"refresh token unexpected response HTTP {status}: {_format_oauth_body(body)}",
+        retryable=True,
+    )

@@ -5,6 +5,7 @@ import type {
   ConfigPayload,
   StatePayload,
   Task,
+  TaskFailure,
   TaskLog,
   ViewName,
 } from "./types";
@@ -28,7 +29,7 @@ const NAV_ITEMS: Array<{ name: ViewName; label: string; glyph: string }> = [
   { name: "settings", label: "设置", glyph: "≡" },
 ];
 
-const TERMINAL_STATES = new Set(["succeeded", "failed", "cancelled"]);
+const TERMINAL_STATES = new Set(["succeeded", "partial", "failed", "cancelled"]);
 
 export function orderAccountsById(accounts: Account[]): Account[] {
   return [...accounts].sort((left, right) => Number(right.id) - Number(left.id));
@@ -47,7 +48,7 @@ function taskPercent(task: Task): number {
   if (task.total > 0) {
     return Math.min(100, Math.max(0, Math.round((task.current / task.total) * 100)));
   }
-  return task.state === "succeeded" ? 100 : 0;
+  return TERMINAL_STATES.has(task.state) && task.state !== "cancelled" ? 100 : 0;
 }
 
 function formatTime(value: string): string {
@@ -83,6 +84,8 @@ function taskKindLabel(kind: string): string {
     import: "导入",
     inspect: "巡检",
     login: "登录",
+    consent: "授权确认",
+    "refresh-cpa": "CPA 续期",
     "reset-password": "重置密码",
     register: "注册",
     diagnostics: "环境检查",
@@ -94,7 +97,8 @@ function taskStateLabel(state: string): string {
     queued: "排队中",
     running: "进行中",
     succeeded: "已完成",
-    failed: "失败",
+    partial: "部分成功",
+    failed: "全部失败",
     cancelled: "已取消",
   } as Record<string, string>)[state] ?? state;
 }
@@ -119,6 +123,17 @@ function jsonValidationError(value: string): string {
   }
 }
 
+function restoreWindowScroll(scrollY: number) {
+  // Polling re-renders can nudge the document scroll; pin it back after paint.
+  const apply = () => {
+    if (Math.abs(window.scrollY - scrollY) > 0.5) {
+      window.scrollTo(0, scrollY);
+    }
+  };
+  apply();
+  requestAnimationFrame(apply);
+}
+
 function useManagerState(search: string, status: string, page: number, pageSize: number) {
   const [state, setState] = useState<StatePayload>({
     accounts: [],
@@ -130,39 +145,91 @@ function useManagerState(search: string, status: string, page: number, pageSize:
   const [loaded, setLoaded] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const requestSequence = useRef(0);
+  const hasRunningTasks = useRef(false);
+  const refreshRef = useRef<(options?: { silent?: boolean }) => Promise<void>>(async () => undefined);
+  const scrollPinnedY = useRef<number | null>(null);
+  const userScrolledDuringSilent = useRef(false);
 
-  const refresh = useCallback(async () => {
+  useEffect(() => {
+    const onScroll = () => {
+      // If the user moves away from the pinned position while a silent poll is in
+      // flight, do not yank them back when the response lands.
+      if (scrollPinnedY.current == null) return;
+      if (Math.abs(window.scrollY - scrollPinnedY.current) > 1) {
+        userScrolledDuringSilent.current = true;
+      }
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
+
+  const refresh = useCallback(async (options?: { silent?: boolean }) => {
+    const silent = Boolean(options?.silent);
     const requestId = ++requestSequence.current;
-    setRefreshing(true);
+    const scrollY = window.scrollY;
+    if (silent) {
+      scrollPinnedY.current = scrollY;
+      userScrolledDuringSilent.current = false;
+    }
+    if (!silent) setRefreshing(true);
     try {
       const next = await getState({ search, status, page, pageSize });
-      if (requestId === requestSequence.current) {
-        setState(next);
-        setError("");
+      if (requestId !== requestSequence.current) return;
+      hasRunningTasks.current = next.tasks.some(isRunning);
+      setState(next);
+      setError("");
+      // Only restore scroll for silent polls that the user did not interrupt.
+      if (silent && !userScrolledDuringSilent.current) {
+        restoreWindowScroll(scrollY);
       }
     } catch (reason) {
       if (requestId === requestSequence.current) {
         setError(reason instanceof Error ? reason.message : String(reason));
       }
     } finally {
+      if (silent && requestId === requestSequence.current) {
+        scrollPinnedY.current = null;
+      }
       if (requestId === requestSequence.current) {
         setLoaded(true);
-        setRefreshing(false);
+        if (!silent) setRefreshing(false);
       }
     }
   }, [search, status, page, pageSize]);
 
+  refreshRef.current = refresh;
+
   useEffect(() => {
-    void refresh();
+    void refresh({ silent: false });
   }, [refresh]);
 
   useEffect(() => {
-    const active = state.tasks.some(isRunning);
-    const timer = window.setInterval(() => void refresh(), active ? 1200 : 8000);
-    return () => window.clearInterval(timer);
-  }, [refresh, state.tasks]);
+    // Self-rescheduling timeout avoids recreating intervals whenever task list identity changes.
+    let timer = 0;
+    let stopped = false;
+    const schedule = () => {
+      const delay = hasRunningTasks.current ? 1200 : 8000;
+      timer = window.setTimeout(() => {
+        void (async () => {
+          await refreshRef.current({ silent: true });
+          if (!stopped) schedule();
+        })();
+      }, delay);
+    };
+    schedule();
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
+  }, [search, status, page, pageSize]);
 
-  return { state, error, loading: !loaded, refreshing, refresh };
+  return {
+    state,
+    error,
+    loading: !loaded,
+    refreshing,
+    refresh: useCallback(() => refresh({ silent: false }), [refresh]),
+  };
 }
 
 export function App() {
@@ -225,6 +292,11 @@ export function App() {
         if (result.task) {
           setSelectedTaskId(result.task.id);
           setTaskDrawerOpen(true);
+        }
+        // Batch account ops are fire-and-forget once submitted; keep selection only
+        // until the request succeeds so the next action starts from a clean set.
+        if (Array.isArray(body.ids) && body.ids.length > 0) {
+          setSelected(new Set());
         }
         flash(success);
         await manager.refresh();
@@ -322,8 +394,8 @@ export function App() {
             ))}
           </nav>
           <div className="topbar-meta">
-            <span className={`sync-state ${manager.refreshing ? "refreshing" : ""}`}>
-              <i aria-hidden="true" />{manager.refreshing ? "同步中" : "本地已连接"}
+            <span className={`sync-state ${manager.refreshing ? "refreshing" : ""}`} title={manager.refreshing ? "同步中" : "本地已连接"}>
+              <i aria-hidden="true" />本地已连接
             </span>
             <button className="task-trigger" type="button" onClick={openTasks} aria-label="打开任务中心">
               <span aria-hidden="true">≡</span><span>任务</span>
@@ -442,9 +514,9 @@ function AccountsView(props: AccountsViewProps) {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const ids = [...selected];
   const hasFilters = Boolean(search || status);
-  const requireSelection = (endpoint: string, label: string) => {
+  const requireSelection = (endpoint: string, label: string, extra: Record<string, unknown> = {}) => {
     if (!ids.length || busy) return;
-    void onAction(endpoint, { ids }, label);
+    void onAction(endpoint, { ids, ...extra }, label);
   };
 
   return (
@@ -508,15 +580,26 @@ function AccountsView(props: AccountsViewProps) {
           <div className="selection-summary"><strong>{selected.size}</strong><span>已选择</span></div>
           <div className="selection-actions">
             <button type="button" disabled={!selected.size || busy} onClick={() => requireSelection("/api/inspect", "巡检任务已创建")}><span aria-hidden="true">↻</span>巡检</button>
-            <button type="button" disabled={!selected.size || busy} onClick={() => requireSelection("/api/login", "登录任务已创建")}><span aria-hidden="true">→</span>批量登录</button>
+            <button type="button" disabled={!selected.size || busy} onClick={() => requireSelection("/api/refresh-cpa", "CPA 续期任务已创建")}><span aria-hidden="true">⟳</span>CPA 续期</button>
+            <button type="button" disabled={!selected.size || busy} onClick={() => requireSelection("/api/login", "登录任务已创建", { requireAccountGates: false })} title="只重新登录，不处理 TOS 门禁"><span aria-hidden="true">→</span>登录</button>
+            <button type="button" disabled={!selected.size || busy} onClick={() => requireSelection("/api/login", "登录+门禁任务已创建", { requireAccountGates: true })} title="登录后先过 TOS 门禁，再 Build 授权"><span aria-hidden="true">⇢</span>登录+门禁</button>
+            <button type="button" disabled={!selected.size || busy} onClick={() => requireSelection("/api/consent", "授权确认任务已创建")} title="仅对已有 SSO 的账号补做 TOS 门禁"><span aria-hidden="true">✓</span>授权确认</button>
             <button type="button" disabled={!selected.size || busy} onClick={() => requireSelection("/api/reset-password", "改密任务已创建")}><span aria-hidden="true">↺</span>重置密码</button>
-            <span className="export-control">
-              <select aria-label="导出格式" value={exportFormat} onChange={(event) => setExportFormat(event.target.value)}>
+            <span className="export-control" role="group" aria-label="导出">
+              <select
+                aria-label="导出格式"
+                value={exportFormat}
+                disabled={!selected.size || busy}
+                onChange={(event) => setExportFormat(event.target.value)}
+              >
                 <option value="cpa">CPA ZIP</option>
                 <option value="sub2api">Sub2API JSON</option>
                 <option value="grok2api">Grok2API JSON</option>
+                <option value="accounts">账户 TXT</option>
               </select>
-              <button type="button" disabled={!selected.size || busy} onClick={() => void onExport(exportFormat)}><span aria-hidden="true">↓</span>导出</button>
+              <button type="button" disabled={!selected.size || busy} onClick={() => void onExport(exportFormat)}>
+                <span aria-hidden="true">↓</span>导出
+              </button>
             </span>
             <button className="danger-action" type="button" disabled={!selected.size || busy} onClick={() => setConfirmDelete(true)}><span aria-hidden="true">×</span>删除</button>
           </div>
@@ -617,8 +700,9 @@ function AccountRow({ account, selected, onSelect, onAction }: {
       <td><span className={`react-status ${statusClass(account.ssoStatus)}`}>{account.ssoStatusLabel}</span><small>{account.hasSso ? "已配置" : "缺少 cookie"}</small></td>
       <td><span className={`react-status ${statusClass(account.cpaStatus)}`}>{account.cpaStatusLabel}</span><small>{account.hasAccessToken ? "access token" : "缺少 token"}</small></td>
       <td><small>{formatTime(account.lastCheckedAt)}</small></td>
-      <td>
+      <td className="row-actions">
         <button className="icon-action" type="button" title="巡检账号" aria-label={`巡检 ${account.email}`} onClick={() => void onAction("/api/inspect", { ids: [account.id] }, "巡检任务已创建")}>↻</button>
+        <button className="icon-action" type="button" title="授权确认（TOS）" aria-label={`授权确认 ${account.email}`} onClick={() => void onAction("/api/consent", { ids: [account.id] }, "授权确认任务已创建")}>✓</button>
       </td>
     </tr>
   );
@@ -702,11 +786,31 @@ function TaskDrawer({ open, tasks, selectedTask, selectedTaskId, onClose, onSele
   );
 }
 
+function taskFailures(task: Task): TaskFailure[] {
+  const raw = task.result?.failures;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((item) => {
+      if (!item || typeof item !== "object") return null;
+      const value = item as unknown as Record<string, unknown>;
+      return {
+        id: Number(value.id) || 0,
+        email: String(value.email || ""),
+        detail: String(value.detail || ""),
+      };
+    })
+    .filter((item): item is TaskFailure => item !== null);
+}
+
 function TaskDetail({ task, onCancel }: { task?: Task; onCancel: (id: string) => void }) {
   const logRef = useRef<HTMLDivElement>(null);
   const followLogsRef = useRef(true);
   const previousTaskIdRef = useRef<string>();
   const logs: TaskLog[] = task?.logs ?? [];
+  const failures = task ? taskFailures(task) : [];
+  const failedCount = Number(task?.result?.failed ?? failures.length) || failures.length;
+  const succeededCount = Number(task?.result?.succeeded ?? 0) || 0;
+  const failureTruncated = Boolean(task?.result?.failureTruncated);
 
   useEffect(() => {
     const taskChanged = previousTaskIdRef.current !== task?.id;
@@ -730,6 +834,29 @@ function TaskDetail({ task, onCancel }: { task?: Task; onCancel: (id: string) =>
         <span>启动时间<strong>{formatTime(task.startedAt || task.createdAt)}</strong></span>
         <span>结束时间<strong>{formatTime(task.finishedAt)}</strong></span>
       </div>
+      {TERMINAL_STATES.has(task.state) && (succeededCount > 0 || failedCount > 0) && (
+        <div className="task-result-summary">
+          <span className="ok">成功 <strong>{succeededCount}</strong></span>
+          <span className={failedCount ? "bad" : ""}>失败 <strong>{failedCount}</strong></span>
+        </div>
+      )}
+      {failures.length > 0 && (
+        <div className="task-failure-panel">
+          <div className="task-failure-title">
+            <strong>失败账号</strong>
+            <span>{failures.length}{failureTruncated ? "+" : ""} 个</span>
+          </div>
+          <ul className="task-failure-list">
+            {failures.map((item) => (
+              <li key={`${item.id}-${item.email}`}>
+                <strong title={item.email}>{item.email || `#${item.id}`}</strong>
+                <span title={item.detail}>{item.detail || "失败"}</span>
+              </li>
+            ))}
+          </ul>
+          {failureTruncated && <p className="task-failure-note">列表已截断，完整原因见下方执行日志。</p>}
+        </div>
+      )}
       {!TERMINAL_STATES.has(task.state) && <button className="button danger" type="button" onClick={() => onCancel(task.id)}>取消任务</button>}
       <div className="task-log-terminal">
         <div className="task-log-title">
@@ -1058,12 +1185,13 @@ function ManagerConfigPanel({ values, onChange, saving, onSave }: { values: Conf
     <ConfigGroup title="批量注册"><div className="config-grid three"><ConfigField values={values} name="register_count" label="每批注册数量" type="number" min={1} max={10000} onChange={onChange} /><ConfigField values={values} name="register_threads" label="注册并发" type="number" min={1} max={10} onChange={onChange} /><ConfigField values={values} name="mint_workers" label="CPA Mint 并发" type="number" min={0} max={10} onChange={onChange} /></div></ConfigGroup>
     <ConfigGroup title="重新登录"><div className="config-grid two"><ConfigField values={values} name="login_workers" label="重新登录并发" type="number" min={1} max={10} onChange={onChange} /><ConfigField values={values} name="login_timeout_seconds" label="单账号超时（秒）" type="number" min={60} max={1800} onChange={onChange} /></div></ConfigGroup>
     <ConfigGroup title="巡检与导入"><div className="config-grid two"><ConfigField values={values} name="probe_timeout_seconds" label="巡检请求超时（秒）" type="number" min={3} max={120} onChange={onChange} /><ConfigField values={values} name="inspection_workers" label="巡检并发" type="number" min={1} max={32} onChange={onChange} /></div><div className="toggle-grid"><ConfigToggle values={values} name="live_probe" label="巡检时执行在线探测" onChange={onChange} /><ConfigToggle values={values} name="auto_import_on_start" label="启动时自动导入" onChange={onChange} /></div></ConfigGroup>
+    <ConfigGroup title="CPA 守护"><div className="config-grid two"><ConfigField values={values} name="cpa_guard_interval_seconds" label="守护轮询间隔（秒）" type="number" min={30} max={86400} onChange={onChange} /><ConfigField values={values} name="cpa_guard_lead_seconds" label="提前续期窗口（秒）" type="number" min={60} max={21600} onChange={onChange} /></div><div className="toggle-grid"><ConfigToggle values={values} name="cpa_guard_enabled" label="启动管理端时自动运行 CPA 守护" onChange={onChange} /></div><p className="config-hint">默认随 `run.py` / `ui` 后台启动。守护每轮先与 CPA hotload 双向同步（以新为准），再 silent refresh。单独同步：`uv run --locked python run.py cpa-sync`；单独守护：`cpa-guard`。</p></ConfigGroup>
   </ConfigPanel>;
 }
 
 function RegistrationConfigPanel({ values, secrets, onChange, saving, onSave }: { values: ConfigDraft; secrets: Record<string, boolean>; onChange: (name: string, value: unknown) => void; saving: boolean; onSave: () => Promise<void> }) {
   return <ConfigPanel title="注册基础" kicker="注册运行时" index="02" footer={<button className="button primary" type="button" disabled={saving} onClick={() => void onSave()}>{saving ? "保存中" : "保存注册基础"}</button>}>
-    <ConfigGroup title="网络与浏览器"><div className="config-grid two"><ConfigField values={values} secrets={secrets} name="proxy" label="注册代理" secret onChange={onChange} placeholder="http://user:pass@host:port" /><ConfigField values={values} name="thread_start_interval" label="线程启动间隔（秒）" type="number" min={0} step={0.1} onChange={onChange} /><ConfigField values={values} name="user_agent" label="浏览器 User-Agent" wide onChange={onChange} /></div><div className="toggle-grid"><ConfigToggle values={values} name="enable_nsfw" label="注册后启用 NSFW" onChange={onChange} /></div></ConfigGroup>
+    <ConfigGroup title="网络与浏览器"><div className="config-grid two"><ConfigField values={values} name="proxy" label="注册代理" onChange={onChange} placeholder="http://user:pass@host:port" /><ConfigField values={values} name="thread_start_interval" label="线程启动间隔（秒）" type="number" min={0} step={0.1} onChange={onChange} /><ConfigField values={values} name="user_agent" label="浏览器 User-Agent" wide onChange={onChange} /></div><div className="toggle-grid"><ConfigToggle values={values} name="enable_nsfw" label="注册后启用 NSFW" onChange={onChange} /></div></ConfigGroup>
   </ConfigPanel>;
 }
 

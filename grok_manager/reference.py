@@ -39,7 +39,6 @@ SENSITIVE_CONFIG_KEYS = frozenset(
     {
         "duckmail_api_key",
         "cloudflare_api_key",
-        "proxy",
         "yyds_api_key",
         "yyds_jwt",
         "grok2api_remote_app_key",
@@ -47,6 +46,9 @@ SENSITIVE_CONFIG_KEYS = frozenset(
         "cpa_cloud_management_key",
     }
 )
+
+# Proxy used to be vault-encrypted; still decrypt legacy ciphertext on load.
+LEGACY_ENCRYPTED_CONFIG_KEYS = frozenset({"proxy"})
 
 
 def _is_supported_python(version_text: str) -> bool:
@@ -210,7 +212,7 @@ class ReferenceProject:
                 raise ReferenceProjectError("注册配置必须是 JSON 对象")
             base.update(local)
         vault = self.credential_vault
-        for key in SENSITIVE_CONFIG_KEYS:
+        for key in SENSITIVE_CONFIG_KEYS | LEGACY_ENCRYPTED_CONFIG_KEYS:
             raw = str(base.get(key) or "")
             if not raw:
                 continue
@@ -240,6 +242,16 @@ class ReferenceProject:
         document = dict(existing)
         document.update(values)
         vault = self.credential_vault
+        for key in LEGACY_ENCRYPTED_CONFIG_KEYS:
+            raw = str(document.get(key) or "")
+            if not raw or not CredentialVault.is_encrypted(raw):
+                continue
+            if vault is None or not vault.is_unlocked:
+                raise ReferenceProjectError("读取受保护注册配置前必须解锁保险库")
+            try:
+                document[key] = vault.decrypt_text(raw, "registration-config:%s" % key)
+            except Exception as exc:
+                raise ReferenceProjectError("注册配置密文无法解密: %s" % key) from exc
         for key in SENSITIVE_CONFIG_KEYS:
             if key in values and values.get(key) is None:
                 document[key] = ""
@@ -269,6 +281,43 @@ class ReferenceProject:
             # Re-save so pre-vault plaintext secrets are encrypted in place.
             return self.save_registration_config({})
         return self.save_registration_config(self.load_registration_config())
+
+    def cpa_hotload_dir(self) -> Optional[Path]:
+        """Resolved CPA hotload directory when configured; None if unset."""
+        config = self.load_registration_config()
+        configured = str(config.get("cpa_hotload_dir") or "").strip()
+        if not configured:
+            return None
+        target_dir = Path(configured).expanduser()
+        if not target_dir.is_absolute():
+            target_dir = self.data_root / target_dir
+        return target_dir.resolve()
+
+    def cpa_hotload_enabled(self) -> bool:
+        config = self.load_registration_config()
+        return bool(config.get("cpa_copy_to_hotload", False)) and bool(
+            str(config.get("cpa_hotload_dir") or "").strip()
+        )
+
+    def hotload_auth_path_for_email(self, email: str, sub: str = "") -> Optional[Path]:
+        hotload_dir = self.cpa_hotload_dir()
+        if hotload_dir is None:
+            return None
+        from grok_register.cpa_xai.schema import credential_file_name
+
+        return hotload_dir / credential_file_name(email, sub)
+
+    def load_hotload_auth(self, email: str, sub: str = "") -> Optional[tuple[Path, Dict[str, Any]]]:
+        path = self.hotload_auth_path_for_email(email, sub)
+        if path is None or not path.is_file():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return path, payload
 
     def sync_cpa_hotload(self, auth_file: str | Path) -> Optional[Path]:
         config = self.load_registration_config()
@@ -568,7 +617,63 @@ class ReferenceProject:
                 stored = ""
             if stored:
                 return stored
+        # No local JWT: recover via Cloudflare admin address lookup + show_password.
+        recovered = self.recover_mail_credential_via_admin(normalized_email)
+        if recovered:
+            return recovered
         return ""
+
+    def recover_mail_credential_via_admin(self, email: str) -> str:
+        """Use Cloudflare admin APIs to recover a missing mailbox JWT."""
+        normalized_email = str(email or "").strip().lower()
+        if not normalized_email or "@" not in normalized_email:
+            return ""
+        try:
+            config = self.load_registration_config()
+        except Exception:
+            return ""
+        provider = str(config.get("email_provider") or "").strip().lower()
+        if provider and provider != "cloudflare":
+            return ""
+        if not str(config.get("cloudflare_api_base") or "").strip():
+            return ""
+        if not str(config.get("cloudflare_api_key") or "").strip():
+            return ""
+        try:
+            from grok_register import app as registration_app
+
+            # Ensure worker/manager config is visible to the shared app module.
+            registration_app.config.update(
+                {
+                    key: config.get(key)
+                    for key in (
+                        "email_provider",
+                        "cloudflare_api_base",
+                        "cloudflare_api_key",
+                        "cloudflare_auth_mode",
+                        "cloudflare_path_domains",
+                        "cloudflare_path_accounts",
+                        "cloudflare_path_token",
+                        "cloudflare_path_messages",
+                    )
+                    if key in config
+                }
+            )
+            credential, _address_id = registration_app.cloudflare_admin_recover_jwt(
+                normalized_email
+            )
+        except Exception:
+            return ""
+        credential = str(credential or "").strip()
+        if not credential:
+            return ""
+        vault = self.credential_vault
+        if vault is not None and vault.is_unlocked:
+            try:
+                vault.put_secret("mail-credential:%s" % normalized_email, credential)
+            except Exception:
+                pass
+        return credential
 
     def persist_account_password(self, email: str, password: str, source: str = "") -> Path:
         normalized_email = str(email or "").strip().lower()
@@ -656,6 +761,33 @@ class ReferenceProject:
         )
 
     @staticmethod
+    def _split_account_line(raw: str) -> Optional[Tuple[str, str, str]]:
+        text = str(raw or "").strip()
+        if not text or text.startswith("#"):
+            return None
+        if "----" in text:
+            parts = [part.strip() for part in text.split("----", 2)]
+        elif "\t" in text:
+            parts = [part.strip() for part in text.split("\t")]
+        else:
+            return None
+        if len(parts) < 2:
+            return None
+        email = parts[0].strip().lower()
+        password = parts[1].strip()
+        sso = parts[2].strip() if len(parts) > 2 else ""
+        # Skip TSV header from accounts export: 账户\t密码\ttoken
+        if email in {"账户", "account", "email", "账号"} and password in {
+            "密码",
+            "password",
+            "pass",
+        }:
+            return None
+        if not email or not password:
+            return None
+        return email, password, sso
+
+    @staticmethod
     def parse_account_text(
         text: str,
         source: str = "manual-import",
@@ -665,22 +797,25 @@ class ReferenceProject:
         auth_index = auth_index or {}
         records: List[AccountDraft] = []
         for line in str(text or "").splitlines():
-            raw = line.strip()
-            if not raw or raw.startswith("#"):
+            parsed = ReferenceProject._split_account_line(line)
+            if parsed is None:
                 continue
-            parts = raw.split("----", 2)
-            if len(parts) < 2:
-                continue
-            email = parts[0].strip().lower()
-            password = parts[1].strip()
-            sso = parts[2].strip() if len(parts) > 2 else ""
-            if not email or not password:
-                continue
+            email, password, sso = parsed
             auth_path = ""
             auth: Dict[str, Any] = {}
             if email in auth_index:
                 indexed_path, auth = auth_index[email]
                 auth_path = str(indexed_path)
+            # SSO freshness follows accounts.txt mtime; CPA freshness follows auth
+            # last_refresh (or file mtime fallback). Never mix the two clocks.
+            sso_stamp = (
+                source_modified_at
+                or datetime.now(tz=timezone.utc)
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+            cpa_stamp = str(auth.get("last_refresh") or "").strip() or sso_stamp
             records.append(
                 AccountDraft(
                     email=email,
@@ -691,13 +826,8 @@ class ReferenceProject:
                     token_expires_at=str(auth.get("expired") or ""),
                     auth_file=auth_path,
                     source=source,
-                    source_modified_at=(
-                        source_modified_at
-                        or datetime.now(tz=timezone.utc)
-                        .replace(microsecond=0)
-                        .isoformat()
-                        .replace("+00:00", "Z")
-                    ),
+                    source_modified_at=sso_stamp,
+                    cpa_source_modified_at=cpa_stamp,
                 )
             )
         return records
@@ -729,6 +859,11 @@ class ReferenceProject:
                         record.source_modified_at
                         if record.sso_token
                         else previous.source_modified_at
+                    ),
+                    cpa_source_modified_at=(
+                        record.cpa_source_modified_at
+                        if record.access_token or record.refresh_token
+                        else previous.cpa_source_modified_at
                     ),
                 )
         return list(by_email.values())

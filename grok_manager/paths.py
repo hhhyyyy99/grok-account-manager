@@ -6,9 +6,10 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping, Optional
+from typing import Callable, Iterator, Mapping, Optional
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -96,6 +97,95 @@ def ensure_data_dirs() -> None:
             path.chmod(0o700)
         except OSError:
             pass
+
+
+@contextmanager
+def interprocess_lock(
+    name: str,
+    data_root: Path | None = None,
+    *,
+    timeout_seconds: float = 300.0,
+    cancelled: Optional[Callable[[], bool]] = None,
+) -> Iterator[None]:
+    """Cross-process exclusive lock for CPA sync/guardian (Unix fcntl / Windows msvcrt)."""
+    import time
+
+    root = Path(data_root or DATA_DIR).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path = root / (".%s.lock" % str(name or "lock").strip().replace("/", "_"))
+    handle = open(lock_path, "a+", encoding="utf-8")
+    deadline = time.monotonic() + max(1.0, float(timeout_seconds))
+    locked = False
+    try:
+        try:
+            os.chmod(lock_path, 0o600)
+        except OSError:
+            pass
+        if sys.platform == "win32":
+            import msvcrt
+
+            handle.seek(0)
+            if handle.read(1) == "":
+                handle.write("0")
+                handle.flush()
+            while True:
+                handle.seek(0)
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    locked = True
+                    break
+                except OSError:
+                    if cancelled and cancelled():
+                        raise InterruptedError("获取跨进程锁已取消: %s" % lock_path)
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("获取跨进程锁超时: %s" % lock_path)
+                    time.sleep(0.05)
+        else:
+            import fcntl
+
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                    break
+                except BlockingIOError:
+                    if cancelled and cancelled():
+                        raise InterruptedError("获取跨进程锁已取消: %s" % lock_path)
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("获取跨进程锁超时: %s" % lock_path)
+                    time.sleep(0.05)
+        yield
+    finally:
+        if locked:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()
+
+
+def remove_managed_auth_file(
+    auth_file: str | Path | None,
+    managed_auth_dir: Path | None = None,
+) -> None:
+    """Delete a transient plaintext xai-*.json under the managed auth directory."""
+    if not auth_file:
+        return
+    root = Path(managed_auth_dir or MANAGED_AUTH_DIR).expanduser().resolve()
+    try:
+        target = Path(auth_file).expanduser().resolve()
+        target.relative_to(root)
+        target.unlink(missing_ok=True)
+    except (OSError, ValueError):
+        pass
 
 
 def write_private_text_atomic(path: Path, content: str, encoding: str = "utf-8") -> Path:
@@ -269,6 +359,7 @@ def _migrate_account_database(source: Path, destination: Path) -> tuple[bool, in
                 "sso_detail",
                 "cpa_status",
                 "cpa_detail",
+                "cpa_updated_at",
                 "last_checked_at",
                 "last_login_at",
                 "created_at",

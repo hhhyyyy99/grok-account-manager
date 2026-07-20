@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional
 
 
 def utc_now_iso() -> str:
@@ -50,6 +50,8 @@ class AccountDraft:
     auth_file: str = ""
     source: str = ""
     source_modified_at: str = ""
+    # CPA-only freshness (auth last_refresh). Must not drive SSO upsert decisions.
+    cpa_source_modified_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -75,10 +77,18 @@ class Account:
     last_login_at: str
     created_at: str
     updated_at: str
+    cpa_updated_at: str = ""
 
     @classmethod
     def from_row(cls, row: Mapping[str, Any]) -> "Account":
-        return cls(**{field: row[field] for field in cls.__dataclass_fields__})
+        values: Dict[str, Any] = {}
+        keys = set(row.keys()) if hasattr(row, "keys") else set()
+        for field in cls.__dataclass_fields__:
+            if field in keys:
+                values[field] = row[field]
+            else:
+                values[field] = 0 if field == "id" else ""
+        return cls(**values)
 
     @property
     def status_label(self) -> str:
@@ -114,6 +124,15 @@ class InspectionResult:
     cpa_status: str = ""
     cpa_detail: str = ""
     sso_expires_at: str = ""
+    # Snapshot of CPA material used for this probe; apply is skipped if rotated.
+    observed_access_token: str = ""
+    observed_cpa_updated_at: str = ""
+    # True when TokenInspector recorded a CPA snapshot for CAS on apply.
+    cpa_snapshot: bool = False
+    # Snapshot of SSO material used for this probe; apply is skipped if changed.
+    observed_sso_token: str = ""
+    observed_last_login_at: str = ""
+    sso_snapshot: bool = False
 
 
 @dataclass(frozen=True)
@@ -128,8 +147,37 @@ class LoginResult:
 
 
 @dataclass(frozen=True)
+class ConsentResult:
+    account_id: int
+    email: str
+    ok: bool
+    detail: str
+    tos_ok: bool = False
+
+
+@dataclass(frozen=True)
 class PasswordResetResult:
     account_id: int
     email: str
     ok: bool
     detail: str
+
+
+@dataclass(frozen=True)
+class CpaRefreshResult:
+    account_id: int
+    email: str
+    ok: bool
+    detail: str
+    auth_file: str = ""
+    retryable: bool = False
+
+
+@dataclass(frozen=True)
+class CpaHotloadSyncResult:
+    account_id: int
+    email: str
+    ok: bool
+    detail: str
+    action: str = ""  # pull | push | noop | skip | error
+    auth_file: str = ""

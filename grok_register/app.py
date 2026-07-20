@@ -321,9 +321,12 @@ DUCKMAIL_API_BASE = "https://api.duckmail.sbs"
 
 
 def get_proxies():
-    proxy = config.get("proxy", "")
-    if proxy:
-        return {"http": proxy, "https": proxy}
+    proxy = str(config.get("proxy", "") or "").strip()
+    # Ignore vault ciphertext leftovers and empty/invalid proxy values so admin
+    # and mail API recovery can still reach the temp-mail host directly.
+    if not proxy or proxy.startswith("gmv1:") or "://" not in proxy:
+        return {}
+    return {"http": proxy, "https": proxy}
     return {}
 
 
@@ -463,6 +466,114 @@ def cloudflare_admin_get_jwt(address_id):
         if jwt:
             return str(jwt).strip()
     raise Exception("Cloudflare 管理接口未返回 JWT")
+
+
+def _cloudflare_row_address(row):
+    if not isinstance(row, dict):
+        return ""
+    for key in ("address", "email", "name", "mail"):
+        value = str(row.get(key) or "").strip()
+        if value and "@" in value:
+            return value
+    return ""
+
+
+def _cloudflare_row_address_id(row):
+    if not isinstance(row, dict):
+        return ""
+    for key in ("id", "address_id", "addressId", "addressID"):
+        raw = row.get(key)
+        try:
+            numeric_id = int(str(raw or "").strip())
+        except (TypeError, ValueError):
+            continue
+        if numeric_id > 0:
+            return str(numeric_id)
+    return ""
+
+
+def cloudflare_admin_find_address_id(address):
+    """Resolve a temp-mail address to its admin numeric id for show_password."""
+    target = str(address or "").strip().lower()
+    if not target or "@" not in target:
+        raise ValueError("无效邮箱地址")
+    api_base = get_cloudflare_api_base()
+    if not api_base:
+        raise Exception("Cloudflare API Base 未配置")
+    if not get_cloudflare_api_key():
+        raise Exception("Cloudflare 管理密钥未配置")
+
+    headers = cloudflare_build_headers(content_type=False)
+    # Prefer filtered queries when the admin API supports them.
+    query_candidates = (
+        {"address": target, "limit": 50, "offset": 0},
+        {"name": target, "limit": 50, "offset": 0},
+        {"query": target, "limit": 50, "offset": 0},
+        {"keyword": target, "limit": 50, "offset": 0},
+    )
+    for query in query_candidates:
+        try:
+            response = http_get(
+                f"{api_base}/admin/address",
+                headers=headers,
+                params=cloudflare_apply_auth_params(query),
+            )
+            response.raise_for_status()
+            rows = _pick_list_payload(response.json())
+        except Exception:
+            continue
+        for row in rows:
+            row_address = _cloudflare_row_address(row)
+            if row_address.casefold() != target.casefold():
+                continue
+            address_id = _cloudflare_row_address_id(row)
+            if address_id:
+                return address_id
+
+    # Fallback: page through /admin/address until the mailbox appears.
+    offset = 0
+    limit = 100
+    seen_empty = 0
+    while offset < 5000 and seen_empty < 2:
+        try:
+            response = http_get(
+                f"{api_base}/admin/address",
+                headers=headers,
+                params=cloudflare_apply_auth_params(
+                    {"limit": limit, "offset": offset}
+                ),
+            )
+            response.raise_for_status()
+            data = response.json()
+            rows = _pick_list_payload(data)
+        except Exception as exc:
+            raise Exception("Cloudflare 管理接口查询邮箱地址失败: %s" % exc) from exc
+        if not rows:
+            seen_empty += 1
+            offset += limit
+            continue
+        seen_empty = 0
+        for row in rows:
+            row_address = _cloudflare_row_address(row)
+            if row_address.casefold() != target.casefold():
+                continue
+            address_id = _cloudflare_row_address_id(row)
+            if address_id:
+                return address_id
+        try:
+            total = int(data.get("count") or 0)
+        except (TypeError, ValueError, AttributeError):
+            total = 0
+        offset += len(rows)
+        if total and offset >= total:
+            break
+    raise Exception("Cloudflare 管理接口未找到邮箱: %s" % target)
+
+
+def cloudflare_admin_recover_jwt(address):
+    """Recover a mailbox JWT via admin address lookup + show_password."""
+    address_id = cloudflare_admin_find_address_id(address)
+    return cloudflare_admin_get_jwt(address_id), address_id
 
 
 def cloudflare_admin_get_messages(address):
@@ -1162,15 +1273,32 @@ def _to_std_request_kwargs(kwargs):
     return std_kwargs
 
 
+def _should_retry_without_proxy(exc) -> bool:
+    err = str(exc or "")
+    lowered = err.lower()
+    markers = (
+        "127.0.0.1 port 7890",
+        "could not connect to server",
+        "unsupported proxy syntax",
+        "proxyerror",
+        "failed to perform, curl: (5)",
+        "failed to perform, curl: (7)",
+        "failed to perform, curl: (28)",
+        "tunnel connection failed",
+        "proxy connect aborted",
+        "gmv1:",
+    )
+    return any(marker in lowered or marker in err for marker in markers)
+
+
 def http_get(url, **kwargs):
     try:
         return curl_requests.get(url, **_build_request_kwargs(**kwargs))
     except Exception as exc:
-        err = str(exc)
         if _is_tls_backend_error(exc):
             return std_requests.get(url, **_to_std_request_kwargs(kwargs))
-        # 代理不可用时自动回退为直连，避免整个流程直接失败
-        if "127.0.0.1 port 7890" in err or "Could not connect to server" in err:
+        # 代理不可用/无效时自动回退为直连，避免整个流程直接失败
+        if _should_retry_without_proxy(exc):
             retry_kwargs = dict(kwargs)
             retry_kwargs["proxies"] = {}
             try:
@@ -1186,10 +1314,9 @@ def http_post(url, **kwargs):
     try:
         return curl_requests.post(url, **_build_request_kwargs(**kwargs))
     except Exception as exc:
-        err = str(exc)
         if _is_tls_backend_error(exc):
             return std_requests.post(url, **_to_std_request_kwargs(kwargs))
-        if "127.0.0.1 port 7890" in err or "Could not connect to server" in err:
+        if _should_retry_without_proxy(exc):
             retry_kwargs = dict(kwargs)
             retry_kwargs["proxies"] = {}
             try:
@@ -1205,10 +1332,9 @@ def http_put(url, **kwargs):
     try:
         return curl_requests.put(url, **_build_request_kwargs(**kwargs))
     except Exception as exc:
-        err = str(exc)
         if _is_tls_backend_error(exc):
             return std_requests.put(url, **_to_std_request_kwargs(kwargs))
-        if "127.0.0.1 port 7890" in err or "Could not connect to server" in err:
+        if _should_retry_without_proxy(exc):
             retry_kwargs = dict(kwargs)
             retry_kwargs["proxies"] = {}
             try:

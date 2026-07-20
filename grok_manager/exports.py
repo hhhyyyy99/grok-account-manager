@@ -27,7 +27,7 @@ class AccountExport:
 
 
 class AccountExporter:
-    SUPPORTED_FORMATS = frozenset(("cpa", "sub2api", "grok2api"))
+    SUPPORTED_FORMATS = frozenset(("cpa", "sub2api", "grok2api", "accounts"))
 
     def __init__(self, registration_config: Optional[Dict[str, Any]] = None):
         self.registration_config = registration_config or {}
@@ -36,13 +36,15 @@ class AccountExporter:
         selected = list(accounts)
         normalized = str(export_format or "").strip().lower()
         if normalized not in self.SUPPORTED_FORMATS:
-            raise ValueError("导出格式必须是 cpa、sub2api 或 grok2api")
+            raise ValueError("导出格式必须是 cpa、sub2api、grok2api 或 accounts")
         if not selected:
             raise ValueError("没有符合条件的账号可导出")
         if normalized == "cpa":
             return self._export_cpa(selected)
         if normalized == "sub2api":
             return self._export_sub2api(selected)
+        if normalized == "accounts":
+            return self._export_accounts(selected)
         return self._export_grok2api(selected)
 
     def _export_cpa(self, accounts: List[Account]) -> AccountExport:
@@ -111,6 +113,26 @@ class AccountExporter:
             body=self._json_bytes({pool_name: entries}),
             exported_count=len(entries),
             skipped_count=len(accounts) - len(entries),
+        )
+
+    def _export_accounts(self, accounts: List[Account]) -> AccountExport:
+        rows: List[str] = []
+        for account in accounts:
+            email = str(account.email or "").strip().lower()
+            password = str(account.password or "").strip()
+            token = self._normalize_sso(account.sso_token)
+            if not email or not password or not token:
+                continue
+            rows.append("%s\t%s\t%s" % (email, password, token))
+        self._require_exported(len(rows), "账户")
+        lines = ["账户\t密码\ttoken", *rows]
+        body = ("\n".join(lines) + "\n").encode("utf-8")
+        return AccountExport(
+            filename="accounts_%s.txt" % self._timestamp(),
+            content_type="text/plain; charset=utf-8",
+            body=body,
+            exported_count=len(rows),
+            skipped_count=len(accounts) - len(rows),
         )
 
     def _cpa_payload(self, account: Account) -> Optional[Dict[str, Any]]:

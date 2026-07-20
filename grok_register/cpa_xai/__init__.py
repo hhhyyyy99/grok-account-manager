@@ -21,8 +21,13 @@ from .writer import write_cpa_xai_auth
 # CLIENT_ID lives in oauth_device; re-export from schema if present
 try:
     from .oauth_device import CLIENT_ID as OAUTH_CLIENT_ID
+    from .oauth_device import refresh_access_token
 except Exception:  # pragma: no cover
     OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
+
+    def refresh_access_token(*_args, **_kwargs):  # type: ignore[misc]
+        raise RuntimeError("oauth_device.refresh_access_token unavailable")
+
 
 __all__ = [
     "AccountLine",
@@ -40,5 +45,6 @@ __all__ = [
     "parse_accounts_file",
     "probe_mini_response",
     "probe_models",
+    "refresh_access_token",
     "write_cpa_xai_auth",
 ]

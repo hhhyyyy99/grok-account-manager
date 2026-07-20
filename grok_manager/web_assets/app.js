@@ -1,5 +1,6 @@
 (function () {
   /* Endpoint compatibility marker: /api/reset-password. */
+  /* Endpoint compatibility marker: /api/refresh-cpa. */
   "use strict";
   function orderAccountsById(accounts) {
     return Array.from(accounts || []).sort((left, right) => Number(right.id) - Number(left.id));

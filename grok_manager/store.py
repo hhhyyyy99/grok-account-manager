@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
@@ -32,6 +33,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     sso_detail TEXT NOT NULL DEFAULT '',
     cpa_status TEXT NOT NULL DEFAULT 'unknown',
     cpa_detail TEXT NOT NULL DEFAULT '',
+    cpa_updated_at TEXT NOT NULL DEFAULT '',
     last_checked_at TEXT NOT NULL DEFAULT '',
     last_login_at TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
@@ -48,6 +50,7 @@ MIGRATION_COLUMNS = {
     "sso_detail": "TEXT NOT NULL DEFAULT ''",
     "cpa_status": "TEXT NOT NULL DEFAULT 'unknown'",
     "cpa_detail": "TEXT NOT NULL DEFAULT ''",
+    "cpa_updated_at": "TEXT NOT NULL DEFAULT ''",
     "source_modified_at": "TEXT NOT NULL DEFAULT ''",
 }
 
@@ -72,6 +75,8 @@ class AccountStore:
         if not self.vault.is_unlocked:
             raise VaultLockedError("账号存储需要已解锁的凭据保险库")
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._account_locks: Dict[int, threading.RLock] = {}
+        self._account_locks_guard = threading.Lock()
         with self._connect() as conn:
             conn.execute("PRAGMA secure_delete = ON")
             conn.executescript(SCHEMA)
@@ -94,6 +99,16 @@ class AccountStore:
             self.path.chmod(0o600)
         except OSError:
             pass
+
+    def account_lock(self, account_id: int) -> threading.RLock:
+        """Per-account reentrant lock shared by login, remint, silent refresh, expire marks."""
+        key = int(account_id)
+        with self._account_locks_guard:
+            lock = self._account_locks.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                self._account_locks[key] = lock
+            return lock
 
     def _credential_context(self, email: str, field: str) -> str:
         return "account:%s:%s" % (email.strip().lower(), field)
@@ -211,6 +226,15 @@ class AccountStore:
                 refresh_token = ""
             if auth_file == existing.auth_file:
                 auth_file = ""
+        cpa_material = bool(access_token or refresh_token or auth_file or draft.token_expires_at.strip())
+        # SSO and CPA use independent clocks. source_modified_at is accounts.txt/SSO age;
+        # cpa_source_modified_at is auth last_refresh (or file mtime fallback).
+        source_modified = draft.source_modified_at.strip()
+        cpa_source_modified = (
+            str(getattr(draft, "cpa_source_modified_at", "") or "").strip()
+            or source_modified
+        )
+        cpa_stamp = cpa_source_modified or now if cpa_material else ""
         values = (
             email,
             self._encrypt_credential(email, "password", password),
@@ -220,7 +244,8 @@ class AccountStore:
             draft.token_expires_at.strip(),
             self._encrypt_credential(email, "auth_file", auth_file),
             draft.source.strip(),
-            draft.source_modified_at.strip(),
+            source_modified,
+            cpa_stamp,
             now,
             now,
         )
@@ -230,8 +255,8 @@ class AccountStore:
                 INSERT INTO accounts (
                     email, password, sso_token, access_token, refresh_token,
                     token_expires_at, auth_file, source, source_modified_at,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    cpa_updated_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(email) DO UPDATE SET
                     password = CASE WHEN excluded.password != '' THEN excluded.password ELSE accounts.password END,
                     sso_token = CASE
@@ -243,19 +268,35 @@ class AccountStore:
                     END,
                     access_token = CASE
                         WHEN excluded.access_token != '' AND (
-                            accounts.last_login_at = '' OR excluded.source_modified_at >= accounts.last_login_at
+                            accounts.cpa_updated_at = ''
+                            OR (
+                                excluded.cpa_updated_at != ''
+                                AND excluded.cpa_updated_at >= accounts.cpa_updated_at
+                            )
                         ) THEN excluded.access_token ELSE accounts.access_token END,
                     refresh_token = CASE
                         WHEN excluded.refresh_token != '' AND (
-                            accounts.last_login_at = '' OR excluded.source_modified_at >= accounts.last_login_at
+                            accounts.cpa_updated_at = ''
+                            OR (
+                                excluded.cpa_updated_at != ''
+                                AND excluded.cpa_updated_at >= accounts.cpa_updated_at
+                            )
                         ) THEN excluded.refresh_token ELSE accounts.refresh_token END,
                     token_expires_at = CASE
                         WHEN excluded.token_expires_at != '' AND (
-                            accounts.last_login_at = '' OR excluded.source_modified_at >= accounts.last_login_at
+                            accounts.cpa_updated_at = ''
+                            OR (
+                                excluded.cpa_updated_at != ''
+                                AND excluded.cpa_updated_at >= accounts.cpa_updated_at
+                            )
                         ) THEN excluded.token_expires_at ELSE accounts.token_expires_at END,
                     auth_file = CASE
                         WHEN excluded.auth_file != '' AND (
-                            accounts.last_login_at = '' OR excluded.source_modified_at >= accounts.last_login_at
+                            accounts.cpa_updated_at = ''
+                            OR (
+                                excluded.cpa_updated_at != ''
+                                AND excluded.cpa_updated_at >= accounts.cpa_updated_at
+                            )
                         ) THEN excluded.auth_file ELSE accounts.auth_file END,
                     source = CASE WHEN excluded.source != '' THEN excluded.source ELSE accounts.source END,
                     source_modified_at = CASE
@@ -269,7 +310,11 @@ class AccountStore:
                             excluded.source_modified_at >= accounts.last_login_at
                         ) THEN 'unknown'
                         WHEN excluded.access_token != '' AND excluded.access_token != accounts.access_token AND (
-                            accounts.last_login_at = '' OR excluded.source_modified_at >= accounts.last_login_at
+                            accounts.cpa_updated_at = ''
+                            OR (
+                                excluded.cpa_updated_at != ''
+                                AND excluded.cpa_updated_at >= accounts.cpa_updated_at
+                            )
                         ) THEN 'unknown'
                         ELSE accounts.status
                     END,
@@ -279,7 +324,11 @@ class AccountStore:
                             excluded.source_modified_at >= accounts.last_login_at
                         ) THEN ''
                         WHEN excluded.access_token != '' AND excluded.access_token != accounts.access_token AND (
-                            accounts.last_login_at = '' OR excluded.source_modified_at >= accounts.last_login_at
+                            accounts.cpa_updated_at = ''
+                            OR (
+                                excluded.cpa_updated_at != ''
+                                AND excluded.cpa_updated_at >= accounts.cpa_updated_at
+                            )
                         ) THEN ''
                         ELSE accounts.status_detail
                     END,
@@ -299,15 +348,38 @@ class AccountStore:
                     END,
                     cpa_status = CASE
                         WHEN excluded.access_token != '' AND excluded.access_token != accounts.access_token AND (
-                            accounts.last_login_at = '' OR excluded.source_modified_at >= accounts.last_login_at
+                            accounts.cpa_updated_at = ''
+                            OR (
+                                excluded.cpa_updated_at != ''
+                                AND excluded.cpa_updated_at >= accounts.cpa_updated_at
+                            )
                         ) THEN 'unknown'
                         ELSE accounts.cpa_status
                     END,
                     cpa_detail = CASE
                         WHEN excluded.access_token != '' AND excluded.access_token != accounts.access_token AND (
-                            accounts.last_login_at = '' OR excluded.source_modified_at >= accounts.last_login_at
+                            accounts.cpa_updated_at = ''
+                            OR (
+                                excluded.cpa_updated_at != ''
+                                AND excluded.cpa_updated_at >= accounts.cpa_updated_at
+                            )
                         ) THEN ''
                         ELSE accounts.cpa_detail
+                    END,
+                    cpa_updated_at = CASE
+                        WHEN (
+                            (excluded.access_token != '' AND excluded.access_token != accounts.access_token)
+                            OR (excluded.refresh_token != '' AND excluded.refresh_token != accounts.refresh_token)
+                            OR (excluded.token_expires_at != '' AND excluded.token_expires_at != accounts.token_expires_at)
+                            OR (excluded.auth_file != '' AND excluded.auth_file != accounts.auth_file)
+                        ) AND (
+                            accounts.cpa_updated_at = ''
+                            OR (
+                                excluded.cpa_updated_at != ''
+                                AND excluded.cpa_updated_at >= accounts.cpa_updated_at
+                            )
+                        ) THEN excluded.cpa_updated_at
+                        ELSE accounts.cpa_updated_at
                     END,
                     updated_at = excluded.updated_at
                 """,
@@ -408,6 +480,77 @@ class AccountStore:
             ).fetchall()
         return [int(row["id"]) for row in rows]
 
+    def ids_for_cpa_statuses(self, statuses: Sequence[str]) -> List[int]:
+        clean = [str(value) for value in statuses if str(value)]
+        if not clean:
+            return []
+        placeholders = ",".join("?" for _ in clean)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM accounts WHERE cpa_status IN (%s) ORDER BY id" % placeholders,
+                clean,
+            ).fetchall()
+        return [int(row["id"]) for row in rows]
+
+    def mark_cpa_expired(self, account_id: int, detail: str = "CPA 凭据已过期") -> None:
+        """Mark CPA (and overall status) expired without touching SSO fields."""
+        with self.account_lock(account_id):
+            self._mark_cpa_expired_unlocked(account_id, detail)
+
+    def mark_cpa_expired_if_refresh_unchanged(
+        self,
+        account_id: int,
+        expected_refresh: Optional[str],
+        detail: str = "CPA 凭据已过期",
+        *,
+        expected_access: Optional[str] = None,
+        expected_cpa_updated_at: Optional[str] = None,
+    ) -> bool:
+        """Expire only when every provided CPA snapshot field still matches.
+
+        None means the field was not included in the snapshot. An empty string is an
+        explicit snapshot value and must compare equal exactly.
+        """
+        with self.account_lock(account_id):
+            account = self.get(account_id)
+            if account is None:
+                return False
+            current_refresh = str(account.refresh_token or "").strip()
+            if expected_refresh is not None and current_refresh != str(expected_refresh).strip():
+                return False
+            if expected_access is not None:
+                current_access = str(account.access_token or "").strip()
+                if current_access != str(expected_access).strip():
+                    return False
+            if expected_cpa_updated_at is not None:
+                current_stamp = str(account.cpa_updated_at or "").strip()
+                if current_stamp != str(expected_cpa_updated_at).strip():
+                    return False
+            self._mark_cpa_expired_unlocked(account_id, detail)
+            return True
+
+    def _mark_cpa_expired_unlocked(self, account_id: int, detail: str) -> None:
+        now = utc_now_iso()
+        text = str(detail or "CPA 凭据已过期")[:1000]
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE accounts
+                SET cpa_status = ?, cpa_detail = ?,
+                    status = ?, status_detail = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    AccountStatus.EXPIRED.value,
+                    text,
+                    AccountStatus.EXPIRED.value,
+                    text,
+                    now,
+                    int(account_id),
+                ),
+            )
+
     def set_status(self, account_ids: Sequence[int], status: str, detail: str = "") -> None:
         ids = [int(value) for value in account_ids]
         if not ids:
@@ -422,33 +565,82 @@ class AccountStore:
             )
 
     def apply_inspection(self, result: InspectionResult) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                UPDATE accounts
-                SET status = ?, status_detail = ?, last_checked_at = ?,
-                    token_expires_at = CASE WHEN ? != '' THEN ? ELSE token_expires_at END,
-                    sso_expires_at = CASE WHEN ? != '' THEN ? ELSE sso_expires_at END,
-                    sso_status = ?, sso_detail = ?, cpa_status = ?, cpa_detail = ?,
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    result.status,
-                    result.detail[:1000],
-                    result.checked_at,
-                    result.expires_at,
-                    result.expires_at,
-                    result.sso_expires_at,
-                    result.sso_expires_at,
-                    result.sso_status or AccountStatus.UNKNOWN.value,
-                    result.sso_detail[:1000],
-                    result.cpa_status or AccountStatus.UNKNOWN.value,
-                    result.cpa_detail[:1000],
-                    result.checked_at,
-                    result.account_id,
-                ),
-            )
+        # Hold the account lock and refuse stale snapshots that predate a CPA rotation.
+        with self.account_lock(result.account_id):
+            current = self.get(result.account_id)
+            if current is None:
+                return
+            observed_access = str(getattr(result, "observed_access_token", "") or "").strip()
+            observed_cpa_updated = str(
+                getattr(result, "observed_cpa_updated_at", "") or ""
+            ).strip()
+            observed_sso = str(getattr(result, "observed_sso_token", "") or "").strip()
+            observed_last_login = str(
+                getattr(result, "observed_last_login_at", "") or ""
+            ).strip()
+            current_access = str(current.access_token or "").strip()
+            current_stamp = str(current.cpa_updated_at or "").strip()
+            current_sso = str(current.sso_token or "").strip()
+            current_last_login = str(current.last_login_at or "").strip()
+            if bool(getattr(result, "cpa_snapshot", False)):
+                # Empty observation means the probe saw no CPA material; refuse to
+                # overwrite an account that gained CPA credentials after the probe.
+                if not observed_access and current_access:
+                    return
+                if observed_access and observed_access != current_access:
+                    return
+                if (
+                    observed_cpa_updated
+                    and current_stamp
+                    and observed_cpa_updated != current_stamp
+                ):
+                    return
+                if not observed_cpa_updated and current_stamp and current_access:
+                    return
+            elif observed_access or observed_cpa_updated:
+                if observed_access and observed_access != current_access:
+                    return
+                if (
+                    observed_cpa_updated
+                    and current_stamp
+                    and observed_cpa_updated != current_stamp
+                ):
+                    return
+            if bool(getattr(result, "sso_snapshot", False)):
+                if observed_sso != current_sso or observed_last_login != current_last_login:
+                    return
+            elif observed_sso or observed_last_login:
+                if observed_sso and observed_sso != current_sso:
+                    return
+                if observed_last_login and observed_last_login != current_last_login:
+                    return
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE accounts
+                    SET status = ?, status_detail = ?, last_checked_at = ?,
+                        token_expires_at = CASE WHEN ? != '' THEN ? ELSE token_expires_at END,
+                        sso_expires_at = CASE WHEN ? != '' THEN ? ELSE sso_expires_at END,
+                        sso_status = ?, sso_detail = ?, cpa_status = ?, cpa_detail = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        result.status,
+                        result.detail[:1000],
+                        result.checked_at,
+                        result.expires_at,
+                        result.expires_at,
+                        result.sso_expires_at,
+                        result.sso_expires_at,
+                        result.sso_status or AccountStatus.UNKNOWN.value,
+                        result.sso_detail[:1000],
+                        result.cpa_status or AccountStatus.UNKNOWN.value,
+                        result.cpa_detail[:1000],
+                        result.checked_at,
+                        result.account_id,
+                    ),
+                )
 
     def apply_login_credentials(
         self,
@@ -460,36 +652,129 @@ class AccountStore:
         detail: str = "批量登录成功",
         sso_token: str = "",
     ) -> None:
-        now = utc_now_iso()
+        with self.account_lock(account_id):
+            now = utc_now_iso()
+            account = self.get(account_id)
+            if account is None:
+                raise ValueError("登录凭据对应的账号不存在")
+            # Login deliberately stores the provided auth_file (often empty after the
+            # transient managed file is deleted). CPA renewals use apply_cpa_credentials
+            # which preserves an existing pointer when the new value is blank.
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE accounts
+                    SET access_token = ?, refresh_token = ?, token_expires_at = ?,
+                        sso_token = CASE WHEN ? != '' THEN ? ELSE sso_token END,
+                        auth_file = ?, status = ?, status_detail = ?,
+                        sso_status = ?, sso_detail = ?, cpa_status = ?, cpa_detail = ?,
+                        cpa_updated_at = ?,
+                        last_login_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        self._encrypt_credential(account.email, "access_token", access_token),
+                        self._encrypt_credential(account.email, "refresh_token", refresh_token),
+                        expires_at.strip(),
+                        self._encrypt_credential(account.email, "sso_token", sso_token),
+                        self._encrypt_credential(account.email, "sso_token", sso_token),
+                        self._encrypt_credential(account.email, "auth_file", auth_file),
+                        AccountStatus.UNKNOWN.value,
+                        detail[:1000],
+                        AccountStatus.UNKNOWN.value,
+                        "登录后待巡检",
+                        AccountStatus.UNKNOWN.value,
+                        "登录后待巡检",
+                        now,
+                        now,
+                        now,
+                        int(account_id),
+                    ),
+                )
+
+    def apply_cpa_credentials(
+        self,
+        account_id: int,
+        access_token: str,
+        refresh_token: str,
+        expires_at: str,
+        auth_file: str = "",
+        detail: str = "CPA 凭据已续期",
+        *,
+        preserve_status: bool = False,
+    ) -> None:
+        """Update CPA tokens only; leave SSO fields untouched.
+
+        auth_file is a metadata pointer (often the hotload path). Empty input keeps
+        the existing pointer so temporary managed files can be deleted without
+        wiping inspection metadata.
+        """
+        with self.account_lock(account_id):
+            now = utc_now_iso()
+            account = self.get(account_id)
+            if account is None:
+                raise ValueError("CPA 续期对应的账号不存在")
+            access_token = str(access_token or "").strip()
+            refresh_token = str(refresh_token or "").strip()
+            if not access_token or not refresh_token:
+                raise ValueError("CPA 续期需要 access_token 与 refresh_token")
+            auth_file = str(auth_file or "").strip()
+            if preserve_status:
+                status = account.status
+                status_detail = detail[:1000] if detail else account.status_detail
+                cpa_status = account.cpa_status
+                cpa_detail = detail[:1000] if detail else account.cpa_detail
+            else:
+                status = AccountStatus.UNKNOWN.value
+                status_detail = detail[:1000]
+                cpa_status = AccountStatus.UNKNOWN.value
+                cpa_detail = "续期后待巡检"
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE accounts
+                    SET access_token = ?, refresh_token = ?, token_expires_at = ?,
+                        auth_file = CASE WHEN ? != '' THEN ? ELSE auth_file END,
+                        status = ?, status_detail = ?,
+                        cpa_status = ?, cpa_detail = ?,
+                        cpa_updated_at = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        self._encrypt_credential(account.email, "access_token", access_token),
+                        self._encrypt_credential(account.email, "refresh_token", refresh_token),
+                        expires_at.strip(),
+                        self._encrypt_credential(account.email, "auth_file", auth_file),
+                        self._encrypt_credential(account.email, "auth_file", auth_file),
+                        status,
+                        status_detail,
+                        cpa_status,
+                        cpa_detail,
+                        now,
+                        now,
+                        int(account_id),
+                    ),
+                )
+
+    def touch_cpa_auth_file(self, account_id: int, auth_file: str) -> None:
+        """Update only the CPA auth_file metadata pointer."""
+        path = str(auth_file or "").strip()
+        if not path:
+            return
         account = self.get(account_id)
         if account is None:
-            raise ValueError("登录凭据对应的账号不存在")
+            raise ValueError("账号不存在")
         with self._connect() as conn:
             conn.execute(
                 """
                 UPDATE accounts
-                SET access_token = ?, refresh_token = ?, token_expires_at = ?,
-                    sso_token = CASE WHEN ? != '' THEN ? ELSE sso_token END,
-                    auth_file = ?, status = ?, status_detail = ?,
-                    sso_status = ?, sso_detail = ?, cpa_status = ?, cpa_detail = ?,
-                    last_login_at = ?, updated_at = ?
+                SET auth_file = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
-                    self._encrypt_credential(account.email, "access_token", access_token),
-                    self._encrypt_credential(account.email, "refresh_token", refresh_token),
-                    expires_at.strip(),
-                    self._encrypt_credential(account.email, "sso_token", sso_token),
-                    self._encrypt_credential(account.email, "sso_token", sso_token),
-                    self._encrypt_credential(account.email, "auth_file", auth_file),
-                    AccountStatus.UNKNOWN.value,
-                    detail[:1000],
-                    AccountStatus.UNKNOWN.value,
-                    "登录后待巡检",
-                    AccountStatus.UNKNOWN.value,
-                    "登录后待巡检",
-                    now,
-                    now,
+                    self._encrypt_credential(account.email, "auth_file", path),
+                    utc_now_iso(),
                     int(account_id),
                 ),
             )

@@ -137,24 +137,43 @@ def _has_reset_success(
         "too many",
         "rate limit",
         "请求过于频繁",
-        "invalid",
-        "incorrect",
-        "expired",
-        "failed",
-        "error",
-        "unable",
-        "could not",
-        "session",
+        "invalid code",
+        "incorrect code",
+        "code expired",
+        "session expired",
+        "invalid session",
         "unauthorized",
         "forbidden",
-        "验证码",
-        "失败",
-        "无效",
-        "错误",
-        "过期",
+        "验证码无效",
+        "验证码错误",
+        "验证码过期",
+        "密码重置失败",
+        "重置失败",
+        "请求失败",
     )
     if any(marker in low for marker in failure_markers):
         return False
+    # Keep a second pass for generic failure words, but only while still on the
+    # reset flow. Post-reset account/sign-in landings often contain neutral words
+    # like "Sessions" / "Security".
+    still_on_reset = "reset-password" in url_low or "new-password" in low or "设置新密码" in (text or "")
+    if still_on_reset:
+        generic_failure = (
+            "invalid",
+            "incorrect",
+            "expired",
+            "failed",
+            "error",
+            "unable",
+            "could not",
+            "验证码",
+            "失败",
+            "无效",
+            "错误",
+            "过期",
+        )
+        if any(marker in low for marker in generic_failure):
+            return False
     success_words = (
         "password updated",
         "password has been reset",
@@ -178,23 +197,49 @@ def _has_reset_success(
     )
     if any(word in low for word in success_words):
         return True
-    # Leaving the form alone is not enough: require a sign-in landing without
-    # residual reset-password content.
-    if (
+    # Leaving the form alone is not enough: require a post-reset landing without
+    # residual reset-password content. xAI may land on sign-in or the signed-in
+    # account management page after a successful reset.
+    left_reset_form = (
         password_form_present is False
         and "reset-password" not in url_low
         and "new-password" not in low
-        and any(marker in url_low for marker in ("sign-in", "login"))
-        and any(
-            marker in low
-            for marker in (
-                "sign in",
-                "log in",
-                "login",
-                "登录",
-                "使用邮箱登录",
-                "continue with email",
-            )
+        and "设置新密码" not in (text or "")
+        and "choose a new password" not in low
+    )
+    if not left_reset_form:
+        return False
+    if any(marker in url_low for marker in ("sign-in", "login")) and any(
+        marker in low
+        for marker in (
+            "sign in",
+            "log in",
+            "login",
+            "登录",
+            "使用邮箱登录",
+            "continue with email",
+        )
+    ):
+        return True
+    account_page = (
+        "/account" in url_low
+        or url_low.rstrip("/").endswith("accounts.x.ai")
+    )
+    if account_page and any(
+        marker in low
+        for marker in (
+            "manage your account",
+            "your account",
+            "account settings",
+            "security",
+            "sessions",
+            "管理您的账户",
+            "您的账户",
+            "账户信息",
+            "安全",
+            "会话",
+            "欢迎",
+            "welcome",
         )
     ):
         return True
@@ -331,10 +376,26 @@ def reset_password(
     email = str(email or "").strip()
     mail_credential = str(mail_credential or "").strip()
     new_password = str(new_password or "").strip() or generate_password()
-    if not email or not mail_credential:
-        raise PasswordResetError("邮箱或邮箱访问凭据为空")
+    if not email:
+        raise PasswordResetError("邮箱为空")
     if len(new_password) < 12:
         raise PasswordResetError("新密码长度不足")
+    if not mail_credential:
+        # Recover JWT via admin address lookup + /admin/show_password/{id}.
+        provider = str(app.get_email_provider() or "").strip().lower()
+        if provider != "cloudflare":
+            raise PasswordResetError("邮箱访问凭据为空")
+        log("本地无邮箱 JWT，尝试管理员接口按邮箱恢复访问凭据")
+        try:
+            recovered, address_id = app.cloudflare_admin_recover_jwt(email)
+        except Exception as exc:
+            raise PasswordResetError(
+                "邮箱访问凭据为空，管理员接口恢复失败: %s" % exc
+            ) from exc
+        mail_credential = str(recovered or "").strip()
+        if not mail_credential:
+            raise PasswordResetError("邮箱访问凭据为空，管理员接口未返回 JWT")
+        log("管理员接口已恢复邮箱 JWT（address_id=%s）" % address_id)
 
     excluded_ids, mail_credential, use_admin_mail = _load_mail_snapshot(
         email, mail_credential, log

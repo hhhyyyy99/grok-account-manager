@@ -23,6 +23,10 @@ class ManagerConfig:
     register_threads: int = 1
     mint_workers: int = 1
     auto_import_on_start: bool = True
+    # CPA access_token guardian: refresh when within lead window; loop interval.
+    cpa_guard_enabled: bool = True
+    cpa_guard_interval_seconds: int = 300
+    cpa_guard_lead_seconds: int = 1800
 
     def normalized(self) -> "ManagerConfig":
         self.probe_timeout_seconds = max(3, min(int(self.probe_timeout_seconds), 120))
@@ -32,6 +36,9 @@ class ManagerConfig:
         self.register_count = max(1, int(self.register_count))
         self.register_threads = max(1, min(int(self.register_threads), 10))
         self.mint_workers = max(0, min(int(self.mint_workers), 10))
+        self.cpa_guard_enabled = bool(self.cpa_guard_enabled)
+        self.cpa_guard_interval_seconds = max(30, min(int(self.cpa_guard_interval_seconds), 86400))
+        self.cpa_guard_lead_seconds = max(60, min(int(self.cpa_guard_lead_seconds), 21600))
         return self
 
 

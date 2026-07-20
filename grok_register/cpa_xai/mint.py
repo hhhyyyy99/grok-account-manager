@@ -21,7 +21,7 @@ def _noop(_: str) -> None:
 def mint_and_export(
     *,
     email: str,
-    password: str,
+    password: str = "",
     auth_dir: str | Path,
     page: Any | None = None,
     proxy: str | None = None,
@@ -34,6 +34,8 @@ def mint_and_export(
     cookies: Any | None = None,
     reuse_browser: bool = True,
     recycle_every: int = 15,
+    allow_passwordless: bool = False,
+    require_account_gates: bool = True,
     log: LogFn | None = None,
     cancel: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
@@ -43,7 +45,11 @@ def mint_and_export(
     """
     log = log or _noop
     email = (email or "").strip()
-    if not email or not password:
+    password = password or ""
+    has_cookies = bool(cookies)
+    if not email:
+        return {"ok": False, "email": email, "error": "missing email"}
+    if not password and not (allow_passwordless and has_cookies):
         return {"ok": False, "email": email, "error": "missing email/password"}
 
     # Config/explicit proxy wins over shell https_proxy (common 7890 trap).
@@ -63,6 +69,8 @@ def mint_and_export(
             cookies=cookies,
             reuse_browser=reuse_browser,
             recycle_every=recycle_every,
+            allow_passwordless=bool(allow_passwordless and has_cookies),
+            require_account_gates=bool(require_account_gates),
             poll_log=log,
             cancel=cancel,
         )
