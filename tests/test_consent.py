@@ -101,6 +101,33 @@ class ConsentServiceTests(unittest.TestCase):
 
 
 
+
+    def test_login_settings_forward_require_account_gates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            account = manager.store.upsert(
+                AccountDraft(email="gates-flag@example.com", password="password")
+            )
+            captured = {}
+
+            def fake_login(ids, settings, log=None, progress=None):
+                captured["require_account_gates"] = bool(settings.require_account_gates)
+                result = __import__("grok_manager.models", fromlist=["LoginResult"]).LoginResult(
+                    account.id, account.email, True, "批量登录成功"
+                )
+                if progress:
+                    progress(result, 1, 1)
+                return [result]
+
+            with patch.object(manager.login, "login_accounts", side_effect=fake_login), patch.object(
+                manager, "_sync_relogin_credentials", return_value=""
+            ), patch.object(manager, "inspect_accounts", return_value=[]):
+                manager.batch_login([account.id], require_account_gates=False)
+                self.assertFalse(captured["require_account_gates"])
+                manager.batch_login([account.id], require_account_gates=True)
+                self.assertTrue(captured["require_account_gates"])
+
+
 class GateDetectionTests(unittest.TestCase):
     def test_cloudflare_page_is_not_pass(self) -> None:
         from grok_register.cpa_xai import browser_confirm as bc
@@ -115,6 +142,25 @@ class GateDetectionTests(unittest.TestCase):
     def test_app_markers(self) -> None:
         from grok_register.cpa_xai import browser_confirm as bc
         self.assertTrue(bc.looks_like_grok_app("https://grok.com/", "新建聊天 你想知道什么"))
+
+
+    def test_page_cf_clearance_prefers_grok_domain(self) -> None:
+        from grok_register.cpa_xai import browser_confirm as bc
+        class FakePage:
+            def cookies(self):
+                return [
+                    {"name": "cf_clearance", "value": "other", "domain": ".example.com"},
+                    {"name": "cf_clearance", "value": "grok-pass", "domain": ".grok.com"},
+                    {"name": "sso", "value": "x", "domain": ".grok.com"},
+                ]
+        self.assertEqual("grok-pass", bc._page_cf_clearance(FakePage()))
+
+    def test_page_cf_clearance_empty_without_cookie(self) -> None:
+        from grok_register.cpa_xai import browser_confirm as bc
+        class FakePage:
+            def cookies(self):
+                return [{"name": "sso", "value": "x", "domain": ".grok.com"}]
+        self.assertEqual("", bc._page_cf_clearance(FakePage()))
 
 if __name__ == "__main__":
     unittest.main()

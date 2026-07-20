@@ -514,9 +514,9 @@ function AccountsView(props: AccountsViewProps) {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const ids = [...selected];
   const hasFilters = Boolean(search || status);
-  const requireSelection = (endpoint: string, label: string) => {
+  const requireSelection = (endpoint: string, label: string, extra: Record<string, unknown> = {}) => {
     if (!ids.length || busy) return;
-    void onAction(endpoint, { ids }, label);
+    void onAction(endpoint, { ids, ...extra }, label);
   };
 
   return (
@@ -581,16 +581,25 @@ function AccountsView(props: AccountsViewProps) {
           <div className="selection-actions">
             <button type="button" disabled={!selected.size || busy} onClick={() => requireSelection("/api/inspect", "巡检任务已创建")}><span aria-hidden="true">↻</span>巡检</button>
             <button type="button" disabled={!selected.size || busy} onClick={() => requireSelection("/api/refresh-cpa", "CPA 续期任务已创建")}><span aria-hidden="true">⟳</span>CPA 续期</button>
-            <button type="button" disabled={!selected.size || busy} onClick={() => requireSelection("/api/login", "登录任务已创建")}><span aria-hidden="true">→</span>批量登录</button>
-            <button type="button" disabled={!selected.size || busy} onClick={() => requireSelection("/api/consent", "授权确认任务已创建")}><span aria-hidden="true">✓</span>授权确认</button>
+            <button type="button" disabled={!selected.size || busy} onClick={() => requireSelection("/api/login", "登录任务已创建", { requireAccountGates: false })} title="只重新登录，不处理 TOS 门禁"><span aria-hidden="true">→</span>登录</button>
+            <button type="button" disabled={!selected.size || busy} onClick={() => requireSelection("/api/login", "登录+门禁任务已创建", { requireAccountGates: true })} title="登录后先过 TOS 门禁，再 Build 授权"><span aria-hidden="true">⇢</span>登录+门禁</button>
+            <button type="button" disabled={!selected.size || busy} onClick={() => requireSelection("/api/consent", "授权确认任务已创建")} title="仅对已有 SSO 的账号补做 TOS 门禁"><span aria-hidden="true">✓</span>授权确认</button>
             <button type="button" disabled={!selected.size || busy} onClick={() => requireSelection("/api/reset-password", "改密任务已创建")}><span aria-hidden="true">↺</span>重置密码</button>
-            <span className="export-control">
-              <select aria-label="导出格式" value={exportFormat} onChange={(event) => setExportFormat(event.target.value)}>
+            <span className="export-control" role="group" aria-label="导出">
+              <select
+                aria-label="导出格式"
+                value={exportFormat}
+                disabled={!selected.size || busy}
+                onChange={(event) => setExportFormat(event.target.value)}
+              >
                 <option value="cpa">CPA ZIP</option>
                 <option value="sub2api">Sub2API JSON</option>
                 <option value="grok2api">Grok2API JSON</option>
+                <option value="accounts">账户 TXT</option>
               </select>
-              <button type="button" disabled={!selected.size || busy} onClick={() => void onExport(exportFormat)}><span aria-hidden="true">↓</span>导出</button>
+              <button type="button" disabled={!selected.size || busy} onClick={() => void onExport(exportFormat)}>
+                <span aria-hidden="true">↓</span>导出
+              </button>
             </span>
             <button className="danger-action" type="button" disabled={!selected.size || busy} onClick={() => setConfirmDelete(true)}><span aria-hidden="true">×</span>删除</button>
           </div>

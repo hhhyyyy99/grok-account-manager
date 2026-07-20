@@ -79,6 +79,26 @@ CLOUDFLARE_MARKERS = (
     "needs to review the security",
     "ray id",
 )
+CLOUDFLARE_HARD_BLOCK_MARKERS = (
+    "sorry, you have been blocked",
+    "you are unable to access",
+    "access denied",
+    "error 1020",
+    "error 1015",
+    "why have i been blocked",
+)
+CLOUDFLARE_SPINNING_MARKERS = (
+    "just a moment",
+    "checking your browser",
+    "performing security verification",
+    "needs to review the security",
+    "one more step",
+    "verifying",
+    "please wait",
+    "正在验证",
+    "请稍候",
+    "安全验证",
+)
 GROK_APP_MARKERS = (
     "新建聊天",
     "new chat",
@@ -588,6 +608,28 @@ def looks_like_cloudflare(url: str = "", text: str = "") -> bool:
     return any(marker in blob for marker in CLOUDFLARE_MARKERS)
 
 
+def looks_like_cloudflare_hard_block(url: str = "", text: str = "") -> bool:
+    blob = _norm_probe_text("%s %s" % (url, text))
+    if not blob:
+        return False
+    return any(marker in blob for marker in CLOUDFLARE_HARD_BLOCK_MARKERS)
+
+
+def looks_like_cloudflare_spinning(url: str = "", text: str = "") -> bool:
+    """True when CF is still checking/spinning, not a final hard block."""
+    if looks_like_cloudflare_hard_block(url, text):
+        return False
+    blob = _norm_probe_text("%s %s" % (url, text))
+    if not blob:
+        return False
+    if any(marker in blob for marker in CLOUDFLARE_SPINNING_MARKERS):
+        return True
+    # Managed challenge pages often only show CF chrome while the spinner runs.
+    return looks_like_cloudflare(url, text) and (
+        "cloudflare" in blob or "cf-" in blob or "challenge" in blob
+    )
+
+
 def looks_like_tos_gate(url: str = "", text: str = "") -> bool:
     url_l = str(url or "").casefold()
     text_l = _norm_probe_text(text)
@@ -742,8 +784,26 @@ def prepare_account_gates(
 
             if looks_like_cloudflare(url, text):
                 saw_cf = True
-                log("cloudflare challenge detected; waiting")
-                _sleep(2.0)
+                if looks_like_cloudflare_hard_block(url, text):
+                    notes.append("Cloudflare 硬拦截")
+                    log("cloudflare hard block on grok.com during TOS gate")
+                    break
+                # Align with login turnstile budget (~45s), not a long gate-only wait.
+                remaining = max(10.0, min(45.0, deadline - time.time()))
+                cleared = bypass_cloudflare_challenge(
+                    page,
+                    log=log,
+                    timeout_sec=remaining,
+                    stop_event=stop_event,
+                    reload_on_stuck=True,
+                )
+                if cleared:
+                    notes.append("Cloudflare 已过盾")
+                    _sleep(1.0)
+                    continue
+                notes.append("Cloudflare 过盾未完成")
+                # keep looping until deadline; do not mark pass while CF remains
+                _sleep(1.0)
                 continue
 
             if looks_like_sign_in(url, text):
@@ -779,33 +839,28 @@ def prepare_account_gates(
                 # No gate and no app markers yet — keep waiting a bit for SPA.
             _sleep(1.0)
 
-        # API accept is auxiliary only.
-        try:
-            tos_api = _browser_post_binary(
-                page,
-                url="https://accounts.x.ai/auth_mgmt.AuthManagement/SetTosAcceptedVersion",
-                data_hex=_encode_grpc_tos_accepted().hex(),
-                content_type="application/grpc-web+proto",
-                origin="https://accounts.x.ai",
-                referer="https://accounts.x.ai/accept-tos",
-            )
-            status = int(tos_api.get("status") or 0)
-            if 200 <= status < 300:
-                api_ok = True
-                notes.append("SetTosAcceptedVersion 成功")
-            elif tos_api.get("error"):
-                notes.append("SetTosAcceptedVersion 异常: %s" % tos_api.get("error"))
-            else:
-                notes.append("SetTosAcceptedVersion HTTP %s" % status)
-        except Exception as exc:
-            notes.append("SetTosAcceptedVersion 异常: %s" % exc)
-
         final_url = _page_url(page) or ""
         final_text = _visible_text(page) or ""
         if looks_like_cloudflare(final_url, final_text):
-            detail = "；".join(notes + ["Cloudflare 挑战未通过"])
-            log("account TOS gate done ok=False detail=%s" % detail)
-            return {"ok": False, "tos_ok": False, "detail": detail}
+            if looks_like_cloudflare_hard_block(final_url, final_text):
+                detail = "；".join(notes + ["Cloudflare 硬拦截"])
+                log("account TOS gate done ok=False detail=%s" % detail)
+                return {"ok": False, "tos_ok": False, "detail": detail}
+            log("final page still CF; one last bypass attempt")
+            if bypass_cloudflare_challenge(
+                page,
+                log=log,
+                timeout_sec=45.0,
+                stop_event=stop_event,
+                reload_on_stuck=False,
+            ):
+                notes.append("Cloudflare 最终过盾成功")
+                final_url = _page_url(page) or ""
+                final_text = _visible_text(page) or ""
+            else:
+                detail = "；".join(notes + ["Cloudflare 挑战未通过"])
+                log("account TOS gate done ok=False detail=%s" % detail)
+                return {"ok": False, "tos_ok": False, "detail": detail}
         if looks_like_sign_in(final_url, final_text):
             detail = "；".join(notes + ["SSO 无效或回到登录页"])
             log("account TOS gate done ok=False detail=%s" % detail)
@@ -847,12 +902,42 @@ def prepare_account_gates(
         if tos_ok and clicked_tos and "TOS 门禁已通过" not in "；".join(notes):
             notes.append("TOS 门禁已通过")
 
+        # Auxiliary API accept: must run on accounts.x.ai, not while the tab is
+        # still on grok.com (browser fetch is same-origin restricted / CORS).
+        # Failures here must not override a successful UI gate pass.
+        if tos_ok and not stopped():
+            try:
+                page.get("https://accounts.x.ai/account")
+                _sleep(1.0)
+                tos_api = _browser_post_binary(
+                    page,
+                    url="https://accounts.x.ai/auth_mgmt.AuthManagement/SetTosAcceptedVersion",
+                    data_hex=_encode_grpc_tos_accepted().hex(),
+                    content_type="application/grpc-web+proto",
+                    origin="https://accounts.x.ai",
+                    referer="https://accounts.x.ai/accept-tos",
+                )
+                status = int(tos_api.get("status") or 0)
+                if 200 <= status < 300:
+                    api_ok = True
+                    notes.append("SetTosAcceptedVersion 成功")
+                elif tos_api.get("error"):
+                    log(
+                        "SetTosAcceptedVersion auxiliary failed: %s"
+                        % tos_api.get("error")
+                    )
+                else:
+                    log("SetTosAcceptedVersion auxiliary HTTP %s" % status)
+            except Exception as exc:
+                log("SetTosAcceptedVersion auxiliary exception: %s" % exc)
+
         detail = "；".join(notes) if notes else ("账号授权完成" if tos_ok else "账号授权未确认")
         log("account TOS gate done ok=%s detail=%s" % (tos_ok, detail))
         return {
             "ok": bool(tos_ok),
             "tos_ok": bool(tos_ok),
             "detail": detail,
+            "api_ok": bool(api_ok),
         }
     except Exception as exc:
         detail = "账号授权异常: %s" % exc
@@ -1134,6 +1219,483 @@ if (nodes.length && typeof nodes[0].click === 'function') nodes[0].click();
         _sleep(0.9)
     log("turnstile not ready")
     return False
+
+
+def _click_cloudflare_widgets(page: Any, log: LogFn) -> bool:
+    """Best-effort click on CF managed-challenge / turnstile widgets."""
+    acted = False
+    # Same shadow-root path as register/login turnstile wait.
+    try:
+        challenge_input = page.ele("@name=cf-turnstile-response", timeout=0.2)
+        if challenge_input is not None:
+            wrapper = challenge_input.parent()
+            iframe = None
+            try:
+                iframe = wrapper.shadow_root.ele("tag:iframe")
+            except Exception:
+                iframe = None
+            if iframe is not None:
+                try:
+                    iframe.run_js(
+                        """
+window.dtp = 1;
+function getRandomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+let sx = getRandomInt(800, 1200);
+let sy = getRandomInt(400, 700);
+Object.defineProperty(MouseEvent.prototype, 'screenX', { value: sx });
+Object.defineProperty(MouseEvent.prototype, 'screenY', { value: sy });
+                        """
+                    )
+                except Exception:
+                    pass
+                try:
+                    body_sr = iframe.ele("tag:body").shadow_root
+                    btn = body_sr.ele("tag:input")
+                    if btn is not None:
+                        btn.click()
+                        log("clicked CF turnstile checkbox")
+                        acted = True
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Broader click targets used by managed challenges.
+    try:
+        clicked = page.run_js(
+            """
+const selectors = [
+  'input[type=checkbox]',
+  'label',
+  'button',
+  'div[role=button]',
+  'iframe[src*="challenges.cloudflare"]',
+  'iframe[src*="turnstile"]',
+  '.cf-turnstile',
+  '#challenge-stage',
+  '#cf-stage',
+];
+const labels = ['Verify you are human', '确认您是真人', '继续', 'Continue'];
+for (const sel of selectors) {
+  for (const el of document.querySelectorAll(sel)) {
+    try {
+      const t = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim();
+      const src = String(el.getAttribute?.('src') || '');
+      if (
+        labels.includes(t) ||
+        src.includes('challenges.cloudflare') ||
+        src.includes('turnstile') ||
+        (el.type === 'checkbox')
+      ) {
+        el.click();
+        return t || sel || src.slice(0, 40) || 'widget';
+      }
+    } catch (e) {}
+  }
+}
+return null;
+            """
+        )
+        if clicked:
+            log("clicked CF widget %r" % clicked)
+            acted = True
+    except Exception as exc:
+        log("CF widget click failed: %s" % exc)
+    return acted
+
+
+def _cf_turnstile_token(page: Any) -> str:
+    try:
+        token = page.run_js(
+            """
+try {
+  const input = document.querySelector('input[name="cf-turnstile-response"]');
+  const byInput = String((input && input.value) || '').trim();
+  if (byInput) return byInput;
+  if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
+    return String(window.turnstile.getResponse() || '').trim();
+  }
+  return '';
+} catch (e) { return ''; }
+            """
+        )
+        return str(token or "").strip()
+    except Exception:
+        return ""
+
+
+def _cf_has_interactive_widget(page: Any) -> bool:
+    """True only when a real turnstile/checkbox widget is present (not just spinning text)."""
+    try:
+        found = page.run_js(
+            """
+try {
+  if (document.querySelector('input[name="cf-turnstile-response"]')) return 'input';
+  if (document.querySelector('iframe[src*="challenges.cloudflare.com"]')) return 'cf-iframe';
+  if (document.querySelector('iframe[src*="turnstile"]')) return 'turnstile-iframe';
+  if (document.querySelector('.cf-turnstile, [data-sitekey]')) return 'widget';
+  return '';
+} catch (e) { return ''; }
+            """
+        )
+        return bool(str(found or "").strip())
+    except Exception:
+        return False
+
+
+def _page_cf_clearance(page: Any) -> str:
+    """Return cf_clearance cookie value if present for grok/cloudflare domains."""
+    try:
+        cookies = page.cookies() or []
+    except Exception:
+        return ""
+    best = ""
+    for cookie in cookies:
+        if isinstance(cookie, dict):
+            name = str(cookie.get("name") or "")
+            value = str(cookie.get("value") or "")
+            domain = str(cookie.get("domain") or "").casefold()
+        else:
+            name = str(getattr(cookie, "name", "") or "")
+            value = str(getattr(cookie, "value", "") or "")
+            domain = str(getattr(cookie, "domain", "") or "").casefold()
+        if name != "cf_clearance" or not value:
+            continue
+        # Prefer grok.com clearance; fall back to any clearance seen.
+        if "grok.com" in domain or domain.endswith(".grok.com") or not domain:
+            return value
+        if not best:
+            best = value
+    return best
+
+
+def _reload_after_cf_clearance(
+    page: Any,
+    *,
+    log: LogFn,
+    target_url: str = "",
+) -> bool:
+    """Research finding: clearance often lands while UI stays on challenge page.
+
+    Reload once so the browser re-requests grok.com with cf_clearance.
+    Returns True when the page no longer looks like Cloudflare afterwards.
+    """
+    target = (target_url or _page_url(page) or "https://grok.com/").strip()
+    if "grok.com" not in target.casefold():
+        target = "https://grok.com/"
+    log("cf_clearance present; reload %s to apply challenge pass" % target)
+    try:
+        page.get(target)
+    except TypeError:
+        page.get(target)
+    except Exception as exc:
+        log("cf_clearance reload failed: %s" % exc)
+        return False
+    _sleep(2.0)
+    # SPA / challenge settle
+    for _ in range(6):
+        url = _page_url(page) or ""
+        text = _visible_text(page) or ""
+        if looks_like_cloudflare_hard_block(url, text):
+            log("still hard-blocked after cf_clearance reload")
+            return False
+        if not looks_like_cloudflare(url, text):
+            log("cloudflare cleared after cf_clearance reload")
+            return True
+        _sleep(1.0)
+    url = _page_url(page) or ""
+    text = _visible_text(page) or ""
+    cleared = not looks_like_cloudflare(url, text)
+    log("after cf_clearance reload cleared=%s url=%s" % (cleared, url[:120]))
+    return cleared
+
+
+def _click_visible_cf_checkbox(page: Any, log: LogFn) -> bool:
+    """Click only a real CF checkbox / interactive widget. No blind container clicks."""
+    # Shadow-root checkbox path (same as login, but only when input exists).
+    try:
+        challenge_input = page.ele("@name=cf-turnstile-response", timeout=0.2)
+        if challenge_input is not None:
+            wrapper = challenge_input.parent()
+            iframe = None
+            try:
+                iframe = wrapper.shadow_root.ele("tag:iframe")
+            except Exception:
+                iframe = None
+            if iframe is not None:
+                try:
+                    iframe.run_js(
+                        """
+window.dtp = 1;
+function getRandomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+let sx = getRandomInt(800, 1200);
+let sy = getRandomInt(400, 700);
+Object.defineProperty(MouseEvent.prototype, 'screenX', { value: sx });
+Object.defineProperty(MouseEvent.prototype, 'screenY', { value: sy });
+                        """
+                    )
+                except Exception:
+                    pass
+                try:
+                    body_sr = iframe.ele("tag:body").shadow_root
+                    btn = body_sr.ele("tag:input")
+                    if btn is not None:
+                        btn.click()
+                        log("clicked CF turnstile checkbox")
+                        return True
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Visible labels only — no generic "nodes with turnstile in className" blind click.
+    try:
+        clicked = page.run_js(
+            """
+const labels = [
+  'Verify you are human',
+  '确认您是真人',
+  'I am human',
+  '我是真人',
+];
+for (const el of document.querySelectorAll('button, label, div[role=button], input[type=checkbox]')) {
+  try {
+    const t = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim();
+    if (!t) continue;
+    if (labels.includes(t) || (el.type === 'checkbox' && el.name !== 'cf-turnstile-response')) {
+      el.click();
+      return t || 'checkbox';
+    }
+  } catch (e) {}
+}
+return null;
+            """
+        )
+        if clicked:
+            log("clicked CF interactive control %r" % clicked)
+            return True
+    except Exception as exc:
+        log("CF interactive click failed: %s" % exc)
+    return False
+
+
+def bypass_cloudflare_challenge(
+    page: Any,
+    *,
+    log: LogFn | None = None,
+    timeout_sec: float = 45.0,
+    stop_event: threading.Event | None = None,
+    reload_on_stuck: bool = True,
+) -> bool:
+    """Gate-side Cloudflare wait/bypass for grok.com Managed Challenge.
+
+    Research findings:
+      - grok.com often issues Managed Challenge, not password-page Turnstile
+      - cf_clearance may appear while the UI still shows "请稍候/安全验证"
+      - success path is: detect cf_clearance -> reload grok.com -> re-check page
+
+    Rules:
+      - do NOT reset turnstile
+      - do NOT blind-click hidden turnstile containers
+      - spinning/no-widget: wait
+      - real checkbox/iframe: click once and settle
+      - cf_clearance present: reload once to apply the pass
+    """
+    log = log or _noop_log
+    if page is None:
+        return False
+
+    def stopped() -> bool:
+        return bool(stop_event is not None and stop_event.is_set())
+
+    start_url = _page_url(page) or "https://grok.com/"
+    log("cloudflare challenge detected; gate mode (clearance+reload, no blind click)")
+    # Same order of magnitude as login _wait_turnstile default (45s).
+    deadline = time.time() + max(20.0, float(timeout_sec))
+    reloaded = False
+    clearance_reloaded = False
+    last_progress = time.time()
+    last_status_log = 0.0
+    settle_rounds = 0
+    clicked_once = False
+    last_clearance = ""
+
+    while time.time() < deadline and not stopped():
+        url = _page_url(page) or ""
+        text = _visible_text(page) or ""
+        if not looks_like_cloudflare(url, text):
+            log("cloudflare challenge cleared")
+            return True
+
+        if looks_like_cloudflare_hard_block(url, text):
+            log("cloudflare hard block page detected; stop bypass early")
+            return False
+
+        spinning = looks_like_cloudflare_spinning(url, text)
+        has_widget = _cf_has_interactive_widget(page)
+        token = _cf_turnstile_token(page)
+        clearance = _page_cf_clearance(page)
+        now = time.time()
+        if now - last_status_log >= 8.0:
+            if clearance and spinning:
+                state = "clearance-pending-reload"
+            elif spinning and not has_widget:
+                state = "spinning"
+            elif has_widget:
+                state = "interactive-widget"
+            else:
+                state = "challenge"
+            log(
+                "cloudflare still present (%s), wait %.0fs more"
+                % (state, max(0.0, deadline - now))
+            )
+            last_status_log = now
+
+        # Key fix: clearance often means challenge already passed server-side.
+        if clearance and not clearance_reloaded:
+            last_clearance = clearance
+            clearance_reloaded = True
+            last_progress = time.time()
+            if _reload_after_cf_clearance(page, log=log, target_url=start_url):
+                return True
+            # Reload happened but page still looks like CF; keep waiting/clicking.
+            continue
+
+        # New clearance value after first reload attempt: try one more apply.
+        if (
+            clearance
+            and clearance_reloaded
+            and clearance != last_clearance
+            and not reloaded
+        ):
+            last_clearance = clearance
+            last_progress = time.time()
+            if _reload_after_cf_clearance(page, log=log, target_url=start_url):
+                return True
+            continue
+
+        # Token already filled (invisible challenge finished) — settle, then
+        # reload if clearance is present.
+        if len(token) >= 80:
+            last_progress = time.time()
+            log("turnstile token present len=%s; waiting page settle" % len(token))
+            for _ in range(6):
+                if stopped():
+                    return False
+                _sleep(1.0)
+                url = _page_url(page) or ""
+                text = _visible_text(page) or ""
+                if not looks_like_cloudflare(url, text):
+                    log("cloudflare cleared after turnstile token")
+                    return True
+                if looks_like_cloudflare_hard_block(url, text):
+                    log("cloudflare hard block after turnstile token")
+                    return False
+                clearance = _page_cf_clearance(page)
+                if clearance and not clearance_reloaded:
+                    clearance_reloaded = True
+                    last_clearance = clearance
+                    if _reload_after_cf_clearance(page, log=log, target_url=start_url):
+                        return True
+                    break
+            continue
+
+        # Only click when a real widget is present.
+        if has_widget:
+            if _click_visible_cf_checkbox(page, log):
+                clicked_once = True
+                last_progress = time.time()
+                for _ in range(10):
+                    if stopped():
+                        return False
+                    _sleep(1.0)
+                    url = _page_url(page) or ""
+                    text = _visible_text(page) or ""
+                    if not looks_like_cloudflare(url, text):
+                        log("cloudflare cleared after widget click")
+                        return True
+                    if looks_like_cloudflare_hard_block(url, text):
+                        log("cloudflare hard block after widget click")
+                        return False
+                    clearance = _page_cf_clearance(page)
+                    if clearance and not clearance_reloaded:
+                        clearance_reloaded = True
+                        last_clearance = clearance
+                        if _reload_after_cf_clearance(
+                            page, log=log, target_url=start_url
+                        ):
+                            return True
+                        break
+                    if len(_cf_turnstile_token(page)) >= 80:
+                        last_progress = time.time()
+                    if looks_like_cloudflare_spinning(url, text):
+                        last_progress = time.time()
+                continue
+            _sleep(1.5)
+            continue
+
+        # Spinning / no widget: wait only. No reset, no blind click.
+        if spinning or not has_widget:
+            settle_rounds += 1
+            # If clearance appeared mid-wait, apply it immediately next loop.
+            if clearance and not clearance_reloaded:
+                continue
+            last_progress = time.time()
+            _sleep(2.0)
+            continue
+
+        settle_rounds += 1
+        _sleep(2.0)
+        quiet_for = time.time() - last_progress
+        # Last-resort reload only after quiet stretch with no spin/widget/clearance.
+        if (
+            reload_on_stuck
+            and not reloaded
+            and not spinning
+            and not has_widget
+            and not clearance
+            and quiet_for >= 12.0
+            and (deadline - time.time()) >= 8.0
+        ):
+            reloaded = True
+            log(
+                "cloudflare quiet for %.0fs without widget/clearance; reload once"
+                % quiet_for
+            )
+            try:
+                target = start_url if "grok.com" in start_url.casefold() else "https://grok.com/"
+                page.get(target)
+            except Exception as exc:
+                log("cloudflare reload failed: %s" % exc)
+            _sleep(3.0)
+            last_progress = time.time()
+
+    # Final attempt: if clearance exists, one more reload before giving up.
+    clearance = _page_cf_clearance(page)
+    if clearance and not stopped():
+        log("timeout with cf_clearance still present; final reload attempt")
+        if _reload_after_cf_clearance(page, log=log, target_url=start_url):
+            return True
+
+    url = _page_url(page) or ""
+    text = _visible_text(page) or ""
+    cleared = not looks_like_cloudflare(url, text)
+    if looks_like_cloudflare_hard_block(url, text):
+        log("cloudflare bypass done cleared=False (hard block)")
+        return False
+    log(
+        "cloudflare bypass done cleared=%s settle_rounds=%s reloaded=%s "
+        "clearance_reloaded=%s clicked=%s has_clearance=%s"
+        % (
+            cleared,
+            settle_rounds,
+            reloaded,
+            clearance_reloaded,
+            clicked_once,
+            bool(clearance or last_clearance),
+        )
+    )
+    return cleared
 
 
 def _prepare_password_login(
@@ -1432,6 +1994,7 @@ def mint_with_browser(
     reuse_browser: bool = True,
     recycle_every: int = 15,
     allow_passwordless: bool = False,
+    require_account_gates: bool = True,
 ) -> dict[str, Any]:
     """Request device code, approve in browser, poll tokens.
 
@@ -1440,11 +2003,13 @@ def mint_with_browser(
     cookies: optional register-browser cookie list to skip re-login.
     allow_passwordless: when True and cookies are injected, skip password gate;
     still fails if the browser shows a sign-in form.
+    require_account_gates: when True, finish grok.com TOS gate before Build allow.
     """
     from .oauth_device import OAuthDeviceError, poll_device_token, request_device_code
     from .proxyutil import proxy_log_label, resolve_proxy, set_runtime_proxy
 
     log = poll_log or _noop_log
+    require_account_gates = bool(require_account_gates)
     own_browser = None
     owned = False
     work_page = None if force_standalone else page
@@ -1497,30 +2062,44 @@ def mint_with_browser(
                 log(f"post-inject session url={url[:120]} visible={snip}")
             except Exception as e:
                 log(f"post-inject check: {e}")
-            # With an existing SSO session, finish TOS/age before Build OAuth.
-            pre_gate = prepare_account_gates(
-                work_page,
-                log=log,
-                timeout_sec=min(60.0, float(browser_timeout_sec)),
-            )
-            if not pre_gate.get("ok"):
-                log(
-                    "account TOS incomplete before Build authorize: %s"
-                    % (pre_gate.get("detail") or "unknown")
+            if require_account_gates:
+                # With an existing SSO session, finish TOS before Build OAuth.
+                pre_gate = prepare_account_gates(
+                    work_page,
+                    log=log,
+                    timeout_sec=min(60.0, float(browser_timeout_sec)),
                 )
+                if not pre_gate.get("ok"):
+                    log(
+                        "account TOS incomplete before Build authorize: %s"
+                        % (pre_gate.get("detail") or "unknown")
+                    )
+                else:
+                    log(
+                        "account TOS ready before Build authorize: %s"
+                        % (pre_gate.get("detail") or "ok")
+                    )
             else:
-                log(
-                    "account TOS ready before Build authorize: %s"
-                    % (pre_gate.get("detail") or "ok")
-                )
+                pre_gate = {
+                    "ok": True,
+                    "tos_ok": False,
+                    "detail": "skipped-account-gates",
+                }
+                log("account TOS gate skipped (require_account_gates=false)")
         else:
-            # Password login path finishes TOS inside approve_device_code,
+            # Password login path can finish TOS inside approve_device_code,
             # after sign-in and before clicking Build「允许」.
             pre_gate = {
                 "ok": False,
                 "tos_ok": False,
-                "detail": "deferred-until-login",
+                "detail": (
+                    "deferred-until-login"
+                    if require_account_gates
+                    else "skipped-account-gates"
+                ),
             }
+            if not require_account_gates:
+                log("account TOS gate skipped (require_account_gates=false)")
 
         if cancel and cancel():
             raise BrowserConfirmError("cancelled before Build authorize")
@@ -1564,9 +2143,9 @@ def mint_with_browser(
                 stop_event=stop_event,
                 log=log,
                 allow_passwordless=allow_passwordless,
-                # Always allow a last-chance gate run before Build「允许」.
-                # Cookie path may have already finished; password path does it here.
-                ensure_account_gates=True,
+                # Cookie path may have already finished; password path does it here
+                # only when the caller asked for account gates.
+                ensure_account_gates=require_account_gates,
                 account_gates_state=pre_gate if cookies else None,
             )
             if isinstance(gate_result, dict) and gate_result.get("detail"):

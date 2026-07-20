@@ -24,6 +24,7 @@ class LoginSettings:
     base_url: str = "https://cli-chat-proxy.grok.com/v1"
     probe_after_login: bool = False
     auto_reset_password: bool = False
+    require_account_gates: bool = True
 
 
 class BatchLoginService:
@@ -100,6 +101,7 @@ class BatchLoginService:
                 "recycle_every": 10,
                 "default_auth_dir": str(self.project.managed_auth_dir),
                 "auto_reset_password": auto_reset,
+                "require_account_gates": bool(settings.require_account_gates),
             },
             "accounts": [
                 self._worker_account(account, include_mail_credential=auto_reset)
@@ -203,6 +205,8 @@ class BatchLoginService:
                 "reuse_browser": True,
                 "recycle_every": 10,
                 "default_auth_dir": str(self.project.managed_auth_dir),
+                # Remint is CPA-focused; skip TOS gate unless caller opts in.
+                "require_account_gates": bool(settings.require_account_gates),
             },
             "accounts": [self._worker_remint_account(account) for account in ready],
         }

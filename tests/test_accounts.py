@@ -22,6 +22,23 @@ class AccountImportQueryTests(unittest.TestCase):
 
             self.assertEqual(1, len(imported))
 
+    def test_manual_import_accepts_tab_separated_export(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+
+            imported = manager.import_account_text(
+                "账户\t密码\ttoken\n"
+                "alice@example.com\tpassword\tfresh-sso\n"
+                "bob@example.com\tbob-password\tbob-sso\n"
+            )
+
+            self.assertEqual(2, len(imported))
+            by_email = {account.email: account for account in imported}
+            self.assertEqual("password", by_email["alice@example.com"].password)
+            self.assertEqual("fresh-sso", by_email["alice@example.com"].sso_token)
+            self.assertEqual("bob-password", by_email["bob@example.com"].password)
+            self.assertEqual("bob-sso", by_email["bob@example.com"].sso_token)
+
     def test_email_search_treats_wildcards_as_text(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = make_manager(Path(directory))

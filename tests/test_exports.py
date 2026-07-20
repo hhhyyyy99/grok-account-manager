@@ -87,6 +87,16 @@ class AccountExportTests(unittest.TestCase):
                 grok2api["ssoSuper"],
             )
 
+            accounts_export = exporter.export([exportable, missing], "accounts")
+            self.assertEqual("text/plain; charset=utf-8", accounts_export.content_type)
+            self.assertEqual((1, 1), (accounts_export.exported_count, accounts_export.skipped_count))
+            self.assertTrue(accounts_export.filename.startswith("accounts_"))
+            self.assertTrue(accounts_export.filename.endswith(".txt"))
+            self.assertEqual(
+                "账户\t密码\ttoken\nalice@example.com\tpassword\tfresh-sso\n",
+                accounts_export.body.decode("utf-8"),
+            )
+
     def test_web_export_uses_selected_ids_or_current_filter(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = make_manager(Path(directory))

@@ -616,9 +616,23 @@ class GrokWebApplication:
             ids = self.manager.relogin_candidate_ids()
         if not ids:
             raise ValueError("没有待登录账号")
+        # Default keeps historical behavior: login with TOS gate.
+        if "requireAccountGates" in payload:
+            require_account_gates = bool(payload.get("requireAccountGates"))
+        elif "require_account_gates" in payload:
+            require_account_gates = bool(payload.get("require_account_gates"))
+        else:
+            require_account_gates = True
+        label = "登录+门禁" if require_account_gates else "登录(跳过门禁)"
 
         def worker(task: TaskRecord) -> Dict[str, Any]:
-            task.log("开始批量登录 %s 个账号" % len(ids))
+            task.log(
+                "开始%s %s 个账号"
+                % (
+                    "登录并走门禁授权" if require_account_gates else "登录（跳过门禁）",
+                    len(ids),
+                )
+            )
 
             def progress(result, completed, total):
                 task.progress(completed, total, "%s: %s" % (result.email, result.detail))
@@ -628,8 +642,12 @@ class GrokWebApplication:
                 log=task.log,
                 progress=progress,
                 cancelled=lambda: task.cancel_requested,
+                require_account_gates=require_account_gates,
             )
-            summary = summarize_account_results(results, action_label="登录")
+            summary = summarize_account_results(
+                results,
+                action_label="登录+门禁" if require_account_gates else "登录",
+            )
             log_account_failures(
                 task,
                 summary["failures"],
@@ -637,7 +655,7 @@ class GrokWebApplication:
             )
             return summary
 
-        return self.tasks.start("login", "批量登录", worker, exclusive_group="browser-automation")
+        return self.tasks.start("login", label, worker, exclusive_group="browser-automation")
 
     def start_consent(self, payload: Dict[str, Any]) -> TaskRecord:
         ids = self._ids(payload)

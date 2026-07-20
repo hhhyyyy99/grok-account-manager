@@ -404,19 +404,53 @@ button:active:not(:disabled), .button:active:not(:disabled) { transform: transla
 .selection-actions > button:hover:not(:disabled), .export-control button:hover:not(:disabled), .react-pagination button:hover:not(:disabled) { border-color: #c7cec4; background: #dfe5dc; }
 .selection-actions .danger-action { margin-left: auto; background: transparent; color: var(--danger); }
 .selection-actions .danger-action:hover:not(:disabled) { border-color: #e2b8b2; background: var(--danger-soft); }
-.export-control { display: inline-flex; align-items: stretch; margin-left: 3px; }
-.export-control select {
-  min-height: 32px;
-  max-width: 130px;
+.export-control {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: stretch;
+  margin-left: 3px;
+  overflow: hidden;
   border: 1px solid #ccd3ca;
-  border-right: 0;
-  border-radius: 4px 0 0 4px;
-  padding: 0 7px;
+  border-radius: 4px;
   background: var(--surface);
-  color: #526052;
-  font-size: 10px;
 }
-.export-control button { border-radius: 0 4px 4px 0; }
+.export-control:focus-within {
+  border-color: var(--accent-strong);
+  box-shadow: 0 0 0 3px rgba(130, 148, 49, .12);
+}
+.export-control select {
+  min-width: 7.8rem;
+  min-height: 30px;
+  border: 0;
+  border-right: 1px solid #ccd3ca;
+  border-radius: 0;
+  padding: 0 1.55rem 0 8px;
+  background-color: var(--surface);
+  background-image:
+    linear-gradient(45deg, transparent 50%, #7d867e 50%),
+    linear-gradient(135deg, #7d867e 50%, transparent 50%);
+  background-position:
+    calc(100% - 11px) calc(50% - 1px),
+    calc(100% - 7px) calc(50% - 1px);
+  background-size: 4px 4px, 4px 4px;
+  background-repeat: no-repeat;
+  color: #465048;
+  font-size: 10px;
+  font-weight: 650;
+  appearance: none;
+  cursor: pointer;
+}
+.export-control select:hover:not(:disabled) { background-color: #f4f6f2; }
+.export-control select:disabled { opacity: .42; cursor: not-allowed; }
+.export-control select:focus,
+.export-control select:focus-visible { outline: none; box-shadow: none; }
+.export-control button {
+  min-height: 30px;
+  border: 0;
+  border-radius: 0;
+  background: #e9ede6;
+}
+.export-control button:focus-visible { outline: none; }
 .selection-clear {
   display: grid;
   width: 28px;

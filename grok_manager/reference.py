@@ -749,6 +749,33 @@ class ReferenceProject:
         )
 
     @staticmethod
+    def _split_account_line(raw: str) -> Optional[Tuple[str, str, str]]:
+        text = str(raw or "").strip()
+        if not text or text.startswith("#"):
+            return None
+        if "----" in text:
+            parts = [part.strip() for part in text.split("----", 2)]
+        elif "\t" in text:
+            parts = [part.strip() for part in text.split("\t")]
+        else:
+            return None
+        if len(parts) < 2:
+            return None
+        email = parts[0].strip().lower()
+        password = parts[1].strip()
+        sso = parts[2].strip() if len(parts) > 2 else ""
+        # Skip TSV header from accounts export: 账户\t密码\ttoken
+        if email in {"账户", "account", "email", "账号"} and password in {
+            "密码",
+            "password",
+            "pass",
+        }:
+            return None
+        if not email or not password:
+            return None
+        return email, password, sso
+
+    @staticmethod
     def parse_account_text(
         text: str,
         source: str = "manual-import",
@@ -758,17 +785,10 @@ class ReferenceProject:
         auth_index = auth_index or {}
         records: List[AccountDraft] = []
         for line in str(text or "").splitlines():
-            raw = line.strip()
-            if not raw or raw.startswith("#"):
+            parsed = ReferenceProject._split_account_line(line)
+            if parsed is None:
                 continue
-            parts = raw.split("----", 2)
-            if len(parts) < 2:
-                continue
-            email = parts[0].strip().lower()
-            password = parts[1].strip()
-            sso = parts[2].strip() if len(parts) > 2 else ""
-            if not email or not password:
-                continue
+            email, password, sso = parsed
             auth_path = ""
             auth: Dict[str, Any] = {}
             if email in auth_index:

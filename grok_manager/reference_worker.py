@@ -155,6 +155,7 @@ def login_item_core(
         force_standalone=True,
         cookies=cookies,
         allow_passwordless=allow_passwordless,
+        require_account_gates=bool(settings.get("require_account_gates", True)),
         reuse_browser=bool(settings.get("reuse_browser", True)),
         recycle_every=max(1, int(settings.get("recycle_every") or 10)),
         log=log,

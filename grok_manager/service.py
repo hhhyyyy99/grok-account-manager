@@ -564,6 +564,7 @@ class GrokManager:
         log=None,
         progress=None,
         auto_reset_password: bool = True,
+        require_account_gates: bool = True,
         _skip_review: bool = False,
         cancelled=None,
     ) -> List[LoginResult]:
@@ -618,7 +619,12 @@ class GrokManager:
             ),
             probe_after_login=False,
             auto_reset_password=bool(auto_reset_password),
+            require_account_gates=bool(require_account_gates),
         )
+        if require_account_gates:
+            log("登录模式：走门禁授权（TOS）")
+        else:
+            log("登录模式：跳过门禁授权")
 
         def handle_result(result: LoginResult, _completed: int, _total: int):
             final = result
@@ -1061,6 +1067,7 @@ class GrokManager:
                 headless=bool(registration_config.get("cpa_headless", False)),
                 base_url=base_url,
                 probe_after_login=False,
+                require_account_gates=False,
             )
             log("开始通过 SSO 重新签发 %s 个账号的 CPA 凭据" % len(remint_ids))
 
