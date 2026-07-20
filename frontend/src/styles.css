@@ -277,7 +277,7 @@ button:active:not(:disabled), .button:active:not(:disabled) { transform: transla
   display: grid;
   min-height: 94px;
   grid-template-columns: 5px 1fr;
-  grid-template-rows: auto 1fr;
+  grid-template-rows: auto auto auto;
   column-gap: 12px;
   align-content: center;
   padding: 17px 18px 19px;
@@ -285,13 +285,12 @@ button:active:not(:disabled), .button:active:not(:disabled) { transform: transla
 }
 .react-metric:last-child { border-right: 0; }
 .react-metric.total { background: #f9faee; }
-.metric-marker { grid-row: 1 / 3; width: 3px; min-height: 42px; align-self: center; border-radius: 2px; background: #b3b9b1; }
+.metric-marker { grid-row: 1 / -1; width: 3px; min-height: 42px; align-self: center; border-radius: 2px; background: #b3b9b1; }
 .react-metric.total .metric-marker { background: var(--accent-strong); }
 .react-metric.success .metric-marker { background: var(--success); }
 .react-metric.danger .metric-marker { background: var(--danger); }
 .react-metric > span:not(.metric-marker) { color: var(--muted); font-size: 10px; font-weight: 620; }
 .react-metric strong {
-  align-self: end;
   color: #2a312c;
   font: 700 25px/1.08 "Noto Sans Mono", "Liberation Mono", monospace;
   font-variant-numeric: tabular-nums;
@@ -299,6 +298,13 @@ button:active:not(:disabled), .button:active:not(:disabled) { transform: transla
 }
 .react-metric.success strong { color: var(--success); }
 .react-metric.danger strong { color: var(--danger); }
+.metric-detail {
+  margin-top: 6px;
+  color: #7a847c;
+  font: 600 10px/1.3 "Noto Sans", system-ui, sans-serif;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
 
 .react-panel { border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
 .account-panel { overflow: clip; }

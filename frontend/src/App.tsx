@@ -564,10 +564,19 @@ function AccountsView(props: AccountsViewProps) {
       </header>
 
       <div className="react-metrics" aria-label="账号概况">
-        <Metric label="全部账号" value={stats.total ?? 0} tone="total" />
-        <Metric label="已启用" value={stats.enabled ?? 0} tone="success" />
-        <Metric label="已禁用" value={stats.disabled ?? 0} tone="neutral" />
-        <Metric label="需要处理" value={(stats.expired ?? 0) + (stats.invalid ?? 0) + (stats.error ?? 0) + (stats.needs_login ?? 0)} tone="danger" />
+        <Metric
+          label="全部账号"
+          value={stats.total ?? 0}
+          tone="total"
+          detail={`启用 ${(stats.enabled ?? 0).toLocaleString("zh-CN")} · 禁用 ${(stats.disabled ?? 0).toLocaleString("zh-CN")}`}
+        />
+        <Metric label="状态正常" value={stats.active ?? 0} tone="success" />
+        <Metric
+          label="需要处理"
+          value={(stats.expired ?? 0) + (stats.invalid ?? 0) + (stats.error ?? 0) + (stats.needs_login ?? 0)}
+          tone="danger"
+        />
+        <Metric label="尚未巡检" value={stats.unknown ?? 0} tone="neutral" />
       </div>
 
       <section className="react-panel account-panel">
@@ -703,12 +712,18 @@ function AccountsView(props: AccountsViewProps) {
   );
 }
 
-function Metric({ label, value, tone }: { label: string; value: number; tone: string }) {
+function Metric({ label, value, tone, detail }: {
+  label: string;
+  value: number;
+  tone: string;
+  detail?: string;
+}) {
   return (
     <article className={`react-metric ${tone}`}>
       <span className="metric-marker" aria-hidden="true" />
       <span>{label}</span>
       <strong>{value.toLocaleString("zh-CN")}</strong>
+      {detail && <small className="metric-detail">{detail}</small>}
     </article>
   );
 }
