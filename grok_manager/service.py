@@ -660,6 +660,7 @@ class GrokManager:
             settings,
             log=log,
             progress=handle_result,
+            cancelled=cancelled,
         )
         by_id = {
             int(result.account_id): result

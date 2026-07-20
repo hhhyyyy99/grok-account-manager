@@ -61,25 +61,22 @@ class BatchPasswordResetService:
         completed = 0
         total = len(accounts)
         for account in accounts:
-            credential = self.project.find_mail_credential(account.email, account.source)
-            if not credential:
-                # Last-chance admin recovery for missing local JWT (show_password path).
-                credential = self.project.recover_mail_credential_via_admin(account.email)
-            if not credential:
-                result = PasswordResetResult(
-                    account.id,
-                    account.email,
-                    False,
-                    "找不到该账号的邮箱访问凭据，且管理员接口未能恢复 JWT，无法接收重置验证码",
-                )
-                results.append(result)
-                self.store.set_status([account.id], AccountStatus.ERROR.value, result.detail)
-                completed += 1
-                if progress:
-                    progress(result, completed, total)
-            else:
+            # Prefer local/vault JWT. Leave network admin recovery to the reset
+            # worker so large batches do not freeze on sequential API calls.
+            credential = self.project.find_mail_credential(
+                account.email,
+                account.source,
+                allow_admin_recover=False,
+            )
+            if credential:
                 ready.append((account, credential))
                 log("[%s] 已准备邮箱访问凭据，开始密码重置" % account.email)
+            else:
+                ready.append((account, ""))
+                log(
+                    "[%s] 本地无邮箱 JWT，将在重置 worker 中尝试管理员接口恢复"
+                    % account.email
+                )
         if not ready:
             return results
 

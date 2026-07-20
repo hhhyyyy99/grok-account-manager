@@ -1219,7 +1219,7 @@ class BatchLoginCredentialTests(unittest.TestCase):
             captured = {}
             progress_events = []
 
-            def fake_login(ids, settings, log=None, progress=None):
+            def fake_login(ids, settings, log=None, progress=None, cancelled=None):
                 captured["ids"] = list(ids)
                 captured["settings"] = settings
                 if progress:
@@ -1260,7 +1260,7 @@ class BatchLoginCredentialTests(unittest.TestCase):
             progress_events = []
             login_calls = []
 
-            def fake_login(ids, settings, log=None, progress=None):
+            def fake_login(ids, settings, log=None, progress=None, cancelled=None):
                 login_calls.append(list(ids))
                 self.assertTrue(settings.auto_reset_password)
                 # Worker emits only final settled results; recovery is internal.
@@ -1330,7 +1330,7 @@ class BatchLoginCredentialTests(unittest.TestCase):
                 two.id, two.email, True, "自动重置密码后：批量登录成功"
             )
 
-            def fake_login(ids, settings, log=None, progress=None):
+            def fake_login(ids, settings, log=None, progress=None, cancelled=None):
                 self.assertTrue(settings.auto_reset_password)
                 values = [first_fail, second_ok]
                 for index, result in enumerate(values, start=1):
@@ -1366,7 +1366,7 @@ class BatchLoginCredentialTests(unittest.TestCase):
             with patch.object(
                 manager.login,
                 "login_accounts",
-                side_effect=lambda ids, settings, log=None, progress=None: (
+                side_effect=lambda ids, settings, log=None, progress=None, cancelled=None: (
                     captured.update({"settings": settings}) or [first]
                 ),
             ):
@@ -1576,7 +1576,7 @@ class BatchLoginCredentialTests(unittest.TestCase):
             second_result = LoginResult(second.id, second.email, True, "批量登录成功")
             progress_events = []
 
-            def fake_login(_ids, _settings, log=None, progress=None):
+            def fake_login(_ids, _settings, log=None, progress=None, cancelled=None):
                 for index, result in enumerate((first_result, second_result), start=1):
                     if progress:
                         progress(result, index, 2)
@@ -1617,7 +1617,7 @@ class BatchLoginCredentialTests(unittest.TestCase):
             }
             login_calls = []
 
-            def fake_login(ids, settings, log=None, progress=None):
+            def fake_login(ids, settings, log=None, progress=None, cancelled=None):
                 requested = list(ids)
                 login_calls.append(requested)
                 self.assertTrue(settings.auto_reset_password)
@@ -1840,26 +1840,157 @@ class ImmediateWrongPasswordRecoveryTests(unittest.TestCase):
                 AccountDraft(email="mail@example.com", password="password", source="src")
             )
             captured = {}
+            find_calls = []
 
             def fake_run(command, document, **kwargs):
                 captured["document"] = document
                 return [], set(), 0
 
+            def fake_find(email, source="", *, allow_admin_recover=True):
+                find_calls.append(
+                    {
+                        "email": email,
+                        "source": source,
+                        "allow_admin_recover": allow_admin_recover,
+                    }
+                )
+                return "mail-jwt"
+
             with patch.object(manager.login._worker, "run", side_effect=fake_run):
                 with patch.object(
                     manager.login.project,
                     "find_mail_credential",
-                    return_value="mail-jwt",
+                    side_effect=fake_find,
                 ):
-                    manager.login.login_accounts(
-                        [account.id],
-                        LoginSettings(auto_reset_password=True),
-                    )
+                    with patch.object(
+                        manager.login.project,
+                        "recover_mail_credential_via_admin",
+                    ) as recover:
+                        manager.login.login_accounts(
+                            [account.id],
+                            LoginSettings(auto_reset_password=True),
+                        )
 
             settings = captured["document"]["settings"]
             account_payload = captured["document"]["accounts"][0]
             self.assertTrue(settings["auto_reset_password"])
             self.assertEqual("mail-jwt", account_payload["mail_credential"])
+            self.assertEqual(
+                [
+                    {
+                        "email": "mail@example.com",
+                        "source": "src",
+                        "allow_admin_recover": False,
+                    }
+                ],
+                find_calls,
+            )
+            recover.assert_not_called()
+
+    def test_login_prep_skips_network_mail_recovery_and_stays_cancellable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = make_manager(Path(directory))
+            accounts = [
+                manager.store.upsert(
+                    AccountDraft(
+                        email="prep%s@example.com" % index,
+                        password="password",
+                        source="src",
+                    )
+                )
+                for index in range(3)
+            ]
+            logs = []
+            recover_calls = []
+            cancel_after = {"count": 0}
+
+            def fake_find(email, source="", *, allow_admin_recover=True):
+                self.assertFalse(allow_admin_recover)
+                cancel_after["count"] += 1
+                return ""
+
+            def fake_recover(email):
+                recover_calls.append(email)
+                return "should-not-run"
+
+            def cancelled():
+                return cancel_after["count"] >= 2
+
+            with patch.object(manager.login._worker, "run") as worker_run:
+                with patch.object(
+                    manager.login.project,
+                    "find_mail_credential",
+                    side_effect=fake_find,
+                ):
+                    with patch.object(
+                        manager.login.project,
+                        "recover_mail_credential_via_admin",
+                        side_effect=fake_recover,
+                    ):
+                        results = manager.login.login_accounts(
+                            [account.id for account in accounts],
+                            LoginSettings(auto_reset_password=True),
+                            log=logs.append,
+                            cancelled=cancelled,
+                        )
+
+            worker_run.assert_not_called()
+            self.assertEqual([], recover_calls)
+            self.assertTrue(any("正在准备" in message for message in logs))
+            self.assertEqual(3, len(results))
+            self.assertTrue(all(not item.ok for item in results))
+            self.assertTrue(all("任务已取消" in item.detail for item in results))
+
+    def test_recover_wrong_password_without_local_mail_credential(self) -> None:
+        from grok_manager import reference_worker
+
+        item = {
+            "id": 9,
+            "email": "empty-mail@example.com",
+            "password": "old",
+            "mail_credential": "",
+            "auth_dir": "/tmp",
+        }
+        settings = {"default_auth_dir": "/tmp", "timeout_seconds": 60}
+        events = []
+
+        def fake_emit(prefix, payload):
+            events.append((prefix.strip(), dict(payload)))
+
+        def fake_reset(item_arg, settings_arg, log):
+            self.assertEqual("", item_arg.get("mail_credential") or "")
+            return {"ok": True, "password": "new-secret-password"}
+
+        def fake_login(item_arg, settings_arg, mint_and_export, log=None):
+            self.assertEqual("new-secret-password", item_arg["password"])
+            return {
+                "ok": True,
+                "id": item_arg["id"],
+                "email": item_arg["email"],
+                "path": "/tmp/auth.json",
+                "sso_token": "sso",
+            }
+
+        with patch.object(reference_worker, "emit", side_effect=fake_emit):
+            with patch.object(
+                reference_worker, "password_reset_core", side_effect=fake_reset
+            ):
+                with patch.object(
+                    reference_worker, "login_item_core", side_effect=fake_login
+                ):
+                    result = reference_worker.recover_wrong_password_item(
+                        item, settings, mint_and_export=lambda **_kwargs: None
+                    )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["recovered_from_wrong_password"])
+        self.assertTrue(
+            any(
+                "本地无邮箱 JWT" in str(payload.get("message") or "")
+                for prefix, payload in events
+                if prefix == "GM_LOG"
+            )
+        )
 
 
 if __name__ == "__main__":

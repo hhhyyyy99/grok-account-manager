@@ -589,7 +589,20 @@ class ReferenceProject:
                 return credential.strip()
         return ""
 
-    def find_mail_credential(self, email: str, source: str = "") -> str:
+    def find_mail_credential(
+        self,
+        email: str,
+        source: str = "",
+        *,
+        allow_admin_recover: bool = True,
+    ) -> str:
+        """Locate a mailbox JWT.
+
+        Local sources (sibling files, registration output, vault) are always
+        checked first. Network recovery via Cloudflare admin is optional because
+        batch login/reset prep must not block the UI on hundreds of sequential
+        admin API calls.
+        """
         vault = self.credential_vault
         normalized_email = str(email or "").strip().lower()
         checked = set()
@@ -617,6 +630,8 @@ class ReferenceProject:
                 stored = ""
             if stored:
                 return stored
+        if not allow_admin_recover:
+            return ""
         # No local JWT: recover via Cloudflare admin address lookup + show_password.
         recovered = self.recover_mail_credential_via_admin(normalized_email)
         if recovered:

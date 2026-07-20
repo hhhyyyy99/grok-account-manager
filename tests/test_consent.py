@@ -110,7 +110,7 @@ class ConsentServiceTests(unittest.TestCase):
             )
             captured = {}
 
-            def fake_login(ids, settings, log=None, progress=None):
+            def fake_login(ids, settings, log=None, progress=None, cancelled=None):
                 captured["require_account_gates"] = bool(settings.require_account_gates)
                 result = __import__("grok_manager.models", fromlist=["LoginResult"]).LoginResult(
                     account.id, account.email, True, "批量登录成功"

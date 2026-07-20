@@ -58,8 +58,10 @@ class BatchLoginService:
         settings: LoginSettings,
         log: Optional[LogCallback] = None,
         progress: Optional[ProgressCallback] = None,
+        cancelled: Optional[Callable[[], bool]] = None,
     ) -> List[LoginResult]:
         log = log or (lambda _: None)
+        is_cancelled = cancelled or (lambda: False)
         requested_ids: List[int] = []
         seen_ids: set[int] = set()
         for value in account_ids:
@@ -77,7 +79,32 @@ class BatchLoginService:
         results: List[LoginResult] = []
         completed = 0
         total = len(accounts)
+
+        def ordered_results() -> List[LoginResult]:
+            results_by_id = {result.account_id: result for result in results}
+            return [
+                results_by_id[account_id]
+                for account_id in requested_ids
+                if account_id in results_by_id
+            ]
+
+        def append_cancelled(pending: List[Account]) -> None:
+            nonlocal completed
+            handled_ids = {result.account_id for result in results}
+            for account in pending:
+                if account.id in handled_ids:
+                    continue
+                result = LoginResult(account.id, account.email, False, "任务已取消")
+                results.append(result)
+                handled_ids.add(account.id)
+                completed += 1
+                if progress:
+                    progress(result, completed, total)
+
         for account in missing:
+            if is_cancelled():
+                append_cancelled(accounts)
+                return ordered_results()
             result = LoginResult(account.id, account.email, False, "缺少邮箱或密码，无法登录")
             results.append(result)
             self.store.set_status([account.id], AccountStatus.INVALID.value, result.detail)
@@ -89,6 +116,22 @@ class BatchLoginService:
 
         self.project.validate()
         auto_reset = bool(settings.auto_reset_password)
+        # Prefetch only local/vault mail JWTs. Network admin recovery is deferred to
+        # the wrong-password path inside the browser worker so large batches cannot
+        # freeze the management UI before the first login starts.
+        log("正在准备 %s 个账号的登录任务" % len(ready))
+        worker_accounts: List[Dict[str, Any]] = []
+        for index, account in enumerate(ready, 1):
+            if is_cancelled():
+                # Nothing has been handed to the browser worker yet, so every
+                # prepared/unprepared ready account must be marked cancelled.
+                append_cancelled(ready)
+                return ordered_results()
+            worker_accounts.append(
+                self._worker_account(account, include_mail_credential=auto_reset)
+            )
+            if index == 1 or index == len(ready) or index % 50 == 0:
+                log("已准备登录输入 %s/%s" % (index, len(ready)))
         document = {
             "settings": {
                 "workers": max(1, min(int(settings.workers), 10)),
@@ -103,11 +146,15 @@ class BatchLoginService:
                 "auto_reset_password": auto_reset,
                 "require_account_gates": bool(settings.require_account_gates),
             },
-            "accounts": [
-                self._worker_account(account, include_mail_credential=auto_reset)
-                for account in ready
-            ],
+            "accounts": worker_accounts,
         }
+        if is_cancelled():
+            append_cancelled(ready)
+            return ordered_results()
+        log(
+            "启动浏览器登录 worker：%s 个账号，并发 %s"
+            % (len(worker_accounts), document["settings"]["workers"])
+        )
         worker_results, parsed_ids, completed = self._worker.run(
             "batch-login",
             document,
@@ -125,14 +172,15 @@ class BatchLoginService:
         for account in ready:
             if account.id in parsed_ids:
                 continue
-            result = LoginResult(account.id, account.email, False, "登录进程未返回该账号结果")
+            detail = "任务已取消" if is_cancelled() else "登录进程未返回该账号结果"
+            result = LoginResult(account.id, account.email, False, detail)
             results.append(result)
-            self.store.set_status([account.id], AccountStatus.ERROR.value, result.detail)
+            if detail != "任务已取消":
+                self.store.set_status([account.id], AccountStatus.ERROR.value, result.detail)
             completed += 1
             if progress:
                 progress(result, completed, total)
-        results_by_id = {result.account_id: result for result in results}
-        return [results_by_id[account_id] for account_id in requested_ids if account_id in results_by_id]
+        return ordered_results()
 
     def remint_cpa_via_sso(
         self,
@@ -256,11 +304,13 @@ class BatchLoginService:
             "auth_dir": str(self.project.managed_auth_dir),
         }
         if include_mail_credential:
-            # Prefer local credential; fall back to admin recovery so wrong-password
-            # accounts can reset without a second orchestration pass.
-            credential = self.project.find_mail_credential(account.email, account.source)
-            if not credential:
-                credential = self.project.recover_mail_credential_via_admin(account.email)
+            # Local/vault only. Network admin recovery happens later inside the
+            # browser worker when a wrong-password reset is actually needed.
+            credential = self.project.find_mail_credential(
+                account.email,
+                account.source,
+                allow_admin_recover=False,
+            )
             payload["mail_credential"] = str(credential or "")
         return payload
 

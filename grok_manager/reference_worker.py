@@ -190,13 +190,9 @@ def recover_wrong_password_item(
         emit("GM_LOG ", {"id": account_id, "email": email, "message": str(message)})
 
     log("登录密码错误，开始自动重置密码")
+    # Empty local JWT is fine: password_reset_core can recover via Cloudflare admin.
     if not str(item.get("mail_credential") or "").strip():
-        return {
-            "ok": False,
-            "id": account_id,
-            "email": email,
-            "error": "邮箱或密码错误；缺少邮箱访问凭据，无法自动重置密码",
-        }
+        log("本地无邮箱 JWT，将尝试管理员接口恢复后重置密码")
 
     reset_result = password_reset_core(item, settings, log)
     if not reset_result.get("ok"):
