@@ -286,7 +286,8 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    setSelected(new Set());
+    // Keep selection across filter/search changes; only clear when the user
+    // explicitly clears it (or after delete, since those rows are gone).
     setPage(1);
   }, [search, status, enabledFilter]);
 
@@ -310,9 +311,9 @@ export function App() {
           setSelectedTaskId(result.task.id);
           setTaskDrawerOpen(true);
         }
-        // Batch account ops are fire-and-forget once submitted; keep selection only
-        // until the request succeeds so the next action starts from a clean set.
-        if (Array.isArray(body.ids) && body.ids.length > 0) {
+        // Keep selection after batch tasks so finished accounts stay easy to find.
+        // Only drop it after delete — those rows are gone from the table.
+        if (endpoint === "/api/accounts/delete") {
           setSelected(new Set());
         }
         flash(success);
